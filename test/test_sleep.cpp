@@ -69,7 +69,7 @@ TEST(SleepTest, SleepInsideSchedulerWorkerResumesOnExecutor) {
   std::atomic<bool> finished {false};
   std::atomic<bool> resumed_on_worker {false};
 
-  std::thread sched_thread([&scheduler]() { scheduler.Start(); });
+  scheduler.Start();
 
   std::this_thread::sleep_for(50ms);
 
@@ -101,9 +101,6 @@ TEST(SleepTest, SleepInsideSchedulerWorkerResumesOnExecutor) {
   EXPECT_TRUE(resumed_on_worker.load());
 
   scheduler.Stop();
-  if (sched_thread.joinable()) {
-    sched_thread.join();
-  }
 }
 
 // 4. Concurrent sleep test with multiple staggered timers
@@ -112,7 +109,7 @@ TEST(SleepTest, ConcurrentStaggeredSleep) {
   constexpr size_t kNumCoroutines = 20;
   std::atomic<size_t> completed_count {0};
 
-  std::thread sched_thread([&scheduler]() { scheduler.Start(); });
+  scheduler.Start();
 
   std::this_thread::sleep_for(50ms);
 
@@ -142,7 +139,4 @@ TEST(SleepTest, ConcurrentStaggeredSleep) {
   EXPECT_EQ(completed_count.load(), kNumCoroutines);
 
   scheduler.Stop();
-  if (sched_thread.joinable()) {
-    sched_thread.join();
-  }
 }

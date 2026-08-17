@@ -28,7 +28,7 @@ int main() {
   serv_addr.sin_port = htons(8016);
   inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr);
 
-  if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
+  if (connect(sock, reinterpret_cast<struct sockaddr*>(&serv_addr), sizeof(serv_addr)) < 0) {
     std::cerr << "[Client] Connection failed!" << std::endl;
     context.Stop();
     server_thread.join();

@@ -11,6 +11,7 @@
 #include "ant_server/type.hpp"
 
 // Test task for lambda execution
+// comment: i have lamdba TaskNode in include/ant_server/type.hpp：113
 template <typename F>
 struct SimpleTask : public TaskNode {
   F func;
@@ -117,8 +118,8 @@ TEST(SchedulerTest, SeparatedIOAndWorkerLifecycle) {
 
   std::atomic<int> worker_executed {0};
 
-  // Launch scheduler in background thread
-  std::thread sched_thread([&scheduler]() { scheduler.Start(); });
+  // Launch scheduler non-blockingly
+  scheduler.Start();
 
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
@@ -138,7 +139,4 @@ TEST(SchedulerTest, SeparatedIOAndWorkerLifecycle) {
   EXPECT_EQ(worker_executed.load(), 42);
 
   scheduler.Stop();
-  if (sched_thread.joinable()) {
-    sched_thread.join();
-  }
 }

@@ -15,6 +15,7 @@
 #include <string>
 #include <unordered_map>
 
+#include <butil/endpoint.h>
 #include <netinet/in.h>
 
 #include "ant_server/awaiter/socket_awaiter.hpp"
@@ -33,33 +34,44 @@ class Server {
  public:
   static constexpr int kUringSize = 256;
 
+  // Primary constructor with butil::EndPoint
+  Server(Context& ctx, butil::EndPoint endpoint) : ctx_(ctx), endpoint_(endpoint) { Init(); }
+
+  // Convenient constructor with port and optional IP (defaults to butil::IP_ANY)
+  Server(Context& ctx, int port, butil::ip_t ip = butil::IP_ANY) : Server(ctx, butil::EndPoint(ip, port)) {}
+
+  // Legacy constructor for backward compatibility
   Server(Context& ctx, int domain, int port, int service, int protocol, int backlog, u_long interface)
-      : ctx_(ctx),
-        domain_(domain),
-        port_(port),
-        service_(service),
-        protocol_(protocol),
-        backlog_(backlog),
-        interface_(interface) {
-    address_.sin_family = domain_;
-    address_.sin_port = htons(port_);
-    address_.sin_addr.s_addr = htonl(interface_);
+      : Server(ctx, butil::EndPoint(butil::int2ip(htonl(interface)), port)) {
+    (void)domain;
+    (void)service;
+    (void)protocol;
+    (void)backlog;
+  }
 
-    server_socket_ = socket(domain_, service_, protocol_);
+  ~Server() {
+    if (server_socket_ >= 0) {
+      close(server_socket_);
+    }
+    if (default_timer_keeper_) {
+      default_timer_keeper_->Stop();
+    }
+    if (default_executor_) {
+      default_executor_->Stop();
+    }
+  }
+
+  Server(const Server&) = delete;
+  Server& operator=(const Server&) = delete;
+
+  int GetSocketFd() const noexcept { return server_socket_; }
+  const butil::EndPoint& GetEndPoint() const noexcept { return endpoint_; }
+
+ private:
+  void Init() {
+    server_socket_ = butil::tcp_listen(endpoint_);
     if (server_socket_ < 0) {
-      perror("Failed to initialize/connect to socket...");
-      exit(EXIT_FAILURE);
-    }
-    int opt = 1;
-    setsockopt(server_socket_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    if (bind(server_socket_, reinterpret_cast<struct sockaddr*>(&address_), sizeof(address_)) < 0) {
-      perror("Failed to bind socket...");
-      exit(EXIT_FAILURE);
-    }
-
-    if (listen(server_socket_, backlog_) < 0) {
-      perror("Failed to start listening...");
+      perror("Failed to start listening with butil::tcp_listen...");
       exit(EXIT_FAILURE);
     }
 
@@ -82,31 +94,9 @@ class Server {
     acceptor_->Start();
   }
 
-  ~Server() {
-    if (server_socket_ >= 0) {
-      close(server_socket_);
-    }
-    if (default_timer_keeper_) {
-      default_timer_keeper_->Stop();
-    }
-    if (default_executor_) {
-      default_executor_->Stop();
-    }
-  }
-
-  Server(const Server&) = delete;
-  Server& operator=(const Server&) = delete;
-
- private:
-  int domain_;
-  int port_;
-  int service_;
-  int protocol_;
-  int backlog_;
-  u_long interface_;
-  int server_socket_;
-  struct sockaddr_in address_;
   Context& ctx_;
+  butil::EndPoint endpoint_;
+  int server_socket_ {-1};
   std::unique_ptr<Acceptor> acceptor_;
   std::unique_ptr<WorkStealingExecutor> default_executor_;
   std::unique_ptr<TimerKeeper> default_timer_keeper_;

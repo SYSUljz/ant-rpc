@@ -86,7 +86,9 @@ class Scheduler : public Executor {
   }
 
   void Start() {
-    running_.store(true, std::memory_order_release);
+    if (running_.exchange(true, std::memory_order_acq_rel)) {
+      return;
+    }
 
     // 1. Start dedicated background timing wheel keeper
     timer_keeper_->Start();
@@ -99,8 +101,9 @@ class Scheduler : public Executor {
     for (std::size_t i = 0; i < n_io_threads_; ++i) {
       io_threads_.emplace_back([this, i]() { this->IOLoop(static_cast<int>(i)); });
     }
+  }
 
-    // 4. Join all IO threads on exit
+  void Wait() {
     for (auto& t : io_threads_) {
       if (t.joinable()) {
         t.join();
@@ -110,24 +113,24 @@ class Scheduler : public Executor {
 
   void Stop() {
     if (running_.exchange(false, std::memory_order_acq_rel)) {
-      // Stop all IO contexts (wake them up from io_uring_submit_and_wait)
+      // 1. Stop all IO contexts (wake them up from io_uring_submit_and_wait)
       for (auto& ctx : io_contexts_) {
         ctx->Stop();
       }
 
-      // Stop background timing wheel keeper
-      timer_keeper_->Stop();
-
-      // Stop worker executor
-      worker_executor_->Stop();
-
-      // Join IO threads
+      // 2. Join and clean up all IO threads
       for (auto& t : io_threads_) {
         if (t.joinable()) {
           t.join();
         }
       }
       io_threads_.clear();
+
+      // 3. Stop background timing wheel keeper
+      timer_keeper_->Stop();
+
+      // 4. Stop worker executor
+      worker_executor_->Stop();
     }
   }
 

@@ -130,21 +130,27 @@ TEST(ResumeOnAwaiterTest, MultiHopBetweenExecutors) {
     co_await resume_on(exec_a);
     {
       std::lock_guard<std::mutex> lk(mtx);
-      if (g_executor == &exec_a) log.push_back("ExecA");
+      if (g_executor == &exec_a) {
+        log.push_back("ExecA");
+      }
     }
 
     // 2. Hop to Executor B
     co_await resume_on(exec_b);
     {
       std::lock_guard<std::mutex> lk(mtx);
-      if (g_executor == &exec_b) log.push_back("ExecB");
+      if (g_executor == &exec_b) {
+        log.push_back("ExecB");
+      }
     }
 
     // 3. Hop back to Executor A
     co_await resume_on(exec_a);
     {
       std::lock_guard<std::mutex> lk(mtx);
-      if (g_executor == &exec_a) log.push_back("ExecA_again");
+      if (g_executor == &exec_a) {
+        log.push_back("ExecA_again");
+      }
     }
 
     out_finished.store(true, std::memory_order_release);
