@@ -11,7 +11,14 @@ Diagnostics:
   UnusedIncludes: None
   MissingIncludes: None
   ClangTidy:
-    Add: ["*"]
+    Add:
+      - "*"
+    Remove:
+      - "llvmlibc-*"
+      - "fuchsia-*"
+      - "zircon-*"
+      - "android-*"
+      - "altera-*"
 
 InlayHints:
   Designators: Yes
