@@ -8,6 +8,7 @@
 #include <utility>
 
 #include "ant_server/context/context.hpp"
+#include "ant_server/scheduler/scheduler.hpp"
 #include "ant_server/scheduler/timer_keeper.hpp"
 #include "ant_server/type.hpp"
 #include "ant_server/utils/sleep.hpp"

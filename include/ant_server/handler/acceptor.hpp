@@ -20,11 +20,9 @@ struct Acceptor : public IOHandler {
   void on_complete() override {
     if (res_ >= 0) {
       on_accept_cb_(res_);
-    } else {
-      perror("Accept error");
     }
 
-    if (!(flags_ & IORING_CQE_F_MORE)) {
+    if (res_ >= 0 && !(flags_ & IORING_CQE_F_MORE)) {
       service_.submit_multishot_accept(server_socket_, static_cast<IOHandler*>(this));
     }
   }

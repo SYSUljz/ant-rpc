@@ -25,6 +25,7 @@ class Context {
   explicit Context(std::size_t entries = 256, Scheduler* scheduler = nullptr, Executor* executor = nullptr)
       : scheduler_(scheduler), executor_(executor) {
     io_uring_queue_init(entries, &ring_, 0);
+    io_uring_register_files_sparse(&ring_, static_cast<unsigned>(entries * 4));
   }
 
   ~Context() { io_uring_queue_exit(&ring_); }

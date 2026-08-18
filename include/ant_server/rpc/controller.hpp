@@ -1,11 +1,14 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <stop_token>
 #include <string>
 #include <string_view>
 #include <utility>
+
+#include <google/protobuf/service.h>
 
 #include "absl/container/flat_hash_map.h"
 #include "ant_server/rpc/error_code.hpp"
@@ -16,21 +19,13 @@ namespace ant_server::rpc {
 
 // ============================================================================
 // RpcController: The central invocation context for RPC requests & responses.
-// Inspired by Apache bRPC Controller, optimized for C++20 coroutines.
-//
-// Key Responsibilities:
-// 1. Error Status Management (ErrorCode, ErrorText, SetFailed).
-// 2. Network Metadata (Local & Remote butil::EndPoint).
-// 3. Distributed Tracing & RPC IDs (CorrelationId, LogId).
-// 4. Custom Key-Value Headers/Metadata (Auth tokens, trace context).
-// 5. Zero-Copy Binary Attachments (butil::IOBuf).
-// 6. Timeout & Structured Cancellation (std::stop_token).
-// 7. Full State Reset for Object Reuse / Connection Pooling.
+// Production-ready implementation of google::protobuf::RpcController.
+// Inspired by Apache bRPC Controller, optimized for modern C++20 coroutines.
 // ============================================================================
-class RpcController {
+class RpcController : public google::protobuf::RpcController {
  public:
   RpcController() = default;
-  ~RpcController() = default;
+  ~RpcController() override = default;
 
   RpcController(const RpcController&) = delete;
   RpcController& operator=(const RpcController&) = delete;
@@ -38,22 +33,60 @@ class RpcController {
   RpcController& operator=(RpcController&&) noexcept = default;
 
   // --------------------------------------------------------------------------
-  // 1. Error & Status Management
+  // 1. Standard google::protobuf::RpcController Interface
   // --------------------------------------------------------------------------
-  [[nodiscard]] bool Failed() const noexcept { return failed_; }
-  [[nodiscard]] int ErrorCode() const noexcept { return error_code_; }
-  [[nodiscard]] const std::string& ErrorText() const noexcept { return error_text_; }
+  void Reset() override {
+    failed_ = false;
+    canceled_ = false;
+    error_code_ = RPC_SUCCESS;
+    error_text_.clear();
+    correlation_id_ = 0;
+    log_id_ = 0;
+    timeout_ms_ = -1;
+    remote_side_ = butil::EndPoint();
+    local_side_ = butil::EndPoint();
+    headers_.clear();
+    request_attachment_.clear();
+    response_attachment_.clear();
+    stop_token_ = std::stop_token();
+    start_time_ = std::chrono::steady_clock::now();
+    latency_us_ = 0;
+  }
 
+  [[nodiscard]] bool Failed() const override { return failed_; }
+
+  [[nodiscard]] std::string ErrorText() const override { return error_text_; }
+
+  void StartCancel() override {
+    canceled_ = true;
+    SetFailed(RPC_ECANCELED, "RPC call was canceled");
+  }
+
+  void SetFailed(const std::string& reason) override {
+    SetFailed(RPC_EINTERNAL, reason);
+  }
+
+  [[nodiscard]] bool IsCanceled() const override {
+    return canceled_ || stop_token_.stop_requested() || (failed_ && error_code_ == RPC_ECANCELED);
+  }
+
+  void NotifyOnCancel(google::protobuf::Closure* callback) override {
+    (void)callback;
+  }
+
+  // --------------------------------------------------------------------------
+  // 2. Enhanced Error Management & Codes
+  // --------------------------------------------------------------------------
   void SetFailed(int error_code, std::string_view reason) {
     failed_ = true;
     error_code_ = error_code;
     error_text_ = std::string(reason);
   }
 
-  void SetFailed(std::string_view reason) { SetFailed(RPC_EINTERNAL, reason); }
+  [[nodiscard]] int ErrorCode() const noexcept { return error_code_; }
 
   // --------------------------------------------------------------------------
-  // 2. Distributed Tracing & IDs
+  // 3. Distributed Tracing & RPC IDs
   // --------------------------------------------------------------------------
   void SetCorrelationId(uint64_t id) noexcept { correlation_id_ = id; }
   [[nodiscard]] uint64_t CorrelationId() const noexcept { return correlation_id_; }
@@ -61,8 +94,11 @@ class RpcController {
   void SetLogId(uint64_t id) noexcept { log_id_ = id; }
   [[nodiscard]] uint64_t LogId() const noexcept { return log_id_; }
 
+  void set_log_id(uint64_t id) noexcept { log_id_ = id; }
+  [[nodiscard]] uint64_t log_id() const noexcept { return log_id_; }
+
   // --------------------------------------------------------------------------
-  // 3. Network Endpoints
+  // 4. Network Endpoints
   // --------------------------------------------------------------------------
   void SetRemoteSide(const butil::EndPoint& ep) noexcept { remote_side_ = ep; }
   [[nodiscard]] const butil::EndPoint& RemoteSide() const noexcept { return remote_side_; }
@@ -71,27 +107,27 @@ class RpcController {
   [[nodiscard]] const butil::EndPoint& LocalSide() const noexcept { return local_side_; }
 
   // --------------------------------------------------------------------------
-  // 4. Custom Metadata / Headers (Key-Value pairs)
+  // 5. Custom Metadata / Headers (Key-Value pairs)
   // --------------------------------------------------------------------------
-  // 4. Custom Metadata / Headers (Zero-Copy Key-Value pairs)
-  // --------------------------------------------------------------------------
-  void SetHeader(std::string_view key, std::string_view value) { headers_[key] = value; }
+  void SetHeader(std::string_view key, std::string_view value) {
+    headers_[std::string(key)] = std::string(value);
+  }
 
   [[nodiscard]] std::optional<std::string_view> GetHeader(std::string_view key) const {
-    auto it = headers_.find(key);
+    auto it = headers_.find(std::string(key));
     if (it != headers_.end()) {
       return it->second;
     }
     return std::nullopt;
   }
 
-  [[nodiscard]] const absl::flat_hash_map<std::string_view, std::string_view>& Headers() const noexcept {
+  [[nodiscard]] const absl::flat_hash_map<std::string, std::string>& Headers() const noexcept {
     return headers_;
   }
-  absl::flat_hash_map<std::string_view, std::string_view>& MutableHeaders() noexcept { return headers_; }
+  absl::flat_hash_map<std::string, std::string>& MutableHeaders() noexcept { return headers_; }
 
   // --------------------------------------------------------------------------
-  // 5. Zero-Copy Attachments (butil::IOBuf)
+  // 6. Zero-Copy Attachments (butil::IOBuf)
   // --------------------------------------------------------------------------
   butil::IOBuf& RequestAttachment() noexcept { return request_attachment_; }
   [[nodiscard]] const butil::IOBuf& RequestAttachment() const noexcept { return request_attachment_; }
@@ -100,38 +136,32 @@ class RpcController {
   [[nodiscard]] const butil::IOBuf& ResponseAttachment() const noexcept { return response_attachment_; }
 
   // --------------------------------------------------------------------------
-  // 6. Timeout & Cancellation
+  // 7. Timeout & Cancellation
   // --------------------------------------------------------------------------
   void SetTimeoutMs(int64_t timeout_ms) noexcept { timeout_ms_ = timeout_ms; }
   [[nodiscard]] int64_t TimeoutMs() const noexcept { return timeout_ms_; }
 
+  void set_timeout_ms(int64_t timeout_ms) noexcept { timeout_ms_ = timeout_ms; }
+  [[nodiscard]] int64_t timeout_ms() const noexcept { return timeout_ms_; }
+
   void SetStopToken(std::stop_token token) noexcept { stop_token_ = std::move(token); }
   [[nodiscard]] std::stop_token GetStopToken() const noexcept { return stop_token_; }
 
-  [[nodiscard]] bool IsCanceled() const noexcept {
-    return stop_token_.stop_requested() || (failed_ && error_code_ == RPC_ECANCELED);
-  }
+  // --------------------------------------------------------------------------
+  // 8. Performance & Latency Metrics
+  // --------------------------------------------------------------------------
+  void RecordStart() { start_time_ = std::chrono::steady_clock::now(); }
+  void set_latency_us(int64_t us) noexcept { latency_us_ = us; }
+  [[nodiscard]] int64_t latency_us() const noexcept { return latency_us_; }
 
-  // --------------------------------------------------------------------------
-  // 7. Reset: Reclaims state for reuse in connection/buffer pools
-  // --------------------------------------------------------------------------
-  void Reset() {
-    failed_ = false;
-    error_code_ = RPC_SUCCESS;
-    error_text_.clear();
-    correlation_id_ = 0;
-    log_id_ = 0;
-    remote_side_ = butil::EndPoint();
-    local_side_ = butil::EndPoint();
-    headers_.clear();
-    request_attachment_.clear();
-    response_attachment_.clear();
-    timeout_ms_ = -1;
-    stop_token_ = std::stop_token();
+  [[nodiscard]] int64_t CalculateElapsedUs() const {
+    auto now = std::chrono::steady_clock::now();
+    return std::chrono::duration_cast<std::chrono::microseconds>(now - start_time_).count();
   }
 
  private:
   bool failed_ {false};
+  bool canceled_ {false};
   int error_code_ {RPC_SUCCESS};
   std::string error_text_;
 
@@ -141,13 +171,20 @@ class RpcController {
   butil::EndPoint remote_side_;
   butil::EndPoint local_side_;
 
-  absl::flat_hash_map<std::string_view, std::string_view> headers_;
+  absl::flat_hash_map<std::string, std::string> headers_;
 
   butil::IOBuf request_attachment_;
   butil::IOBuf response_attachment_;
 
   int64_t timeout_ms_ {-1};
   std::stop_token stop_token_;
+
+  int64_t latency_us_ {0};
+  std::chrono::steady_clock::time_point start_time_ {std::chrono::steady_clock::now()};
 };
 
 }  // namespace ant_server::rpc
+
+namespace ant_rpc {
+  using namespace ant_server::rpc;
+}

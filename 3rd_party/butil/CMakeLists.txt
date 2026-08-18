@@ -30,5 +30,6 @@ target_link_libraries(butil PUBLIC
     Threads::Threads
     OpenSSL::SSL
     OpenSSL::Crypto
+    protobuf::libprotobuf
     ${CMAKE_DL_LIBS}
 )

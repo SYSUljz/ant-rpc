@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package ant_server.rpc;
+
+enum RpcMessageType {
+  RPC_REQUEST = 0;
+  RPC_RESPONSE = 1;
+  RPC_HEARTBEAT = 2;
+}
+
+message RpcMeta {
+  uint64 correlation_id = 1;
+  RpcMessageType msg_type = 2;
+  
+  // Request metadata
+  string service_name = 3;
+  string method_name = 4;
+  int64 log_id = 5;
+  int64 timeout_ms = 6;
+  
+  // Response metadata
+  int32 error_code = 7;
+  string error_text = 8;
+  
+  // Zero-copy attachment and custom metadata
+  uint32 attachment_size = 9;
+  map<string, string> headers = 10;
+}

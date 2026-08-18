@@ -1,0 +1,127 @@
+#pragma once
+
+#include <memory>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+
+#include <google/protobuf/descriptor.h>
+#include <google/protobuf/message.h>
+#include <google/protobuf/service.h>
+
+#include "ant_server/rpc/controller.hpp"
+#include "ant_server/rpc/error_code.hpp"
+#include "ant_server/rpc/protocol.hpp"
+#include "butil/iobuf.h"
+
+namespace ant_server::rpc {
+
+class ServiceRegistry {
+ public:
+  ServiceRegistry() = default;
+
+  // Register a Protobuf RPC Service implementation
+  bool RegisterService(google::protobuf::Service* service) {
+    if (!service) return false;
+    const auto* desc = service->GetDescriptor();
+    if (!desc) return false;
+
+    std::string service_name = desc->full_name();
+    if (services_.find(service_name) != services_.end()) {
+      return false;  // Already registered
+    }
+
+    services_[service_name] = service;
+    return true;
+  }
+
+  // Find a service by full name
+  google::protobuf::Service* FindService(std::string_view service_name) const {
+    auto it = services_.find(std::string(service_name));
+    if (it != services_.end()) {
+      return it->second;
+    }
+    return nullptr;
+  }
+
+  // Dispatch and execute an RPC request
+  bool Dispatch(const FrameParseResult& req_frame, butil::IOBuf& resp_out_buf) {
+    const std::string& service_name = req_frame.meta.service_name();
+    const std::string& method_name = req_frame.meta.method_name();
+
+    RpcMeta resp_meta;
+    resp_meta.set_msg_type(RPC_RESPONSE);
+    resp_meta.set_correlation_id(req_frame.meta.correlation_id());
+    resp_meta.set_service_name(service_name);
+    resp_meta.set_method_name(method_name);
+
+    auto* service = FindService(service_name);
+    if (!service) {
+      resp_meta.set_error_code(RPC_ENOSERVICE);
+      resp_meta.set_error_text("Service not found: " + service_name);
+      PackRpcFrame(resp_meta, nullptr, nullptr, resp_out_buf);
+      return true;
+    }
+
+    const auto* service_desc = service->GetDescriptor();
+    const auto* method_desc = service_desc->FindMethodByName(method_name);
+    if (!method_desc) {
+      resp_meta.set_error_code(RPC_ENOMETHOD);
+      resp_meta.set_error_text("Method not found: " + method_name);
+      PackRpcFrame(resp_meta, nullptr, nullptr, resp_out_buf);
+      return true;
+    }
+
+    // 1. Dynamically create Request and Response prototypes
+    std::unique_ptr<google::protobuf::Message> req_msg(service->GetRequestPrototype(method_desc).New());
+    std::unique_ptr<google::protobuf::Message> resp_msg(service->GetResponsePrototype(method_desc).New());
+
+    // 2. Zero-Copy deserialize from request body IOBuf
+    if (!req_frame.body_iobuf.empty()) {
+      butil::IOBufAsZeroCopyInputStream zc_in(req_frame.body_iobuf);
+      if (!req_msg->ParseFromZeroCopyStream(&zc_in)) {
+        resp_meta.set_error_code(RPC_EINVALID_DATA);
+        resp_meta.set_error_text("Failed to parse request protobuf");
+        PackRpcFrame(resp_meta, nullptr, nullptr, resp_out_buf);
+        return true;
+      }
+    }
+
+    // 3. Initialize Controller
+    RpcController cntl;
+    cntl.SetCorrelationId(req_frame.meta.correlation_id());
+    cntl.SetLogId(req_frame.meta.log_id());
+    cntl.SetTimeoutMs(req_frame.meta.timeout_ms());
+    for (const auto& [k, v] : req_frame.meta.headers()) {
+      cntl.SetHeader(k, v);
+    }
+    if (!req_frame.attachment_iobuf.empty()) {
+      cntl.RequestAttachment() = req_frame.attachment_iobuf;
+    }
+
+    // 4. Invoke user RPC service implementation
+    service->CallMethod(method_desc, &cntl, req_msg.get(), resp_msg.get(), nullptr);
+
+    // 5. Populate response metadata from Controller
+    resp_meta.set_error_code(cntl.ErrorCode());
+    resp_meta.set_error_text(cntl.ErrorText());
+    for (const auto& [k, v] : cntl.Headers()) {
+      (*resp_meta.mutable_headers())[k] = v;
+    }
+
+    // 6. Pack response frame
+    const butil::IOBuf* resp_attach = !cntl.ResponseAttachment().empty() ? &cntl.ResponseAttachment() : nullptr;
+    PackRpcFrame(resp_meta, resp_msg.get(), resp_attach, resp_out_buf);
+
+    return true;
+  }
+
+ private:
+  std::unordered_map<std::string, google::protobuf::Service*> services_;
+};
+
+}  // namespace ant_server::rpc
+
+namespace ant_rpc {
+  using namespace ant_server::rpc;
+}

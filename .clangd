@@ -19,6 +19,7 @@ Diagnostics:
       - "zircon-*"
       - "android-*"
       - "altera-*"
+      - "modernize-use-trailing-return-type"
 
 InlayHints:
   Designators: Yes
