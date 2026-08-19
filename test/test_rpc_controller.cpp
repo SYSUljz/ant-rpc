@@ -122,3 +122,60 @@ TEST(RpcControllerTest, ResetCleansAllState) {
   EXPECT_TRUE(cntl.ResponseAttachment().empty());
   EXPECT_FALSE(cntl.IsCanceled());
 }
+
+// 7. Test Inbound RequestHeader Setup and Zero-Copy Header Retrieval
+TEST(RpcControllerTest, RequestHeaderLookup) {
+  RpcController cntl;
+
+  cntl.SetCorrelationId(888);
+  cntl.SetRequestHeader("x-api-key", "secret-key-12345");
+  cntl.SetRequestHeader("x-cluster", "us-east-1");
+
+  EXPECT_EQ(cntl.CorrelationId(), 888);
+  auto api_key = cntl.GetHeader("x-api-key");
+  ASSERT_TRUE(api_key.has_value());
+  EXPECT_EQ(*api_key, "secret-key-12345");
+
+  auto cluster = cntl.GetHeader("x-cluster");
+  ASSERT_TRUE(cluster.has_value());
+  EXPECT_EQ(*cluster, "us-east-1");
+
+  // Custom set header overrides or supplements request meta
+  cntl.SetHeader("x-cluster", "eu-central-1");
+  auto overridden_cluster = cntl.GetHeader("x-cluster");
+  ASSERT_TRUE(overridden_cluster.has_value());
+  EXPECT_EQ(*overridden_cluster, "eu-central-1");
+}
+
+// 8. Test Separate Inbound RequestHeaders and Outbound ResponseHeaders
+TEST(RpcControllerTest, SeparateRequestAndResponseHeaders) {
+  RpcController cntl;
+
+  // Inbound Request Header
+  cntl.SetRequestHeader("authorization", "Bearer my_token");
+  cntl.SetRequestHeader("x-trace-id", "trace-999");
+
+  // Outbound Response Header
+  cntl.SetResponseHeader("x-server-cost-ms", "15");
+  cntl.SetResponseHeader("x-ratelimit-remaining", "88");
+
+  EXPECT_EQ(cntl.RequestHeaders().size(), 2);
+  EXPECT_EQ(cntl.ResponseHeaders().size(), 2);
+
+  EXPECT_EQ(*cntl.GetRequestHeader("authorization"), "Bearer my_token");
+  EXPECT_EQ(*cntl.GetRequestHeader("x-trace-id"), "trace-999");
+  EXPECT_FALSE(cntl.GetRequestHeader("x-server-cost-ms").has_value());
+
+  EXPECT_EQ(*cntl.GetResponseHeader("x-server-cost-ms"), "15");
+  EXPECT_EQ(*cntl.GetResponseHeader("x-ratelimit-remaining"), "88");
+  EXPECT_FALSE(cntl.GetResponseHeader("authorization").has_value());
+
+  // Test O(1) swap of ResponseHeaders into a Protobuf Map
+  google::protobuf::Map<std::string, std::string> target_map;
+  target_map.swap(cntl.MutableResponseHeaders());
+
+  EXPECT_TRUE(cntl.ResponseHeaders().empty());
+  EXPECT_EQ(target_map.size(), 2);
+  EXPECT_EQ(target_map["x-server-cost-ms"], "15");
+}
+

@@ -3,8 +3,8 @@
 #include <memory>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 
+#include <absl/container/flat_hash_map.h>
 #include <google/protobuf/descriptor.h>
 #include <google/protobuf/message.h>
 #include <google/protobuf/service.h>
@@ -26,18 +26,12 @@ class ServiceRegistry {
     const auto* desc = service->GetDescriptor();
     if (!desc) return false;
 
-    std::string service_name = desc->full_name();
-    if (services_.find(service_name) != services_.end()) {
-      return false;  // Already registered
-    }
-
-    services_[service_name] = service;
-    return true;
+    return services_.try_emplace(desc->full_name(), service).second;
   }
 
-  // Find a service by full name
+  // Find a service by full name (Zero-allocation lookup with string_view)
   google::protobuf::Service* FindService(std::string_view service_name) const {
-    auto it = services_.find(std::string(service_name));
+    auto it = services_.find(service_name);
     if (it != services_.end()) {
       return it->second;
     }
@@ -45,13 +39,14 @@ class ServiceRegistry {
   }
 
   // Dispatch and execute an RPC request
-  bool Dispatch(const FrameParseResult& req_frame, butil::IOBuf& resp_out_buf) {
+  bool Dispatch(FrameParseResult& req_frame, butil::IOBuf& resp_out_buf) {
     const std::string& service_name = req_frame.meta.service_name();
     const std::string& method_name = req_frame.meta.method_name();
+    uint64_t correlation_id = req_frame.meta.correlation_id();
 
     RpcMeta resp_meta;
     resp_meta.set_msg_type(RPC_RESPONSE);
-    resp_meta.set_correlation_id(req_frame.meta.correlation_id());
+    resp_meta.set_correlation_id(correlation_id);
     resp_meta.set_service_name(service_name);
     resp_meta.set_method_name(method_name);
 
@@ -87,16 +82,16 @@ class ServiceRegistry {
       }
     }
 
-    // 3. Initialize Controller
+    // 3. Initialize Controller & transfer request headers (Zero-copy)
     RpcController cntl;
-    cntl.SetCorrelationId(req_frame.meta.correlation_id());
+    cntl.SetCorrelationId(correlation_id);
     cntl.SetLogId(req_frame.meta.log_id());
     cntl.SetTimeoutMs(req_frame.meta.timeout_ms());
-    for (const auto& [k, v] : req_frame.meta.headers()) {
-      cntl.SetHeader(k, v);
+    if (!req_frame.meta.headers().empty()) {
+      cntl.MutableRequestHeaders().swap(*req_frame.meta.mutable_headers());
     }
     if (!req_frame.attachment_iobuf.empty()) {
-      cntl.RequestAttachment() = req_frame.attachment_iobuf;
+      cntl.RequestAttachment() = std::move(req_frame.attachment_iobuf);
     }
 
     // 4. Invoke user RPC service implementation
@@ -105,8 +100,8 @@ class ServiceRegistry {
     // 5. Populate response metadata from Controller
     resp_meta.set_error_code(cntl.ErrorCode());
     resp_meta.set_error_text(cntl.ErrorText());
-    for (const auto& [k, v] : cntl.Headers()) {
-      (*resp_meta.mutable_headers())[k] = v;
+    if (!cntl.ResponseHeaders().empty()) {
+      resp_meta.mutable_headers()->swap(cntl.MutableResponseHeaders());
     }
 
     // 6. Pack response frame
@@ -117,7 +112,7 @@ class ServiceRegistry {
   }
 
  private:
-  std::unordered_map<std::string, google::protobuf::Service*> services_;
+  absl::flat_hash_map<std::string, google::protobuf::Service*> services_;
 };
 
 }  // namespace ant_server::rpc

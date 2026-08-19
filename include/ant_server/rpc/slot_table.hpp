@@ -76,7 +76,7 @@ class SlotTable {
   }
 
   // Complete slot on receiving network response (Zero-Copy parse Protobuf + resume coroutine/done)
-  bool CompleteSlot(uint64_t correlation_id, const butil::IOBuf& body_iobuf, const RpcMeta& meta,
+  bool CompleteSlot(uint64_t correlation_id, const butil::IOBuf& body_iobuf, RpcMeta&& meta,
                     const butil::IOBuf& attachment_iobuf) {
     uint32_t slot_id = GetSlotId(correlation_id);
     uint32_t version = GetVersion(correlation_id);
@@ -103,8 +103,8 @@ class SlotTable {
       if (meta.error_code() != RPC_SUCCESS) {
         slot.controller->SetFailed(meta.error_code(), meta.error_text());
       }
-      for (const auto& [k, v] : meta.headers()) {
-        slot.controller->SetHeader(k, v);
+      if (!meta.headers().empty()) {
+        slot.controller->MutableResponseHeaders().swap(*meta.mutable_headers());
       }
       if (!attachment_iobuf.empty()) {
         slot.controller->ResponseAttachment() = attachment_iobuf;
@@ -140,6 +140,12 @@ class SlotTable {
     }
 
     return true;
+  }
+
+  bool CompleteSlot(uint64_t correlation_id, const butil::IOBuf& body_iobuf, const RpcMeta& meta,
+                    const butil::IOBuf& attachment_iobuf) {
+    RpcMeta meta_copy = meta;
+    return CompleteSlot(correlation_id, body_iobuf, std::move(meta_copy), attachment_iobuf);
   }
 
   // Simplified complete slot overload

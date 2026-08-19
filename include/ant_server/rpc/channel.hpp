@@ -134,7 +134,7 @@ class RpcChannel : public google::protobuf::RpcChannel {
             break;
           }
           recv_buffer.pop_front(res.total_frame_bytes);
-          slot_table_.CompleteSlot(res.meta.correlation_id(), res.body_iobuf, res.meta, res.attachment_iobuf);
+          slot_table_.CompleteSlot(res.meta.correlation_id(), res.body_iobuf, std::move(res.meta), res.attachment_iobuf);
         }
       }
     });
@@ -255,8 +255,8 @@ class RpcChannel : public google::protobuf::RpcChannel {
     if (controller) {
       meta.set_log_id(controller->LogId());
       meta.set_timeout_ms(controller->TimeoutMs());
-      for (const auto& [k, v] : controller->Headers()) {
-        (*meta.mutable_headers())[k] = v;
+      if (!controller->Headers().empty()) {
+        *meta.mutable_headers() = controller->Headers();
       }
     }
 
@@ -319,7 +319,7 @@ class RpcChannel : public google::protobuf::RpcChannel {
         }
 
         recv_buffer.pop_front(res.total_frame_bytes);
-        slot_table_.CompleteSlot(res.meta.correlation_id(), res.body_iobuf, res.meta, res.attachment_iobuf);
+        slot_table_.CompleteSlot(res.meta.correlation_id(), res.body_iobuf, std::move(res.meta), res.attachment_iobuf);
       }
     }
     co_return;

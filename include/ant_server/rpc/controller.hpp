@@ -10,10 +10,10 @@
 
 #include <google/protobuf/service.h>
 
-#include "absl/container/flat_hash_map.h"
 #include "ant_server/rpc/error_code.hpp"
 #include "butil/endpoint.h"
 #include "butil/iobuf.h"
+#include "rpc_meta.pb.h"
 
 namespace ant_server::rpc {
 
@@ -45,7 +45,8 @@ class RpcController : public google::protobuf::RpcController {
     timeout_ms_ = -1;
     remote_side_ = butil::EndPoint();
     local_side_ = butil::EndPoint();
-    headers_.clear();
+    request_headers_.clear();
+    response_headers_.clear();
     request_attachment_.clear();
     response_attachment_.clear();
     stop_token_ = std::stop_token();
@@ -107,27 +108,76 @@ class RpcController : public google::protobuf::RpcController {
   [[nodiscard]] const butil::EndPoint& LocalSide() const noexcept { return local_side_; }
 
   // --------------------------------------------------------------------------
-  // 5. Custom Metadata / Headers (Key-Value pairs)
+  // 5. Inbound Request Metadata / Headers (Client -> Server)
   // --------------------------------------------------------------------------
-  void SetHeader(std::string_view key, std::string_view value) {
-    headers_[std::string(key)] = std::string(value);
+  void SetRequestHeader(std::string_view key, std::string_view value) {
+    request_headers_[std::string(key)] = std::string(value);
   }
 
-  [[nodiscard]] std::optional<std::string_view> GetHeader(std::string_view key) const {
-    auto it = headers_.find(std::string(key));
-    if (it != headers_.end()) {
-      return it->second;
+  void SetHeader(std::string_view key, std::string_view value) {
+    SetRequestHeader(key, value);
+  }
+
+  [[nodiscard]] std::optional<std::string_view> GetRequestHeader(std::string_view key) const {
+    auto map_it = request_headers_.find(std::string(key));
+    if (map_it != request_headers_.end()) {
+      return map_it->second;
     }
     return std::nullopt;
   }
 
-  [[nodiscard]] const absl::flat_hash_map<std::string, std::string>& Headers() const noexcept {
-    return headers_;
+  [[nodiscard]] const google::protobuf::Map<std::string, std::string>& RequestHeaders() const noexcept {
+    return request_headers_;
   }
-  absl::flat_hash_map<std::string, std::string>& MutableHeaders() noexcept { return headers_; }
+
+  google::protobuf::Map<std::string, std::string>& MutableRequestHeaders() noexcept {
+    return request_headers_;
+  }
 
   // --------------------------------------------------------------------------
-  // 6. Zero-Copy Attachments (butil::IOBuf)
+  // 6. Outbound Response Metadata / Headers (Server -> Client)
+  // --------------------------------------------------------------------------
+  void SetResponseHeader(std::string_view key, std::string_view value) {
+    response_headers_[std::string(key)] = std::string(value);
+  }
+
+  [[nodiscard]] std::optional<std::string_view> GetResponseHeader(std::string_view key) const {
+    auto map_it = response_headers_.find(std::string(key));
+    if (map_it != response_headers_.end()) {
+      return map_it->second;
+    }
+    return std::nullopt;
+  }
+
+  [[nodiscard]] const google::protobuf::Map<std::string, std::string>& ResponseHeaders() const noexcept {
+    return response_headers_;
+  }
+
+  google::protobuf::Map<std::string, std::string>& MutableResponseHeaders() noexcept {
+    return response_headers_;
+  }
+
+  // --------------------------------------------------------------------------
+  // Unified / Backwards-compatible Header Interface
+  // --------------------------------------------------------------------------
+  [[nodiscard]] std::optional<std::string_view> GetHeader(std::string_view key) const {
+    auto resp_hdr = GetResponseHeader(key);
+    if (resp_hdr.has_value()) {
+      return resp_hdr;
+    }
+    return GetRequestHeader(key);
+  }
+
+  [[nodiscard]] const google::protobuf::Map<std::string, std::string>& Headers() const noexcept {
+    return RequestHeaders();
+  }
+
+  google::protobuf::Map<std::string, std::string>& MutableHeaders() noexcept {
+    return MutableRequestHeaders();
+  }
+
+  // --------------------------------------------------------------------------
+  // 7. Zero-Copy Attachments (butil::IOBuf)
   // --------------------------------------------------------------------------
   butil::IOBuf& RequestAttachment() noexcept { return request_attachment_; }
   [[nodiscard]] const butil::IOBuf& RequestAttachment() const noexcept { return request_attachment_; }
@@ -136,7 +186,7 @@ class RpcController : public google::protobuf::RpcController {
   [[nodiscard]] const butil::IOBuf& ResponseAttachment() const noexcept { return response_attachment_; }
 
   // --------------------------------------------------------------------------
-  // 7. Timeout & Cancellation
+  // 8. Timeout & Cancellation
   // --------------------------------------------------------------------------
   void SetTimeoutMs(int64_t timeout_ms) noexcept { timeout_ms_ = timeout_ms; }
   [[nodiscard]] int64_t TimeoutMs() const noexcept { return timeout_ms_; }
@@ -148,7 +198,7 @@ class RpcController : public google::protobuf::RpcController {
   [[nodiscard]] std::stop_token GetStopToken() const noexcept { return stop_token_; }
 
   // --------------------------------------------------------------------------
-  // 8. Performance & Latency Metrics
+  // 9. Performance & Latency Metrics
   // --------------------------------------------------------------------------
   void RecordStart() { start_time_ = std::chrono::steady_clock::now(); }
   void set_latency_us(int64_t us) noexcept { latency_us_ = us; }
@@ -171,7 +221,8 @@ class RpcController : public google::protobuf::RpcController {
   butil::EndPoint remote_side_;
   butil::EndPoint local_side_;
 
-  absl::flat_hash_map<std::string, std::string> headers_;
+  google::protobuf::Map<std::string, std::string> request_headers_;
+  google::protobuf::Map<std::string, std::string> response_headers_;
 
   butil::IOBuf request_attachment_;
   butil::IOBuf response_attachment_;
