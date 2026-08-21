@@ -36,6 +36,9 @@ inline constexpr uint16_t kProvidedBufferGroupId = 1;
 inline constexpr std::size_t kDefaultTimingWheelSlots = 4096;
 inline constexpr std::size_t kDefaultTimingWheelSlotMask = kDefaultTimingWheelSlots - 1;
 inline constexpr int64_t kDefaultTimingWheelTickMs = 10;
+inline constexpr std::size_t kDefaultTimerNumBuckets = 16;
+inline constexpr std::size_t kDefaultTimerBucketMask = kDefaultTimerNumBuckets - 1;
+inline constexpr std::size_t kDefaultTimerHeapReserveSize = 4096;
 
 // TypeErasedTask constants
 inline constexpr std::size_t kTaskSboSize = 48;

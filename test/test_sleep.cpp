@@ -140,3 +140,110 @@ TEST(SleepTest, ConcurrentStaggeredSleep) {
 
   scheduler.Stop();
 }
+
+// 5. Explicit CancelTimer test: canceled timers should not trigger
+TEST(SleepTest, TimerCancellation) {
+  WorkStealingExecutor executor(2);
+  executor.Start();
+
+  TimerKeeper timer_keeper(executor);
+  timer_keeper.Start();
+
+  std::atomic<bool> timer1_fired {false};
+  std::atomic<bool> timer2_fired {false};
+  std::atomic<bool> timer3_fired {false};
+
+  uint64_t id1 = timer_keeper.AddTimer(30ms, [&timer1_fired]() { timer1_fired.store(true); });
+  uint64_t id2 = timer_keeper.AddTimer(60ms, [&timer2_fired]() { timer2_fired.store(true); });
+  uint64_t id3 = timer_keeper.AddTimer(90ms, [&timer3_fired]() { timer3_fired.store(true); });
+
+  // Cancel timer2
+  timer_keeper.CancelTimer(id2);
+
+  // Wait 120ms
+  std::this_thread::sleep_for(120ms);
+
+  EXPECT_TRUE(timer1_fired.load());
+  EXPECT_FALSE(timer2_fired.load());
+  EXPECT_TRUE(timer3_fired.load());
+
+  timer_keeper.Stop();
+  executor.Stop();
+}
+
+// 6. Out-of-order insertion test for 4-ary Min-Heap
+TEST(SleepTest, ReverseOrderInsertionAndHeapSorting) {
+  WorkStealingExecutor executor(2);
+  executor.Start();
+
+  TimerKeeper timer_keeper(executor);
+  timer_keeper.Start();
+
+  std::vector<int> order;
+  absl::Mutex mu;
+
+  // Insert in reverse order: 50ms, 40ms, 30ms, 20ms, 10ms
+  for (int delay_ms = 50; delay_ms >= 10; delay_ms -= 10) {
+    timer_keeper.AddTimer(std::chrono::milliseconds(delay_ms), [&mu, &order, delay_ms]() {
+      absl::MutexLock lock(&mu);
+      order.push_back(delay_ms);
+    });
+  }
+
+  std::this_thread::sleep_for(100ms);
+
+  {
+    absl::MutexLock lock(&mu);
+    ASSERT_EQ(order.size(), 5);
+    EXPECT_EQ(order[0], 10);
+    EXPECT_EQ(order[1], 20);
+    EXPECT_EQ(order[2], 30);
+    EXPECT_EQ(order[3], 40);
+    EXPECT_EQ(order[4], 50);
+  }
+
+  timer_keeper.Stop();
+  executor.Stop();
+}
+
+// 7. High concurrency massive timer scheduling
+TEST(SleepTest, MassiveConcurrentTimers) {
+  WorkStealingExecutor executor(4);
+  executor.Start();
+
+  TimerKeeper timer_keeper(executor);
+  timer_keeper.Start();
+
+  constexpr size_t kNumThreads = 8;
+  constexpr size_t kTimersPerThread = 100;
+  std::atomic<size_t> trigger_count {0};
+
+  std::vector<std::thread> threads;
+  threads.reserve(kNumThreads);
+
+  for (size_t t = 0; t < kNumThreads; ++t) {
+    threads.emplace_back([&timer_keeper, &trigger_count, t]() {
+      for (size_t i = 0; i < kTimersPerThread; ++i) {
+        auto delay = std::chrono::milliseconds(10 + (i % 10));
+        timer_keeper.AddTimer(delay, [&trigger_count]() { trigger_count.fetch_add(1, std::memory_order_relaxed); });
+      }
+    });
+  }
+
+  for (auto& th : threads) {
+    th.join();
+  }
+
+  auto wait_start = std::chrono::steady_clock::now();
+  while (trigger_count.load(std::memory_order_relaxed) < kNumThreads * kTimersPerThread) {
+    if (std::chrono::steady_clock::now() - wait_start > 3s) {
+      break;
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+
+  EXPECT_EQ(trigger_count.load(), kNumThreads * kTimersPerThread);
+
+  timer_keeper.Stop();
+  executor.Stop();
+}
