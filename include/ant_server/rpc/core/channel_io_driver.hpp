@@ -3,36 +3,23 @@
 #include <unistd.h>
 
 #include <atomic>
-#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <memory>
-#include <mutex>
 #include <utility>
 
 #include <sys/socket.h>
 
 #include "ant_server/awaiter/socket_awaiter.hpp"
 #include "ant_server/context/context.hpp"
+#include "ant_server/rpc/core/channel_state.hpp"
 #include "ant_server/rpc/protocol.hpp"
-#include "ant_server/rpc/slot_table.hpp"
 #include "ant_server/type.hpp"
 #include "butil/iobuf.h"
 
 namespace ant_server::rpc::detail {
 
-// State shared by the public channel facade and its IO-thread driver.  Slot
-// allocation is thread-safe; all socket state belongs exclusively to the
-// driver below.
-struct ChannelState {
-  SlotTable<65536> slots;
-  std::atomic<bool> running {false};
-
-  std::mutex close_mu;
-  std::condition_variable close_cv;
-  bool closed {true};
-};
-
+// IO-thread-only state machine for one connected RPC channel.
 class RpcChannelIoDriver : public IoCommandMailbox, public std::enable_shared_from_this<RpcChannelIoDriver> {
  public:
   struct OutboundFrame {
@@ -54,22 +41,18 @@ class RpcChannelIoDriver : public IoCommandMailbox, public std::enable_shared_fr
       : context_(context), state_(std::move(state)), fd_(fd) {}
 
   int fd() const noexcept { return fd_.load(std::memory_order_acquire); }
-
-  // Thread-safe entry points. They enqueue concrete ChannelCommand values.
   void Start() { PostCommand(ChannelCommand::Start()); }
-
   void Enqueue(OutboundFrame frame) { PostCommand(ChannelCommand::SendFrame(std::move(frame))); }
 
   void RequestClose() {
-    if (!state_->running.exchange(false, std::memory_order_acq_rel)) {
-      return;
+    if (state_->running.exchange(false, std::memory_order_acq_rel)) {
+      PostCommand(ChannelCommand::Close());
     }
-    PostCommand(ChannelCommand::Close());
   }
 
   void WaitClosed() {
     if (g_local_context == &context_) {
-      return;  // A callback running on the IO owner cannot block that owner.
+      return;
     }
     std::unique_lock<std::mutex> lock(state_->close_mu);
     state_->close_cv.wait(lock, [this] { return state_->closed; });
@@ -102,7 +85,6 @@ class RpcChannelIoDriver : public IoCommandMailbox, public std::enable_shared_fr
     context_.Notify(shared_from_this());
   }
 
-  // Everything below this line is IO-thread-only.
   void StartOnIoThread() {
     if (!state_->running.load(std::memory_order_acquire)) {
       receiver_exited_ = true;
@@ -114,8 +96,7 @@ class RpcChannelIoDriver : public IoCommandMailbox, public std::enable_shared_fr
   }
 
   void BeginCloseOnIoThread() {
-    const int current_fd = fd();
-    if (current_fd >= 0) {
+    if (const int current_fd = fd(); current_fd >= 0) {
       shutdown(current_fd, SHUT_RDWR);
     }
     if (!receiver_started_) {
@@ -132,7 +113,6 @@ class RpcChannelIoDriver : public IoCommandMailbox, public std::enable_shared_fr
       if (bytes_read <= 0) {
         break;
       }
-
       while (true) {
         FrameParseResult result = TryParseRpcFrame(recv_buffer);
         if (result.status == FrameParseStatus::NEED_MORE_DATA) {
@@ -159,8 +139,7 @@ class RpcChannelIoDriver : public IoCommandMailbox, public std::enable_shared_fr
       if (written <= 0) {
         self->state_->slots.TimeoutSlot(frame.correlation_id, "Failed to send RPC request");
         self->state_->running.store(false, std::memory_order_release);
-        const int current_fd = self->fd();
-        if (current_fd >= 0) {
+        if (const int current_fd = self->fd(); current_fd >= 0) {
           shutdown(current_fd, SHUT_RDWR);
         }
         break;
@@ -187,8 +166,7 @@ class RpcChannelIoDriver : public IoCommandMailbox, public std::enable_shared_fr
     if (state_->running.load(std::memory_order_acquire) || !receiver_exited_ || writing_) {
       return;
     }
-    const int current_fd = fd_.exchange(-1, std::memory_order_acq_rel);
-    if (current_fd >= 0) {
+    if (const int current_fd = fd_.exchange(-1, std::memory_order_acq_rel); current_fd >= 0) {
       close(current_fd);
     }
     std::lock_guard<std::mutex> lock(state_->close_mu);

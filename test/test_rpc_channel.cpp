@@ -1,5 +1,6 @@
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <string>
@@ -32,6 +33,22 @@ class EchoServiceImpl : public ant_rpc::EchoService {
       done->Run();
     }
   }
+};
+
+// A protobuf-compatible controller that is intentionally not this project's
+// RpcController. It verifies the compatibility boundary rejects unsafe casts.
+class ForeignRpcController final : public google::protobuf::RpcController {
+ public:
+  void Reset() override { error_.clear(); }
+  bool Failed() const override { return !error_.empty(); }
+  std::string ErrorText() const override { return error_; }
+  void StartCancel() override {}
+  void SetFailed(const std::string& reason) override { error_ = reason; }
+  bool IsCanceled() const override { return false; }
+  void NotifyOnCancel(google::protobuf::Closure* callback) override { callback->Run(); }
+
+ private:
+  std::string error_;
 };
 
 class RpcChannelTest : public ::testing::Test {
@@ -79,9 +96,15 @@ class RpcChannelTest : public ::testing::Test {
   void TearDown() override {
     server_ctx_.Stop();
     client_ctx_.Stop();
-    if (server_thread_.joinable()) server_thread_.join();
-    if (client_thread_.joinable()) client_thread_.join();
-    if (server_socket_ >= 0) close(server_socket_);
+    if (server_thread_.joinable()) {
+      server_thread_.join();
+    }
+    if (client_thread_.joinable()) {
+      client_thread_.join();
+    }
+    if (server_socket_ >= 0) {
+      close(server_socket_);
+    }
   }
 };
 
@@ -135,6 +158,29 @@ TEST_F(RpcChannelTest, AsyncCallbackCall) {
   channel.Close();
 }
 
+TEST_F(RpcChannelTest, RejectsForeignProtobufController) {
+  ant_rpc::RpcChannel channel(client_ctx_);
+  ASSERT_EQ(channel.Init("127.0.0.1", port_), 0);
+  ant_rpc::EchoService_Stub stub(&channel);
+
+  ForeignRpcController controller;
+  ant_rpc::EchoRequest request;
+  ant_rpc::EchoResponse response;
+  absl::Notification done_notification;
+  struct TestClosure final : google::protobuf::Closure {
+    explicit TestClosure(absl::Notification& notification) : notification(notification) {}
+    void Run() override { notification.Notify(); }
+    absl::Notification& notification;
+  } done(done_notification);
+
+  stub.Echo(&controller, &request, &response, &done);
+
+  EXPECT_TRUE(done_notification.WaitForNotificationWithTimeout(absl::Seconds(1)));
+  EXPECT_TRUE(controller.Failed());
+  EXPECT_NE(controller.ErrorText().find("requires ant_server::rpc::RpcController"), std::string::npos);
+  channel.Close();
+}
+
 TEST_F(RpcChannelTest, CoroutineCallMethodTemplate) {
   ant_rpc::RpcChannel channel(client_ctx_);
   ASSERT_EQ(channel.Init("127.0.0.1", port_), 0);
@@ -185,5 +231,43 @@ TEST_F(RpcChannelTest, HighConcurrencyMultiplexingOnSingleTcpConnection) {
   ASSERT_TRUE(all_done.WaitForNotificationWithTimeout(absl::Seconds(5)));
   EXPECT_EQ(completed_calls.load(), TOTAL_CALLS);
 
+  channel.Close();
+}
+
+TEST_F(RpcChannelTest, SharedChannelAcceptsCallsFromMultipleExternalThreads) {
+  ant_rpc::RpcChannel channel(client_ctx_);
+  ASSERT_EQ(channel.Init("127.0.0.1", port_), 0);
+
+  constexpr int kThreadCount = 4;
+  constexpr int kCallsPerThread = 20;
+  std::atomic<int> successful_calls {0};
+  std::atomic<bool> failed {false};
+  std::vector<std::thread> callers;
+  callers.reserve(kThreadCount);
+
+  for (int thread_id = 0; thread_id < kThreadCount; ++thread_id) {
+    callers.emplace_back([&channel, &successful_calls, &failed, thread_id] {
+      ant_rpc::EchoService_Stub stub(&channel);
+      for (int call_id = 0; call_id < kCallsPerThread; ++call_id) {
+        ant_rpc::RpcController controller;
+        ant_rpc::EchoRequest request;
+        ant_rpc::EchoResponse response;
+        const std::string payload = "external-" + std::to_string(thread_id) + "-" + std::to_string(call_id);
+        request.set_message(payload);
+        stub.Echo(&controller, &request, &response, nullptr);
+        if (controller.Failed() || response.message() != "Echo: " + payload) {
+          failed.store(true, std::memory_order_release);
+          return;
+        }
+        successful_calls.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  }
+  for (auto& caller : callers) {
+    caller.join();
+  }
+
+  EXPECT_FALSE(failed.load(std::memory_order_acquire));
+  EXPECT_EQ(successful_calls.load(std::memory_order_relaxed), kThreadCount * kCallsPerThread);
   channel.Close();
 }
