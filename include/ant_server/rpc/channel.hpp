@@ -2,8 +2,6 @@
 
 #include <unistd.h>
 
-#include <atomic>
-#include <chrono>
 #include <coroutine>
 #include <memory>
 #include <mutex>
@@ -21,12 +19,12 @@
 #include <sys/socket.h>
 
 #include "absl/synchronization/notification.h"
-#include "ant_server/awaiter/socket_awaiter.hpp"
 #include "ant_server/context/context.hpp"
 #include "ant_server/coroutine/task.hpp"
+#include "ant_server/rpc/channel_io_driver.hpp"
 #include "ant_server/rpc/controller.hpp"
+#include "ant_server/rpc/error_code.hpp"
 #include "ant_server/rpc/protocol.hpp"
-#include "ant_server/rpc/slot_table.hpp"
 #include "butil/endpoint.h"
 #include "butil/iobuf.h"
 
@@ -37,12 +35,9 @@ struct RpcChannelOptions {
   int64_t timeout_ms {5000};
   bool tcp_no_delay {true};
 };
-
 using ChannelOptions = RpcChannelOptions;
 
 class RpcChannel;
-
-// Modern C++20 Coroutine Awaiter for RPC Call
 struct RpcCallAwaiter {
   RpcChannel& channel;
   std::string_view service_name;
@@ -51,205 +46,179 @@ struct RpcCallAwaiter {
   const google::protobuf::Message* request;
   google::protobuf::Message* response;
   uint64_t correlation_id {0};
-
   bool await_ready() const noexcept { return false; }
   void await_suspend(std::coroutine_handle<> handle) noexcept;
   void await_resume() noexcept {}
 };
 
-// High-Performance Multiplexing C++20 RPC Channel implementing google::protobuf::RpcChannel
+// Thread-safe API facade. Socket state and all IO-thread-only code live in
+// RpcChannelIoDriver, making the ownership boundary explicit.
 class RpcChannel : public google::protobuf::RpcChannel {
  public:
-  RpcChannel() : ctx_(nullptr) {}
-  explicit RpcChannel(Context& ctx) : ctx_(&ctx) {}
-
+  RpcChannel() : state_(std::make_shared<detail::ChannelState>()) {}
+  explicit RpcChannel(Context& context) : ctx_(&context), state_(std::make_shared<detail::ChannelState>()) {}
   ~RpcChannel() override { Close(); }
-
   RpcChannel(const RpcChannel&) = delete;
   RpcChannel& operator=(const RpcChannel&) = delete;
 
-  // Initialize TCP connection with IP and Port
   int Init(const std::string& server_ip, int port, const RpcChannelOptions* options = nullptr) {
-    butil::ip_t ip_val;
-    if (butil::str2ip(server_ip.c_str(), &ip_val) != 0) {
-      return -1;
-    }
-    return Init(butil::EndPoint(ip_val, port), options);
+    butil::ip_t ip_value;
+    return butil::str2ip(server_ip.c_str(), &ip_value) == 0 ? Init(butil::EndPoint(ip_value, port), options) : -1;
   }
-
   int Init(const char* ip, int port, const RpcChannelOptions* options = nullptr) {
     return Init(std::string(ip), port, options);
   }
-
-  // Initialize TCP connection with butil::EndPoint
   int Init(butil::EndPoint endpoint, const RpcChannelOptions* options = nullptr) {
-    if (running_.load(std::memory_order_relaxed)) {
-      Close();
-    }
+    Close();
     if (options) {
       options_ = *options;
     }
     endpoint_ = endpoint;
-
-    client_fd_ = socket(AF_INET, SOCK_STREAM, 0);
-    if (client_fd_ < 0) {
+    EnsureContext();
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+      StopOwnedContext();
       return -1;
     }
-
     if (options_.tcp_no_delay) {
-      int flag = 1;
-      setsockopt(client_fd_, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+      int enabled = 1;
+      setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
     }
-
-    struct sockaddr_in serv_addr {};
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(endpoint_.port);
-    serv_addr.sin_addr = endpoint_.ip;
-
-    if (connect(client_fd_, reinterpret_cast<struct sockaddr*>(&serv_addr), sizeof(serv_addr)) < 0) {
-      close(client_fd_);
-      client_fd_ = -1;
+    sockaddr_in address {};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(endpoint_.port);
+    address.sin_addr = endpoint_.ip;
+    if (connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0) {
+      close(fd);
+      StopOwnedContext();
       return -1;
     }
 
-    running_.store(true, std::memory_order_release);
-
-    // Launch background Receiver thread (bRPC InputMessenger style)
-    reader_thread_ = std::thread([this]() {
-      butil::IOBuf recv_buffer;
-      char temp[4096];
-      while (running_.load(std::memory_order_acquire)) {
-        ssize_t n = recv(client_fd_, temp, sizeof(temp), 0);
-        if (n <= 0) {
-          break;
-        }
-        recv_buffer.append(temp, n);
-        while (true) {
-          FrameParseResult res = TryParseRpcFrame(recv_buffer);
-          if (res.status == FrameParseStatus::NEED_MORE_DATA) {
-            break;
-          }
-          if (res.status != FrameParseStatus::SUCCESS) {
-            recv_buffer.clear();
-            break;
-          }
-          recv_buffer.pop_front(res.total_frame_bytes);
-          slot_table_.CompleteSlot(res.meta.correlation_id(), res.body_iobuf, std::move(res.meta), res.attachment_iobuf);
-        }
-      }
-    });
-
+    auto state = std::make_shared<detail::ChannelState>();
+    {
+      std::lock_guard<std::mutex> lock(state->close_mu);
+      state->closed = false;
+    }
+    state->running.store(true, std::memory_order_release);
+    auto driver = std::make_shared<detail::RpcChannelIoDriver>(*ctx_, state, fd);
+    {
+      std::lock_guard<std::mutex> lock(channel_mu_);
+      state_ = std::move(state);
+      driver_ = driver;
+    }
+    driver->Start();
     return 0;
   }
 
   void Close() {
-    if (running_.exchange(false, std::memory_order_acq_rel)) {
-      if (client_fd_ >= 0) {
-        shutdown(client_fd_, SHUT_RDWR);
-        close(client_fd_);
-        client_fd_ = -1;
-      }
-      if (reader_thread_.joinable()) {
-        reader_thread_.join();
+    std::shared_ptr<detail::RpcChannelIoDriver> driver;
+    {
+      std::lock_guard<std::mutex> lock(channel_mu_);
+      driver = driver_;
+    }
+    if (driver) {
+      driver->RequestClose();
+      driver->WaitClosed();
+      std::lock_guard<std::mutex> lock(channel_mu_);
+      if (driver_ == driver) {
+        driver_.reset();
       }
     }
+    StopOwnedContext();
   }
 
-  int fd() const noexcept { return client_fd_; }
-  SlotTable<65536>& slot_table() { return slot_table_; }
+  int fd() const noexcept {
+    std::lock_guard<std::mutex> lock(channel_mu_);
+    return driver_ ? driver_->fd() : -1;
+  }
+  SlotTable<65536>& slot_table() { return state_->slots; }
 
-  // Standard Protobuf RpcChannel interface implementation
   void CallMethod(const google::protobuf::MethodDescriptor* method, google::protobuf::RpcController* controller,
                   const google::protobuf::Message* request, google::protobuf::Message* response,
                   google::protobuf::Closure* done) override {
-    auto* cntl = static_cast<RpcController*>(controller);
-
-    if (done != nullptr) {
-      SendRpc(method->service()->full_name(), method->name(), cntl, request, response, nullptr, done);
-    } else {
-      absl::Notification notify;
-      struct SyncClosure : public google::protobuf::Closure {
-        absl::Notification& n;
-        explicit SyncClosure(absl::Notification& notif) : n(notif) {}
-        void Run() override { n.Notify(); }
-      } sync_done(notify);
-
-      SendRpc(method->service()->full_name(), method->name(), cntl, request, response, nullptr, &sync_done);
-
-      int64_t timeout = (cntl && cntl->TimeoutMs() > 0) ? cntl->TimeoutMs() : options_.timeout_ms;
-      if (!notify.WaitForNotificationWithTimeout(absl::Milliseconds(timeout))) {
-        if (cntl) {
-          cntl->SetFailed(RPC_ETIMEOUT, "RPC call timed out");
-        }
+    auto* rpc_controller = dynamic_cast<RpcController*>(controller);
+    if (controller && !rpc_controller) {
+      controller->SetFailed("RpcChannel requires ant_server::rpc::RpcController");
+      if (done) {
+        done->Run();
       }
+      return;
+    }
+    if (done) {
+      SendRpc(method->service()->full_name(), method->name(), rpc_controller, request, response, nullptr, done);
+      return;
+    }
+    absl::Notification notification;
+    struct SyncClosure final : google::protobuf::Closure {
+      explicit SyncClosure(absl::Notification& value) : notification(value) {}
+      void Run() override { notification.Notify(); }
+      absl::Notification& notification;
+    } closure(notification);
+    SendRpc(method->service()->full_name(), method->name(), rpc_controller, request, response, nullptr, &closure);
+    const int64_t timeout =
+        rpc_controller && rpc_controller->TimeoutMs() > 0 ? rpc_controller->TimeoutMs() : options_.timeout_ms;
+    if (!notification.WaitForNotificationWithTimeout(absl::Milliseconds(timeout)) && rpc_controller) {
+      rpc_controller->SetFailed(RPC_ETIMEOUT, "RPC call timed out");
     }
   }
 
-  // Raw IOBuf method call (useful for testing or direct binary RPC)
-  void CallMethod(std::string_view service_name, std::string_view method_name, RpcController& cntl,
-                  const butil::IOBuf& req_body, butil::IOBuf& resp_body) {
-    absl::Notification notify;
-    struct SyncClosure : public google::protobuf::Closure {
-      absl::Notification& n;
-      explicit SyncClosure(absl::Notification& notif) : n(notif) {}
-      void Run() override { n.Notify(); }
-    } sync_done(notify);
-
-    SendRpc(service_name, method_name, &cntl, nullptr, nullptr, nullptr, &sync_done, &req_body, &resp_body);
-
-    int64_t timeout = cntl.TimeoutMs() > 0 ? cntl.TimeoutMs() : options_.timeout_ms;
-    if (!notify.WaitForNotificationWithTimeout(absl::Milliseconds(timeout))) {
-      cntl.SetFailed(RPC_ETIMEOUT, "RPC call timed out");
+  void CallMethod(std::string_view service_name, std::string_view method_name, RpcController& controller,
+                  const butil::IOBuf& request_body, butil::IOBuf& response_body) {
+    absl::Notification notification;
+    struct SyncClosure final : google::protobuf::Closure {
+      explicit SyncClosure(absl::Notification& value) : notification(value) {}
+      void Run() override { notification.Notify(); }
+      absl::Notification& notification;
+    } closure(notification);
+    SendRpc(service_name, method_name, &controller, nullptr, nullptr, nullptr, &closure, &request_body, &response_body);
+    const int64_t timeout = controller.TimeoutMs() > 0 ? controller.TimeoutMs() : options_.timeout_ms;
+    if (!notification.WaitForNotificationWithTimeout(absl::Milliseconds(timeout))) {
+      controller.SetFailed(RPC_ETIMEOUT, "RPC call timed out");
     }
   }
 
-  // C++20 Coroutine Async Call Awaiter generator
   RpcCallAwaiter CallAsync(const google::protobuf::MethodDescriptor* method, RpcController* controller,
                            const google::protobuf::Message* request, google::protobuf::Message* response) {
-    return RpcCallAwaiter {*this, method->service()->full_name(), method->name(), controller, request, response};
+    return {*this, method->service()->full_name(), method->name(), controller, request, response};
   }
-
   RpcCallAwaiter CallAsync(std::string_view service_name, std::string_view method_name, RpcController* controller,
                            const google::protobuf::Message* request, google::protobuf::Message* response) {
-    return RpcCallAwaiter {*this, service_name, method_name, controller, request, response};
+    return {*this, service_name, method_name, controller, request, response};
   }
-
-  // Modern C++20 Value-returning CallMethod template
   template <typename ResponseType>
   Task<ResponseType> Call(std::string_view service_name, std::string_view method_name,
                           const google::protobuf::Message& request, RpcController* controller = nullptr) {
-    ResponseType resp;
-    co_await CallAsync(service_name, method_name, controller, &request, &resp);
-    co_return resp;
+    ResponseType response;
+    co_await CallAsync(service_name, method_name, controller, &request, &response);
+    co_return response;
   }
 
-  // Send encoded RPC frame into socket (Thread-safe frame sending)
   uint64_t SendRpc(std::string_view service_name, std::string_view method_name, RpcController* controller,
                    const google::protobuf::Message* request, google::protobuf::Message* response,
                    std::coroutine_handle<> handle, google::protobuf::Closure* done,
-                   const butil::IOBuf* req_raw_body = nullptr, butil::IOBuf* resp_raw_body = nullptr) {
+                   const butil::IOBuf* raw_request_body = nullptr, butil::IOBuf* raw_response_body = nullptr) {
+    std::shared_ptr<detail::ChannelState> state;
+    std::shared_ptr<detail::RpcChannelIoDriver> driver;
+    {
+      std::lock_guard<std::mutex> lock(channel_mu_);
+      state = state_;
+      driver = driver_;
+    }
     if (controller) {
       controller->RecordStart();
     }
-
-    // 1. Allocate slot
-    uint64_t cid = slot_table_.AllocateSlot(handle, response, controller, done, resp_raw_body);
-    if (cid == 0) {
-      if (controller) {
-        controller->SetFailed(RPC_EOVERLOAD, "RPC slot table capacity exhausted");
-      }
-      if (handle) {
-        handle.resume();
-      } else if (done) {
-        done->Run();
-      }
+    if (!driver || !state->running.load(std::memory_order_acquire)) {
+      FailImmediately(controller, handle, done, "Connection closed");
       return 0;
     }
-
-    // 2. Build RpcMeta
+    const uint64_t correlation_id = state->slots.AllocateSlot(handle, response, controller, done, raw_response_body);
+    if (correlation_id == 0) {
+      FailImmediately(controller, handle, done, "RPC slot table capacity exhausted", RPC_EOVERLOAD);
+      return 0;
+    }
     RpcMeta meta;
     meta.set_msg_type(RPC_REQUEST);
-    meta.set_correlation_id(cid);
+    meta.set_correlation_id(correlation_id);
     meta.set_service_name(std::string(service_name));
     meta.set_method_name(std::string(method_name));
     if (controller) {
@@ -259,80 +228,61 @@ class RpcChannel : public google::protobuf::RpcChannel {
         *meta.mutable_headers() = controller->Headers();
       }
     }
-
-    // 3. Pack Frame
-    butil::IOBuf send_buf;
+    auto frame = std::make_shared<butil::IOBuf>();
     const butil::IOBuf* attachment = controller ? &controller->RequestAttachment() : nullptr;
     if (request) {
-      PackRpcFrame(meta, request, attachment, send_buf);
-    } else if (req_raw_body) {
-      PackRpcFrame(meta, *req_raw_body, attachment, send_buf);
+      PackRpcFrame(meta, request, attachment, *frame);
+    } else if (raw_request_body) {
+      PackRpcFrame(meta, *raw_request_body, attachment, *frame);
     } else {
-      butil::IOBuf empty_body;
-      PackRpcFrame(meta, empty_body, attachment, send_buf);
+      butil::IOBuf empty;
+      PackRpcFrame(meta, empty, attachment, *frame);
     }
-
-    // 4. Send over TCP socket with write mutex (atomic frame boundary)
-    {
-      std::lock_guard<std::mutex> lock(write_mu_);
-      if (client_fd_ < 0) {
-        slot_table_.TimeoutSlot(cid, "Connection closed");
-        return cid;
-      }
-
-      size_t blk_num = send_buf.backing_block_num();
-      for (size_t i = 0; i < blk_num; ++i) {
-        butil::StringPiece sp = send_buf.backing_block(i);
-        size_t written = 0;
-        while (written < sp.size()) {
-          ssize_t sent = send(client_fd_, sp.data() + written, sp.size() - written, MSG_NOSIGNAL);
-          if (sent < 0) {
-            slot_table_.TimeoutSlot(cid, "Failed to send RPC request: " + std::string(strerror(errno)));
-            return cid;
-          }
-          written += sent;
-        }
-      }
-    }
-
-    return cid;
+    driver->Enqueue({correlation_id, std::move(frame)});
+    return correlation_id;
   }
 
  private:
-  // Background Receiver Coroutine for Context
-  Task<void> ReceiverLoop() {
-    butil::IOBuf recv_buffer;
-    while (running_.load(std::memory_order_acquire)) {
-      int bytes_read = co_await ReadAwaiter(*ctx_, client_fd_, recv_buffer);
-      if (bytes_read <= 0) {
-        break;
-      }
-
-      while (true) {
-        FrameParseResult res = TryParseRpcFrame(recv_buffer);
-        if (res.status == FrameParseStatus::NEED_MORE_DATA) {
-          break;
-        }
-        if (res.status != FrameParseStatus::SUCCESS) {
-          recv_buffer.clear();
-          break;
-        }
-
-        recv_buffer.pop_front(res.total_frame_bytes);
-        slot_table_.CompleteSlot(res.meta.correlation_id(), res.body_iobuf, std::move(res.meta), res.attachment_iobuf);
-      }
+  void EnsureContext() {
+    if (ctx_) {
+      return;
     }
-    co_return;
+    owned_ctx_ = std::make_unique<Context>();
+    ctx_ = owned_ctx_.get();
+    owned_io_thread_ = std::thread([context = ctx_] { context->Start(); });
   }
-  // comment : cache line aligna
+  void StopOwnedContext() {
+    if (!owned_ctx_) {
+      return;
+    }
+    owned_ctx_->Stop();
+    if (owned_io_thread_.joinable()) {
+      owned_io_thread_.join();
+    }
+    owned_ctx_.reset();
+    ctx_ = nullptr;
+  }
+  static void FailImmediately(RpcController* controller, std::coroutine_handle<> handle,
+                              google::protobuf::Closure* done, const std::string& message,
+                              int error_code = RPC_ECONN_FAILED) {
+    if (controller) {
+      controller->SetFailed(error_code, message);
+    }
+    if (handle) {
+      handle.resume();
+    } else if (done) {
+      done->Run();
+    }
+  }
+
   Context* ctx_ {nullptr};
-  int client_fd_ {-1};
   butil::EndPoint endpoint_;
   RpcChannelOptions options_;
-  std::atomic<bool> running_ {false};
-  std::mutex write_mu_;
-  std::thread reader_thread_;
-  SlotTable<65536> slot_table_;
+  mutable std::mutex channel_mu_;
+  std::shared_ptr<detail::ChannelState> state_;
+  std::shared_ptr<detail::RpcChannelIoDriver> driver_;
+  std::unique_ptr<Context> owned_ctx_;
+  std::thread owned_io_thread_;
 };
 
 inline void RpcCallAwaiter::await_suspend(std::coroutine_handle<> handle) noexcept {

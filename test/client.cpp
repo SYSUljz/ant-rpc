@@ -3,30 +3,22 @@
 #include <iostream>
 #include <string>
 
-#include <arpa/inet.h>
-#include <sys/socket.h>
+#include "butil/endpoint.h"
 
 int main() {
-  int client_socket = socket(AF_INET, SOCK_STREAM, 0);
-  if (client_socket < 0) {
-    std::cerr << "create Socket faild!" << std::endl;
-    return -1;
-  }
-  // comment: use butils/endpoint
-  sockaddr_in server_address;
-  server_address.sin_family = AF_INET;
-  server_address.sin_port = htons(8012);
-
-  if (inet_pton(AF_INET, "127.0.0.1", &server_address.sin_addr) <= 0) {
+  butil::EndPoint server_endpoint;
+  if (butil::str2endpoint("127.0.0.1:8012", &server_endpoint) != 0) {
     std::cerr << "invalid address!" << std::endl;
     return -1;
   }
 
-  std::cout << "connecting to 127.0.0.1:8012 ..." << std::endl;
-  if (connect(client_socket, reinterpret_cast<struct sockaddr*>(&server_address), sizeof(server_address)) < 0) {
+  int client_socket = butil::tcp_connect(server_endpoint, nullptr, 1000);
+  if (client_socket < 0) {
     std::cerr << "Failed connect" << std::endl;
     return -1;
   }
+
+  std::cout << "connecting to 127.0.0.1:8012 ..." << std::endl;
   std::cout << "connect success！\n" << std::endl;
 
   std::string http_request =

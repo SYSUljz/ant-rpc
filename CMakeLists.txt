@@ -95,6 +95,7 @@ add_executable(test_server test/main.cpp)
 target_link_libraries(test_server PRIVATE ant_server ${URING_LIBRARIES} absl::synchronization absl::base)
 
 add_executable(test_client test/client.cpp)
+target_link_libraries(test_client PRIVATE butil)
 
 add_executable(test_timeout test/test_timeout.cpp)
 target_link_libraries(test_timeout PRIVATE ant_server ${URING_LIBRARIES} absl::synchronization absl::base)

@@ -10,24 +10,6 @@
 #include "ant_server/scheduler/scheduler.hpp"
 #include "ant_server/type.hpp"
 
-// Test task for lambda execution
-// comment: i have lamdba TaskNode in include/ant_server/type.hpp：113
-template <typename F>
-struct SimpleTask : public TaskNode {
-  F func;
-  explicit SimpleTask(F&& f) : func(std::forward<F>(f)) {
-    execute = [](TaskNode* self) noexcept {
-      auto* node = static_cast<SimpleTask<F>*>(self);
-      node->func();
-    };
-  }
-};
-
-template <typename F>
-auto make_simple_task(F&& f) {
-  return SimpleTask<std::decay_t<F>> {std::forward<F>(f)};
-}
-
 // 1. Test basic WorkStealingExecutor multi-threaded scheduling
 TEST(ExecutorTest, WorkStealingExecutorExecutesTasksConcurrently) {
   constexpr size_t kNumWorkers = 4;
@@ -37,11 +19,11 @@ TEST(ExecutorTest, WorkStealingExecutorExecutesTasksConcurrently) {
   executor.Start();
 
   std::atomic<size_t> completed_tasks {0};
-  std::vector<std::unique_ptr<SimpleTask<std::function<void()>>>> tasks;
+  std::vector<std::unique_ptr<LambdaTask<std::function<void()>>>> tasks;
   tasks.reserve(kNumTasks);
 
   for (size_t i = 0; i < kNumTasks; ++i) {
-    auto task = std::make_unique<SimpleTask<std::function<void()>>>(
+    auto task = std::make_unique<LambdaTask<std::function<void()>>>(
         [&completed_tasks]() { completed_tasks.fetch_add(1, std::memory_order_relaxed); });
     executor.schedule(task.get());
     tasks.push_back(std::move(task));
@@ -124,7 +106,7 @@ TEST(SchedulerTest, SeparatedIOAndWorkerLifecycle) {
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
   // Schedule task via Scheduler's Executor interface
-  auto task = make_simple_task([&worker_executed]() { worker_executed.store(42, std::memory_order_release); });
+  auto task = make_lambda_task([&worker_executed]() { worker_executed.store(42, std::memory_order_release); });
 
   scheduler.schedule(&task);
 

@@ -10,6 +10,7 @@
 #include <google/protobuf/message.h>
 #include <google/protobuf/service.h>
 
+#include "ant_server/constants.hpp"
 #include "ant_server/rpc/controller.hpp"
 #include "ant_server/rpc/protocol.hpp"
 #include "butil/iobuf.h"
@@ -20,8 +21,7 @@ namespace ant_server::rpc {
 enum class SlotState : uint32_t { FREE = 0, IN_FLIGHT = 1, COMPLETED = 2, TIMED_OUT = 3 };
 
 // Align to 64 bytes (1 CPU Cache Line) to prevent false sharing under high concurrency
-struct alignas(64) CallSlot {
-  // comment ： this should be cacheline aligans
+struct alignas(ant_server::constants::kCacheLineSize) CallSlot {
   std::atomic<uint32_t> version {0};
   std::atomic<uint32_t> state {static_cast<uint32_t>(SlotState::FREE)};
   std::coroutine_handle<> handle {nullptr};

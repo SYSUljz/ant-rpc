@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <memory>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "ant_server/constants.hpp"
@@ -58,9 +59,27 @@ class Scheduler : public Executor {
     return *io_contexts_[index];
   }
 
+  // Round-robin assignment for callers that do not provide a load metric.
   Context& GetNextIOContext() {
     std::size_t idx = next_io_idx_.fetch_add(1, std::memory_order_relaxed) % io_contexts_.size();
     return *io_contexts_[idx];
+  }
+
+  // P2C avoids a contended global "least loaded" counter.  It is used only
+  // when assigning new connections/channels; existing sockets stay pinned to
+  // their original Context.
+  Context& GetBalancedIOContext() {
+    const std::size_t first = next_io_idx_.fetch_add(1, std::memory_order_relaxed) % io_contexts_.size();
+    const std::size_t second = next_io_idx_.fetch_add(1, std::memory_order_relaxed) % io_contexts_.size();
+    return io_contexts_[first]->PendingCommandCount() <= io_contexts_[second]->PendingCommandCount()
+               ? *io_contexts_[first]
+               : *io_contexts_[second];
+  }
+
+  // Worker-facing IO wakeup API. The mailbox owns concrete command types;
+  // Scheduler deliberately exposes no SQE/ring access.
+  void NotifyIO(std::size_t io_index, std::shared_ptr<IoCommandMailbox> mailbox) {
+    GetIOContext(io_index).Notify(std::move(mailbox));
   }
 
   std::size_t NumWorkers() const noexcept { return n_workers_; }
