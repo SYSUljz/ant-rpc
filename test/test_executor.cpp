@@ -42,6 +42,56 @@ TEST(ExecutorTest, WorkStealingExecutorExecutesTasksConcurrently) {
   executor.Stop();
 }
 
+TEST(ExecutorTest, ConcurrentExternalProducersExecuteEveryTaskExactlyOnce) {
+  constexpr size_t kNumWorkers = 4;
+  constexpr size_t kNumProducers = 8;
+  constexpr size_t kTasksPerProducer = 1000;
+  constexpr size_t kTotalTasks = kNumProducers * kTasksPerProducer;
+
+  WorkStealingExecutor executor(kNumWorkers);
+  executor.Start();
+
+  auto executions = std::make_unique<std::atomic<uint32_t>[]>(kTotalTasks);
+  std::vector<std::unique_ptr<LambdaTask<std::function<void()>>>> tasks;
+  tasks.reserve(kTotalTasks);
+  for (size_t i = 0; i < kTotalTasks; ++i) {
+    executions[i].store(0, std::memory_order_relaxed);
+    tasks.push_back(std::make_unique<LambdaTask<std::function<void()>>>(
+        [counter = &executions[i]]() { counter->fetch_add(1, std::memory_order_relaxed); }));
+  }
+
+  std::vector<std::thread> producers;
+  producers.reserve(kNumProducers);
+  for (size_t producer = 0; producer < kNumProducers; ++producer) {
+    producers.emplace_back([&executor, &tasks, producer]() {
+      const size_t first = producer * kTasksPerProducer;
+      for (size_t i = 0; i < kTasksPerProducer; ++i) {
+        executor.schedule(tasks[first + i].get());
+      }
+    });
+  }
+  for (auto& producer : producers) {
+    producer.join();
+  }
+
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (std::chrono::steady_clock::now() < deadline) {
+    size_t completed = 0;
+    for (size_t i = 0; i < kTotalTasks; ++i) {
+      completed += executions[i].load(std::memory_order_acquire);
+    }
+    if (completed == kTotalTasks) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+
+  for (size_t i = 0; i < kTotalTasks; ++i) {
+    EXPECT_EQ(executions[i].load(std::memory_order_acquire), 1u) << "task " << i;
+  }
+  executor.Stop();
+}
+
 // 2. Test simulating external async DB thread hopping back via resume_on
 struct AsyncDbSimulation {
   static DetachedTask SimulateDbWorkflow(Executor& executor, std::atomic<bool>& out_finished,

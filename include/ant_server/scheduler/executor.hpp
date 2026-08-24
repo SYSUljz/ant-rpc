@@ -1,10 +1,10 @@
 #pragma once
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -16,59 +16,67 @@
 #include "absl/synchronization/mutex.h"
 #include "ant_server/constants.hpp"
 #include "ant_server/scheduler/mpmc_queue.hpp"
-#include "ant_server/scheduler/spmc_queue.hpp"
 #include "ant_server/type.hpp"
 #include "ant_server/utils/random.hpp"
 
 // ============================================================================
 // WorkStealingExecutor: Pure Compute / Coroutine Task Executor (Worker Pool)
 // Implements the Executor interface for decoupled, non-IO task scheduling.
-// Uses 3-tier Work-Stealing, LIFO hot slot, Chase-Lev SPMC queues,
-// Per-Worker MPSC Inbox sharding, and P2C (Power of Two Choices) dispatching.
-// Uses Abseil Mutex & CondVar for adaptive, low-overhead worker parking.
+// Each worker owns a mutex-protected ready deque. This intentionally favors a
+// reviewable, testable concurrency boundary over a custom lock-free work-stealing
+// deque. P2C is retained only as a load-balancing policy for external producers.
 // ============================================================================
 class WorkStealingExecutor : public Executor {
  public:
   struct WorkerState {
     int thread_id {0};
-    alignas(kCacheLineSize) TaskNode* lifo_slot {nullptr};
-    alignas(kCacheLineSize) SPMCQueue<TaskNode*> queue;
-    alignas(kCacheLineSize) std::atomic<TaskNode*> inbox {nullptr};
+    alignas(kCacheLineSize) absl::Mutex ready_mu;
+    std::deque<TaskNode*> ready_queue_;
     alignas(kCacheLineSize) uint64_t tick {0};
     alignas(kCacheLineSize) std::atomic<bool> is_parked {false};
 
     absl::Mutex park_mu;
     absl::CondVar park_cv;
 
-    // Multi-producer push into worker's private inbox (lock-free Treiber stack)
-    void push_inbox(TaskNode* task) {
+    // This is the only shared task container for a worker. Producers append at
+    // the back; the owner pops locally from the back while thieves take from
+    // the front. The mutex makes TaskNode::next ownership irrelevant here.
+    void push_ready(TaskNode* task) {
       if (!task) {
         return;
       }
-      TaskNode* old_head = inbox.load(std::memory_order_relaxed);
-      do {
-        task->next = old_head;
-      } while (!inbox.compare_exchange_weak(old_head, task, std::memory_order_release, std::memory_order_relaxed));
+      absl::MutexLock lock(&ready_mu);
+      ready_queue_.push_back(task);
     }
 
-    // Single-consumer bulk pop from inbox (1 atomic exchange takes all)
-    TaskNode* pop_all_inbox() {
-      if (!inbox.load(std::memory_order_relaxed)) {
+    TaskNode* pop_local() {
+      absl::MutexLock lock(&ready_mu);
+      if (ready_queue_.empty()) {
         return nullptr;
       }
-      return inbox.exchange(nullptr, std::memory_order_acquire);
+      TaskNode* task = ready_queue_.back();
+      ready_queue_.pop_back();
+      return task;
     }
 
-    // Estimate current worker load (local queue + LIFO slot + inbox)
-    size_t approximate_load() const {
-      size_t sz = static_cast<size_t>(queue.Size());
-      if (lifo_slot) {
-        sz += 1;
+    TaskNode* steal_one() {
+      absl::MutexLock lock(&ready_mu);
+      if (ready_queue_.empty()) {
+        return nullptr;
       }
-      if (inbox.load(std::memory_order_relaxed)) {
-        sz += 2;
-      }
-      return sz;
+      TaskNode* task = ready_queue_.front();
+      ready_queue_.pop_front();
+      return task;
+    }
+
+    std::size_t approximate_load() {
+      absl::MutexLock lock(&ready_mu);
+      return ready_queue_.size();
+    }
+
+    bool has_ready_work() {
+      absl::MutexLock lock(&ready_mu);
+      return !ready_queue_.empty();
     }
 
     void unpark() {
@@ -86,7 +94,7 @@ class WorkStealingExecutor : public Executor {
       }
       is_parked.store(true, std::memory_order_relaxed);
       while (running.load(std::memory_order_relaxed) && is_parked.load(std::memory_order_relaxed) &&
-             inbox.load(std::memory_order_relaxed) == nullptr) {
+             !has_ready_work()) {
         if (park_cv.WaitWithTimeout(&park_mu, absl::Microseconds(100))) {
           break;  // Timed out
         }
@@ -121,7 +129,7 @@ class WorkStealingExecutor : public Executor {
 
     // 2. If called from external (IO thread, DB pool, or other executors), use P2C
     if (nthreads_ == 1) {
-      workers_[0]->push_inbox(task);
+      workers_[0]->push_ready(task);
       workers_[0]->unpark();
       return;
     }
@@ -133,7 +141,7 @@ class WorkStealingExecutor : public Executor {
     std::size_t load2 = workers_[w2]->approximate_load();
     std::size_t target = (load1 <= load2) ? w1 : w2;
 
-    workers_[target]->push_inbox(task);
+    workers_[target]->push_ready(task);
     workers_[target]->unpark();
   }
 
@@ -151,31 +159,12 @@ class WorkStealingExecutor : public Executor {
 
     auto& w = *workers_[thread_id];
 
-    // If current thread is the owner worker
+    // The owner and external producers use the same mutex-protected deque.
     if (g_executor == this && g_thread_id == thread_id) {
-      if (!w.lifo_slot) {
-        w.lifo_slot = task;
-      } else {
-        if (!w.queue.Push(task)) {
-          // Local queue is full: offload half to global queue
-          std::array<TaskNode*, ant_server::constants::kDefaultSpmcCapacity> batch {};
-          std::size_t count = w.queue.TakeHalf(batch);
-          if (count > 0) {
-            for (std::size_t i = 0; i < count - 1; ++i) {
-              batch[i]->next = batch[i + 1];
-            }
-            batch[count - 1]->next = task;
-            task->next = nullptr;
-            global_queue_.PushBatch(batch[0], task);
-          } else {
-            global_queue_.Push(task);
-          }
-          wake_any_worker();
-        }
-      }
+      w.push_ready(task);
     } else {
       // From another thread targeting this specific worker
-      w.push_inbox(task);
+      w.push_ready(task);
       w.unpark();
     }
   }
@@ -200,48 +189,22 @@ class WorkStealingExecutor : public Executor {
         task = global_queue_.Pop();
       }
 
-      // 2. Check LIFO slot (hot cache path)
-      if (!task && w.lifo_slot) {
-        task = w.lifo_slot;
-        w.lifo_slot = nullptr;
-      }
-
-      // 3. Drain Inbox (external tasks from IO / DB / P2C)
+      // 2. Pop local work. Local execution is LIFO; thieves take FIFO below.
       if (!task) {
-        TaskNode* inbox_list = w.pop_all_inbox();
-        if (inbox_list) {
-          task = inbox_list;
-          TaskNode* curr = inbox_list->next;
-          task->next = nullptr;
-
-          // Push remaining tasks from inbox into local queue
-          while (curr) {
-            TaskNode* next = curr->next;
-            curr->next = nullptr;
-            if (!w.queue.Push(curr)) {
-              global_queue_.Push(curr);
-            }
-            curr = next;
-          }
-        }
+        task = w.pop_local();
       }
 
-      // 4. Pop from local Chase-Lev queue (LIFO)
-      if (!task) {
-        task = w.queue.TryPop();
-      }
-
-      // 5. Steal from other workers (Half-stealing / FIFO)
+      // 3. Steal one FIFO task from another worker.
       if (!task) {
         task = steal_task(thread_id);
       }
 
-      // 6. Check global queue again
+      // 4. Check global queue again
       if (!task) {
         task = global_queue_.Pop();
       }
 
-      // 7. Execute task or backoff & park
+      // 5. Execute task or backoff & park
       if (task) {
         empty_spins = 0;
         task->run();
@@ -304,22 +267,7 @@ class WorkStealingExecutor : public Executor {
 
       auto& victim = *workers_[victim_id];
 
-      // Try batch stealing half of victim's queue
-      std::array<TaskNode*, ant_server::constants::kDefaultSpmcCapacity> batch {};
-      std::size_t count = victim.queue.TakeHalf(batch);
-      if (count > 0) {
-        auto& thief = *workers_[thief_id];
-        // Keep the first task for immediate execution, push the rest to thief's local queue
-        for (std::size_t k = 1; k < count; ++k) {
-          if (!thief.queue.Push(batch[k])) {
-            global_queue_.Push(batch[k]);
-          }
-        }
-        return batch[0];
-      }
-
-      // Single item steal fallback
-      if (auto* task = victim.queue.Steal()) {
+      if (auto* task = victim.steal_one()) {
         return task;
       }
     }
