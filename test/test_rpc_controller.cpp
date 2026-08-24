@@ -178,4 +178,3 @@ TEST(RpcControllerTest, SeparateRequestAndResponseHeaders) {
   EXPECT_EQ(target_map.size(), 2);
   EXPECT_EQ(target_map["x-server-cost-ms"], "15");
 }
-

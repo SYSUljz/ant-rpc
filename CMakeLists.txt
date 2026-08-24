@@ -111,6 +111,7 @@ add_executable(unit_tests
     test/test_sleep.cpp
     test/test_protobuf.cpp
     test/test_rpc_controller.cpp
+    test/test_slot_table.cpp
     test/test_rpc_channel.cpp
     test/test_rpc_server.cpp
     test/test_ant_rpc_e2e.cpp

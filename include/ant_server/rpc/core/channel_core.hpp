@@ -38,6 +38,48 @@ using ChannelOptions = RpcChannelOptions;
 
 struct RpcCallAwaiter;
 
+namespace detail {
+
+// Adapts protobuf's callback-shaped public API to the scheduler's TaskNode.
+// It belongs to the channel facade, rather than SlotTable: the table only
+// manages generic continuations and must not depend on protobuf Closure.
+struct ClosureTask final : TaskNode {
+  google::protobuf::Closure* done {nullptr};
+  bool heap_allocated {false};
+  SlotStopCallback stop_callback;
+
+  ClosureTask() noexcept {
+    execute = [](TaskNode* self) noexcept {
+      auto* node = static_cast<ClosureTask*>(self);
+      auto* closure = node->done;
+      const bool owns_self = node->heap_allocated;
+      if (closure) {
+        closure->Run();
+      }
+      if (owns_self) {
+        delete node;
+      }
+    };
+  }
+
+  explicit ClosureTask(google::protobuf::Closure* closure, bool heap = false) noexcept : ClosureTask() {
+    done = closure;
+    heap_allocated = heap;
+  }
+};
+
+}  // namespace detail
+
+// StartUnaryCall never directly resumes a coroutine. SlotTable owns all
+// continuation dispatch, including a pending resolution delivered by PublishSlot.
+// The caller uses this result to decide whether it may continue inline or must remain suspended.
+enum class StartOutcome : uint8_t { kInFlight, kFailedInline, kResolvedBySlot };
+
+struct StartResult {
+  uint64_t correlation_id {0};
+  StartOutcome outcome {StartOutcome::kFailedInline};
+};
+
 // Thread-safe protobuf-compatible facade. IO-thread-only socket state lives
 // in core/channel_io_driver.hpp.
 class RpcChannel : public google::protobuf::RpcChannel {
@@ -131,7 +173,12 @@ class RpcChannel : public google::protobuf::RpcChannel {
       return;
     }
     if (done) {
-      StartUnaryCall(method->service()->full_name(), method->name(), rpc_controller, request, response, nullptr, done);
+      auto* task = new detail::ClosureTask(done, true);
+      const StartResult result = StartUnaryCall(method->service()->full_name(), method->name(), rpc_controller, request,
+                                                response, task, CurrentContinuationTarget(), &task->stop_callback);
+      if (result.outcome == StartOutcome::kFailedInline) {
+        task->run();
+      }
       return;
     }
     absl::Notification notification;
@@ -140,13 +187,17 @@ class RpcChannel : public google::protobuf::RpcChannel {
       void Run() override { notification.Notify(); }
       absl::Notification& notification;
     } closure(notification);
-    StartUnaryCall(method->service()->full_name(), method->name(), rpc_controller, request, response, nullptr,
-                   &closure);
+    detail::ClosureTask task(&closure);
+    SlotStopCallback stop_callback;
+    const StartResult result = StartUnaryCall(method->service()->full_name(), method->name(), rpc_controller, request,
+                                              response, &task, ContinuationTarget {}, &stop_callback);
+    if (result.outcome == StartOutcome::kFailedInline) {
+      task.run();
+      return;
+    }
     const int64_t timeout =
         rpc_controller && rpc_controller->TimeoutMs() > 0 ? rpc_controller->TimeoutMs() : options_.timeout_ms;
-    if (!notification.WaitForNotificationWithTimeout(absl::Milliseconds(timeout)) && rpc_controller) {
-      rpc_controller->SetFailed(RPC_ETIMEOUT, "RPC call timed out");
-    }
+    AwaitBlockingCall(state_, result.correlation_id, notification, timeout);
   }
 
   void CallMethod(std::string_view service_name, std::string_view method_name, RpcController& controller,
@@ -157,12 +208,16 @@ class RpcChannel : public google::protobuf::RpcChannel {
       void Run() override { notification.Notify(); }
       absl::Notification& notification;
     } closure(notification);
-    StartUnaryCall(service_name, method_name, &controller, nullptr, nullptr, nullptr, &closure, &request_body,
-                   &response_body);
-    const int64_t timeout = controller.TimeoutMs() > 0 ? controller.TimeoutMs() : options_.timeout_ms;
-    if (!notification.WaitForNotificationWithTimeout(absl::Milliseconds(timeout))) {
-      controller.SetFailed(RPC_ETIMEOUT, "RPC call timed out");
+    detail::ClosureTask task(&closure);
+    SlotStopCallback stop_callback;
+    const StartResult result = StartUnaryCall(service_name, method_name, &controller, nullptr, nullptr, &task,
+                                              ContinuationTarget {}, &stop_callback, &request_body, &response_body);
+    if (result.outcome == StartOutcome::kFailedInline) {
+      task.run();
+      return;
     }
+    const int64_t timeout = controller.TimeoutMs() > 0 ? controller.TimeoutMs() : options_.timeout_ms;
+    AwaitBlockingCall(state_, result.correlation_id, notification, timeout);
   }
 
   RpcCallAwaiter CallAsync(const google::protobuf::MethodDescriptor* method, RpcController* controller,
@@ -176,10 +231,11 @@ class RpcChannel : public google::protobuf::RpcChannel {
  private:
   friend struct RpcCallAwaiter;
 
-  uint64_t StartUnaryCall(std::string_view service_name, std::string_view method_name, RpcController* controller,
-                          const google::protobuf::Message* request, google::protobuf::Message* response,
-                          std::coroutine_handle<> handle, google::protobuf::Closure* done,
-                          const butil::IOBuf* raw_request_body = nullptr, butil::IOBuf* raw_response_body = nullptr) {
+  StartResult StartUnaryCall(std::string_view service_name, std::string_view method_name, RpcController* controller,
+                             const google::protobuf::Message* request, google::protobuf::Message* response,
+                             TaskNode* task, ContinuationTarget target, SlotStopCallback* stop_callback,
+                             const butil::IOBuf* raw_request_body = nullptr,
+                             butil::IOBuf* raw_response_body = nullptr) {
     std::shared_ptr<detail::ChannelState> state;
     std::shared_ptr<detail::RpcChannelIoDriver> driver;
     {
@@ -190,14 +246,27 @@ class RpcChannel : public google::protobuf::RpcChannel {
     if (controller) {
       controller->RecordStart();
     }
-    if (!driver || !state->running.load(std::memory_order_acquire)) {
-      FailImmediately(controller, handle, done, "Connection closed");
-      return 0;
+    const std::stop_token stop_token = controller ? controller->GetStopToken() : std::stop_token {};
+    if (stop_token.stop_requested()) {
+      SetInlineFailure(controller, "RPC call canceled before send", RPC_ECANCELED);
+      return {};
     }
-    const uint64_t correlation_id = state->slots.AllocateSlot(handle, response, controller, done, raw_response_body);
+    if (!driver || !state->running.load(std::memory_order_acquire)) {
+      SetInlineFailure(controller, "Connection closed");
+      return {};
+    }
+    const uint64_t correlation_id = state->slots.AllocateSlot(task, response, controller, target, raw_response_body);
     if (correlation_id == 0) {
-      FailImmediately(controller, handle, done, "RPC slot table capacity exhausted", RPC_EOVERLOAD);
-      return 0;
+      SetInlineFailure(controller, "RPC slot table capacity exhausted", RPC_EOVERLOAD);
+      return {};
+    }
+    if (controller) {
+      controller->SetCorrelationId(correlation_id);
+    }
+    if (stop_callback && stop_token.stop_possible()) {
+      // A stop request may invoke this synchronously. SlotTable records it as
+      // CANCEL_PENDING while ARMING; PublishSlot() performs the completion.
+      stop_callback->emplace(stop_token, state->slots.MakeCancelFn(correlation_id));
     }
     RpcMeta meta;
     meta.set_msg_type(RPC_REQUEST);
@@ -221,8 +290,19 @@ class RpcChannel : public google::protobuf::RpcChannel {
       butil::IOBuf empty;
       PackRpcFrame(meta, empty, attachment, *frame);
     }
+    const PublishOutcome publish = state->slots.PublishSlot(correlation_id);
+    if (publish == PublishOutcome::kInvalid) {
+      state->slots.DiscardArmingSlot(correlation_id);
+      SetInlineFailure(controller, "Failed to publish RPC slot", RPC_EINTERNAL);
+      return {};
+    }
+    // From PublishSlot onwards SlotTable may dispatch task on another thread;
+    // do not read request, response, controller, or task below this line.
+    if (publish != PublishOutcome::kInFlight) {
+      return {correlation_id, StartOutcome::kResolvedBySlot};
+    }
     driver->Enqueue({correlation_id, std::move(frame)});
-    return correlation_id;
+    return {correlation_id, StartOutcome::kInFlight};
   }
 
   void EnsureContext() {
@@ -244,16 +324,22 @@ class RpcChannel : public google::protobuf::RpcChannel {
     owned_ctx_.reset();
     ctx_ = nullptr;
   }
-  static void FailImmediately(RpcController* controller, std::coroutine_handle<> handle,
-                              google::protobuf::Closure* done, const std::string& message,
-                              int error_code = RPC_ECONN_FAILED) {
+  static void SetInlineFailure(RpcController* controller, const std::string& message,
+                               int error_code = RPC_ECONN_FAILED) {
     if (controller) {
       controller->SetFailed(error_code, message);
     }
-    if (handle) {
-      handle.resume();
-    } else if (done) {
-      done->Run();
+  }
+
+  static void AwaitBlockingCall(const std::shared_ptr<detail::ChannelState>& state, uint64_t correlation_id,
+                                absl::Notification& notification, int64_t timeout_ms) {
+    if (notification.WaitForNotificationWithTimeout(absl::Milliseconds(timeout_ms))) {
+      return;
+    }
+    // If timeout loses to response/cancellation, wait until that winner has
+    // dispatched the stack-owned notification task before returning.
+    if (!state->slots.TimeoutSlot(correlation_id)) {
+      notification.WaitForNotification();
     }
   }
 

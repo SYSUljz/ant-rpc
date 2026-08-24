@@ -16,11 +16,18 @@ struct RpcCallAwaiter {
   RpcController* controller;
   const google::protobuf::Message* request;
   google::protobuf::Message* response;
-  uint64_t correlation_id {0};
+  CoroTask task_;
+  SlotStopCallback stop_callback_;
 
   bool await_ready() const noexcept { return false; }
-  void await_suspend(std::coroutine_handle<> handle) noexcept {
-    correlation_id = channel.StartUnaryCall(service_name, method_name, controller, request, response, handle, nullptr);
+  bool await_suspend(std::coroutine_handle<> handle) noexcept {
+    task_.init(handle);
+    // StartUnaryCall must not invoke task_. The false return keeps the current
+    // coroutine frame alive for an inline failure instead of resuming it from
+    // inside await_suspend.
+    const StartResult result = channel.StartUnaryCall(service_name, method_name, controller, request, response, &task_,
+                                                      CurrentContinuationTarget(), &stop_callback_);
+    return result.outcome != StartOutcome::kFailedInline;
   }
   void await_resume() noexcept {}
 };

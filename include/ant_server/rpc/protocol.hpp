@@ -43,12 +43,7 @@ struct RpcHeader {
 
 static_assert(sizeof(RpcHeader) == 16, "RpcHeader must be exactly 16 bytes");
 
-enum class FrameParseStatus {
-  SUCCESS,
-  NEED_MORE_DATA,
-  ERROR_MAGIC_MISMATCH,
-  ERROR_CORRUPTED_FRAME
-};
+enum class FrameParseStatus { SUCCESS, NEED_MORE_DATA, ERROR_MAGIC_MISMATCH, ERROR_CORRUPTED_FRAME };
 
 struct FrameParseResult {
   FrameParseStatus status {FrameParseStatus::NEED_MORE_DATA};
@@ -108,13 +103,13 @@ inline FrameParseResult TryParseRpcFrame(const butil::IOBuf& buf) {
     buf.append_to(&attachment_iobuf, attachment_size, body_offset + proto_body_len);
   }
 
-  return {FrameParseStatus::SUCCESS, total_needed, header, std::move(meta),
-          std::move(body_iobuf), std::move(attachment_iobuf)};
+  return {FrameParseStatus::SUCCESS, total_needed,          header,
+          std::move(meta),           std::move(body_iobuf), std::move(attachment_iobuf)};
 }
 
 // Pack an RPC frame into target IOBuf
-inline void PackRpcFrame(RpcMeta& meta, const google::protobuf::Message* message,
-                         const butil::IOBuf* attachment, butil::IOBuf& out_buf) {
+inline void PackRpcFrame(RpcMeta& meta, const google::protobuf::Message* message, const butil::IOBuf* attachment,
+                         butil::IOBuf& out_buf) {
   uint32_t attachment_size = attachment ? static_cast<uint32_t>(attachment->size()) : 0;
   meta.set_attachment_size(attachment_size);
 
@@ -147,8 +142,8 @@ inline void PackRpcFrame(RpcMeta& meta, const google::protobuf::Message* message
 }
 
 // Overload for raw IOBuf body payload
-inline void PackRpcFrame(RpcMeta& meta, const butil::IOBuf& raw_body,
-                         const butil::IOBuf* attachment, butil::IOBuf& out_buf) {
+inline void PackRpcFrame(RpcMeta& meta, const butil::IOBuf& raw_body, const butil::IOBuf* attachment,
+                         butil::IOBuf& out_buf) {
   uint32_t attachment_size = attachment ? static_cast<uint32_t>(attachment->size()) : 0;
   meta.set_attachment_size(attachment_size);
 
@@ -193,5 +188,5 @@ inline void PackRpcFrame(uint8_t msg_type, uint64_t correlation_id, std::string_
 }  // namespace ant_server::rpc
 
 namespace ant_rpc {
-  using namespace ant_server::rpc;
+using namespace ant_server::rpc;
 }

@@ -63,17 +63,13 @@ class RpcController : public google::protobuf::RpcController {
     SetFailed(RPC_ECANCELED, "RPC call was canceled");
   }
 
-  void SetFailed(const std::string& reason) override {
-    SetFailed(RPC_EINTERNAL, reason);
-  }
+  void SetFailed(const std::string& reason) override { SetFailed(RPC_EINTERNAL, reason); }
 
   [[nodiscard]] bool IsCanceled() const override {
     return canceled_ || stop_token_.stop_requested() || (failed_ && error_code_ == RPC_ECANCELED);
   }
 
-  void NotifyOnCancel(google::protobuf::Closure* callback) override {
-    (void)callback;
-  }
+  void NotifyOnCancel(google::protobuf::Closure* callback) override { (void)callback; }
 
   // --------------------------------------------------------------------------
   // 2. Enhanced Error Management & Codes
@@ -114,9 +110,7 @@ class RpcController : public google::protobuf::RpcController {
     request_headers_[std::string(key)] = std::string(value);
   }
 
-  void SetHeader(std::string_view key, std::string_view value) {
-    SetRequestHeader(key, value);
-  }
+  void SetHeader(std::string_view key, std::string_view value) { SetRequestHeader(key, value); }
 
   [[nodiscard]] std::optional<std::string_view> GetRequestHeader(std::string_view key) const {
     auto map_it = request_headers_.find(std::string(key));
@@ -130,9 +124,7 @@ class RpcController : public google::protobuf::RpcController {
     return request_headers_;
   }
 
-  google::protobuf::Map<std::string, std::string>& MutableRequestHeaders() noexcept {
-    return request_headers_;
-  }
+  google::protobuf::Map<std::string, std::string>& MutableRequestHeaders() noexcept { return request_headers_; }
 
   // --------------------------------------------------------------------------
   // 6. Outbound Response Metadata / Headers (Server -> Client)
@@ -153,9 +145,7 @@ class RpcController : public google::protobuf::RpcController {
     return response_headers_;
   }
 
-  google::protobuf::Map<std::string, std::string>& MutableResponseHeaders() noexcept {
-    return response_headers_;
-  }
+  google::protobuf::Map<std::string, std::string>& MutableResponseHeaders() noexcept { return response_headers_; }
 
   // --------------------------------------------------------------------------
   // Unified / Backwards-compatible Header Interface
@@ -172,9 +162,7 @@ class RpcController : public google::protobuf::RpcController {
     return RequestHeaders();
   }
 
-  google::protobuf::Map<std::string, std::string>& MutableHeaders() noexcept {
-    return MutableRequestHeaders();
-  }
+  google::protobuf::Map<std::string, std::string>& MutableHeaders() noexcept { return MutableRequestHeaders(); }
 
   // --------------------------------------------------------------------------
   // 7. Zero-Copy Attachments (butil::IOBuf)
@@ -237,5 +225,5 @@ class RpcController : public google::protobuf::RpcController {
 }  // namespace ant_server::rpc
 
 namespace ant_rpc {
-  using namespace ant_server::rpc;
+using namespace ant_server::rpc;
 }

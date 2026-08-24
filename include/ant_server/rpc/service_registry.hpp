@@ -22,9 +22,13 @@ class ServiceRegistry {
 
   // Register a Protobuf RPC Service implementation
   bool RegisterService(google::protobuf::Service* service) {
-    if (!service) return false;
+    if (!service) {
+      return false;
+    }
     const auto* desc = service->GetDescriptor();
-    if (!desc) return false;
+    if (!desc) {
+      return false;
+    }
 
     return services_.try_emplace(desc->full_name(), service).second;
   }
@@ -118,5 +122,5 @@ class ServiceRegistry {
 }  // namespace ant_server::rpc
 
 namespace ant_rpc {
-  using namespace ant_server::rpc;
+using namespace ant_server::rpc;
 }
