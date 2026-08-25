@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <coroutine>
+#include <cstdint>
 #include <exception>
 #include <memory>
 
@@ -14,7 +15,10 @@
 #include "ant_server/type.hpp"
 #include "butil/iobuf.h"
 
-struct BaseAwaiter : public IOHandler, public CoroTask {
+// Socket awaiters are IO primitives: their CQE continuation always resumes on
+// the Context thread that consumed the CQE. Moving into business execution is
+// an explicit co_await resume_on(...) decision made at a runtime boundary.
+struct BaseAwaiter : public IOHandler {
   explicit BaseAwaiter(Context& ctx = GetCurrentContext()) : socket_service_(ctx.UseService<IOuringSocketService>()) {}
   std::coroutine_handle<> handle;
 
@@ -36,16 +40,10 @@ struct BaseAwaiter : public IOHandler, public CoroTask {
   }
   virtual void on_cancel() {};
   void on_complete() override {
-    if (handle) {
-      this->init(handle);
-      if (g_executor) {
-        g_executor->schedule(this);
-      } else if (g_scheduler) {
-        g_scheduler->schedule(this, g_thread_id);
-      } else {
-        handle.resume();
-      }
+    if (!handle) {
+      return;
     }
+    handle.resume();
   }
 };
 
