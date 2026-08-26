@@ -78,11 +78,8 @@ inline auto with_timeout(std::chrono::milliseconds delay, CoroTaskFunc&& task_fu
 
 template <typename CoroTaskFunc>
 inline auto with_timeout(Context& ctx, std::chrono::milliseconds delay, CoroTaskFunc&& task_func) {
-  if (ctx.GetScheduler()) {
-    return TimeoutAwaiter<CoroTaskFunc> {ctx.GetScheduler()->GetTimerKeeper(), delay,
-                                         std::forward<CoroTaskFunc>(task_func)};
-  }
-  return TimeoutAwaiter<CoroTaskFunc> {delay, std::forward<CoroTaskFunc>(task_func)};
+  return TimeoutAwaiter<CoroTaskFunc> {ctx.GetTimerKeeper(), delay,
+                                       std::forward<CoroTaskFunc>(task_func)};
 }
 
 #endif

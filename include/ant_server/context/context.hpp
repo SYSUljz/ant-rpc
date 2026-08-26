@@ -29,8 +29,11 @@ struct BaseService {
 // ============================================================================
 class Context {
  public:
-  explicit Context(std::size_t entries = 256, Scheduler* scheduler = nullptr, Executor* executor = nullptr)
-      : scheduler_(scheduler), executor_(executor) {
+  // A Context is an IO reactor owned and driven by Scheduler. It deliberately
+  // has no standalone mode: TimerKeeper, worker execution, and IO ownership
+  // must come from one Runtime.
+  Context(std::size_t entries, Scheduler& scheduler, Executor& executor, TimerKeeper& timer_keeper)
+      : scheduler_(&scheduler), executor_(&executor), timer_keeper_(&timer_keeper) {
     io_uring_queue_init(entries, &ring_, 0);
     io_uring_register_files_sparse(&ring_, static_cast<unsigned>(entries * 4));
     wakeup_fd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -67,11 +70,11 @@ class Context {
     }
   }
 
-  void SetExecutor(Executor* executor) noexcept { executor_ = executor; }
   Executor* GetExecutor() const noexcept { return executor_; }
 
-  void SetScheduler(Scheduler* scheduler) noexcept { scheduler_ = scheduler; }
-  Scheduler* GetScheduler() const noexcept { return scheduler_; }
+  Scheduler& GetScheduler() const noexcept { return *scheduler_; }
+  // Non-owning Runtime service. Context never starts or stops TimerKeeper.
+  TimerKeeper& GetTimerKeeper() const noexcept { return *timer_keeper_; }
 
   // Lock-free single-threaded service container for IO reactor
   template <typename ServiceType>
@@ -86,6 +89,9 @@ class Context {
     services_[id] = std::move(new_service);
     return ref;
   }
+
+ private:
+  friend class Scheduler;
 
   inline int ProcessEvents(int wait_nr = 1) {
     ArmWakeupPoll();
@@ -127,7 +133,6 @@ class Context {
     Wakeup();
   }
 
- private:
   struct WakeupHandler final : IOHandler {
     explicit WakeupHandler(Context& context) : context_(context) {}
     void on_complete() override { context_.OnWakeup(); }
@@ -167,4 +172,5 @@ class Context {
   absl::flat_hash_map<std::type_index, std::unique_ptr<BaseService>> services_;
   Scheduler* scheduler_ {nullptr};
   Executor* executor_ {nullptr};
+  TimerKeeper* timer_keeper_ {nullptr};
 };

@@ -28,7 +28,7 @@ class Scheduler : public Executor {
 
     io_contexts_.reserve(n_io_threads_);
     for (std::size_t i = 0; i < n_io_threads_; ++i) {
-      auto ctx = std::make_unique<Context>(uring_size_, this, worker_executor_.get());
+      auto ctx = std::make_unique<Context>(uring_size_, *this, *worker_executor_, *timer_keeper_);
       io_contexts_.push_back(std::move(ctx));
     }
 
@@ -84,6 +84,7 @@ class Scheduler : public Executor {
 
   std::size_t NumWorkers() const noexcept { return n_workers_; }
   std::size_t NumIOThreads() const noexcept { return n_io_threads_; }
+  bool IsRunning() const noexcept { return running_.load(std::memory_order_acquire); }
 
   void IOLoop(int io_id) {
     g_thread_id = static_cast<std::size_t>(io_id);

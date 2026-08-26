@@ -10,8 +10,58 @@
 #include "ant_server/scheduler/timer_keeper.hpp"
 #include "ant_server/type.hpp"
 #include "ant_server/utils/sleep.hpp"
+#include "ant_server/coroutine/operator/when_any.hpp"
 
 using namespace std::chrono_literals;
+
+namespace {
+
+ant_server::Task<int> ImmediateValue(int value) {
+  co_return value;
+}
+
+ant_server::Task<int> DelayedValue(TimerKeeper& timer_keeper, std::chrono::milliseconds delay, int value) {
+  co_await sleep_for(timer_keeper, delay);
+  co_return value;
+}
+
+}  // namespace
+
+TEST(WhenAnyTest, SynchronousWinnerDoesNotResumeParentReentrantly) {
+  int observed = 0;
+  [](int& output) -> DetachedTask {
+    auto result = co_await ant_server::when_any(ImmediateValue(7), ImmediateValue(9));
+    EXPECT_EQ(result.index, 0U);
+    output = std::get<0>(result.value);
+  }(observed);
+
+  EXPECT_EQ(observed, 7);
+}
+
+TEST(WhenAnyTest, FirstCompletionProvidesItsValue) {
+  WorkStealingExecutor executor(1);
+  executor.Start();
+  TimerKeeper timer_keeper(executor);
+  timer_keeper.Start();
+
+  std::atomic<int> observed {0};
+  [](TimerKeeper& timer, std::atomic<int>& output) -> DetachedTask {
+    auto result = co_await ant_server::when_any(DelayedValue(timer, 10ms, 11), DelayedValue(timer, 50ms, 22));
+    output.store(std::get<0>(result.value), std::memory_order_release);
+  }(timer_keeper, observed);
+
+  const auto deadline = std::chrono::steady_clock::now() + 1s;
+  while (observed.load(std::memory_order_acquire) == 0 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(1ms);
+  }
+  EXPECT_EQ(observed.load(std::memory_order_acquire), 11);
+
+  // when_any deliberately does not cancel its loser; let it finish before the
+  // timer service is stopped.
+  std::this_thread::sleep_for(70ms);
+  timer_keeper.Stop();
+  executor.Stop();
+}
 
 // 1. Basic test: sleep_for with explicit TimerKeeper
 TEST(SleepTest, BasicSleepWithTimerKeeper) {

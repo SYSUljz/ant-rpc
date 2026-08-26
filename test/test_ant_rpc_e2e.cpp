@@ -17,6 +17,7 @@
 #include "ant_server/rpc/protocol.hpp"
 #include "ant_server/rpc/rpc_server.hpp"
 #include "ant_server/rpc/service_registry.hpp"
+#include "ant_server/scheduler/scheduler.hpp"
 #include "butil/iobuf.h"
 #include "echo.pb.h"
 
@@ -35,12 +36,12 @@ class EchoServiceImpl : public ant_rpc::EchoService {
 class AntRpcE2ETest : public ::testing::Test {
  protected:
   static constexpr int PORT = 9012;
-  Context context_ {256};
+  Scheduler scheduler_ {1, 1};
+  Context& context_ {scheduler_.GetIOContext(0)};
   ant_rpc::ServiceRegistry registry_;
   EchoServiceImpl echo_service_;
   std::unique_ptr<Acceptor> acceptor_;
   int server_socket_ {-1};
-  std::thread server_thread_;
 
   void SetUp() override {
     registry_.RegisterService(&echo_service_);
@@ -64,15 +65,12 @@ class AntRpcE2ETest : public ::testing::Test {
     });
     acceptor_->Start();
 
-    server_thread_ = std::thread([this]() { context_.Start(); });
+    scheduler_.Start();
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
 
   void TearDown() override {
-    context_.Stop();
-    if (server_thread_.joinable()) {
-      server_thread_.join();
-    }
+    scheduler_.Stop();
     if (server_socket_ >= 0) {
       close(server_socket_);
     }

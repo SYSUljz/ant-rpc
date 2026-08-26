@@ -3,6 +3,7 @@
 #include <unistd.h>
 
 #include <coroutine>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -24,6 +25,8 @@
 #include "ant_server/rpc/core/channel_io_driver.hpp"
 #include "ant_server/rpc/error_code.hpp"
 #include "ant_server/rpc/protocol.hpp"
+#include "ant_server/scheduler/scheduler.hpp"
+#include "ant_server/scheduler/timer_keeper.hpp"
 #include "butil/endpoint.h"
 #include "butil/iobuf.h"
 
@@ -84,8 +87,10 @@ struct StartResult {
 // in core/channel_io_driver.hpp.
 class RpcChannel : public google::protobuf::RpcChannel {
  public:
-  RpcChannel() : state_(std::make_shared<detail::ChannelState>()) {}
-  explicit RpcChannel(Context& context) : ctx_(&context), state_(std::make_shared<detail::ChannelState>()) {}
+  RpcChannel() = delete;
+  explicit RpcChannel(Context& context)
+      : ctx_(&context), timer_keeper_(&context.GetTimerKeeper()),
+        state_(std::make_shared<detail::ChannelState>()) {}
   ~RpcChannel() override { Close(); }
   RpcChannel(const RpcChannel&) = delete;
   RpcChannel& operator=(const RpcChannel&) = delete;
@@ -99,14 +104,15 @@ class RpcChannel : public google::protobuf::RpcChannel {
   }
   int Init(butil::EndPoint endpoint, const RpcChannelOptions* options = nullptr) {
     Close();
+    if (!ctx_->GetScheduler().IsRunning()) {
+      return -1;
+    }
     if (options) {
       options_ = *options;
     }
     endpoint_ = endpoint;
-    EnsureContext();
     const int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
-      StopOwnedContext();
       return -1;
     }
     if (options_.tcp_no_delay) {
@@ -117,25 +123,32 @@ class RpcChannel : public google::protobuf::RpcChannel {
     address.sin_family = AF_INET;
     address.sin_port = htons(endpoint_.port);
     address.sin_addr = endpoint_.ip;
-    if (connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0) {
-      close(fd);
-      StopOwnedContext();
-      return -1;
-    }
     auto state = std::make_shared<detail::ChannelState>();
     {
       std::lock_guard<std::mutex> lock(state->close_mu);
       state->closed = false;
     }
     state->running.store(true, std::memory_order_release);
-    auto driver = std::make_shared<detail::RpcChannelIoDriver>(*ctx_, state, fd);
+    auto driver = std::make_shared<detail::RpcChannelIoDriver>(*ctx_, state, fd,
+                                                                reinterpret_cast<const sockaddr*>(&address),
+                                                                sizeof(address), *timer_keeper_,
+                                                                std::chrono::milliseconds(options_.connect_timeout_ms));
     {
       std::lock_guard<std::mutex> lock(channel_mu_);
-      state_ = std::move(state);
+      // Init still waits on this local shared_ptr for the asynchronous connect
+      // result, so Channel and this compatibility bridge must co-own it.
+      state_ = state;
       driver_ = driver;
     }
     driver->Start();
-    return 0;
+    std::unique_lock<std::mutex> lock(state->connect_mu);
+    state->connect_cv.wait(lock, [&state] { return state->connect_finished; });
+    if (state->connect_result == 0) {
+      return 0;
+    }
+    lock.unlock();
+    Close();
+    return -1;
   }
 
   void Close() {
@@ -152,7 +165,6 @@ class RpcChannel : public google::protobuf::RpcChannel {
         driver_.reset();
       }
     }
-    StopOwnedContext();
   }
 
   int fd() const noexcept {
@@ -305,25 +317,6 @@ class RpcChannel : public google::protobuf::RpcChannel {
     return {correlation_id, StartOutcome::kInFlight};
   }
 
-  void EnsureContext() {
-    if (ctx_) {
-      return;
-    }
-    owned_ctx_ = std::make_unique<Context>();
-    ctx_ = owned_ctx_.get();
-    owned_io_thread_ = std::thread([context = ctx_] { context->Start(); });
-  }
-  void StopOwnedContext() {
-    if (!owned_ctx_) {
-      return;
-    }
-    owned_ctx_->Stop();
-    if (owned_io_thread_.joinable()) {
-      owned_io_thread_.join();
-    }
-    owned_ctx_.reset();
-    ctx_ = nullptr;
-  }
   static void SetInlineFailure(RpcController* controller, const std::string& message,
                                int error_code = RPC_ECONN_FAILED) {
     if (controller) {
@@ -349,8 +342,7 @@ class RpcChannel : public google::protobuf::RpcChannel {
   mutable std::mutex channel_mu_;
   std::shared_ptr<detail::ChannelState> state_;
   std::shared_ptr<detail::RpcChannelIoDriver> driver_;
-  std::unique_ptr<Context> owned_ctx_;
-  std::thread owned_io_thread_;
+  TimerKeeper* timer_keeper_ {nullptr};
 };
 
 }  // namespace ant_server::rpc

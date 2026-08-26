@@ -159,14 +159,10 @@ class WorkStealingExecutor : public Executor {
 
     auto& w = *workers_[thread_id];
 
-    // The owner and external producers use the same mutex-protected deque.
-    if (g_executor == this && g_thread_id == thread_id) {
-      w.push_ready(task);
-    } else {
-      // From another thread targeting this specific worker
-      w.push_ready(task);
-      w.unpark();
-    }
+    // This is an affinity hint for locality, not a non-stealable pin. Business
+    // coroutines are intentionally migratable across this executor's workers.
+    w.push_ready(task);
+    w.unpark();
   }
 
   void SetScheduler(Scheduler* scheduler) noexcept { scheduler_ = scheduler; }

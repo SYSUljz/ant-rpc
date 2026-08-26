@@ -16,6 +16,7 @@
 #include "ant_server/context/context.hpp"
 #include "ant_server/coroutine/task.hpp"
 #include "ant_server/handler/acceptor.hpp"
+#include "ant_server/scheduler/scheduler.hpp"
 #include "ant_server/rpc/channel.hpp"
 #include "ant_server/rpc/controller.hpp"
 #include "ant_server/rpc/protocol.hpp"
@@ -54,14 +55,14 @@ class ForeignRpcController final : public google::protobuf::RpcController {
 class RpcChannelTest : public ::testing::Test {
  protected:
   int port_ {0};
-  Context server_ctx_ {256};
-  Context client_ctx_ {256};
+  Scheduler server_scheduler_ {1, 1};
+  Scheduler client_scheduler_ {1, 1};
+  Context& server_ctx_ {server_scheduler_.GetIOContext(0)};
+  Context& client_ctx_ {client_scheduler_.GetIOContext(0)};
   ant_rpc::ServiceRegistry registry_;
   EchoServiceImpl echo_service_;
   std::unique_ptr<Acceptor> acceptor_;
   int server_socket_ {-1};
-  std::thread server_thread_;
-  std::thread client_thread_;
 
   void SetUp() override {
     registry_.RegisterService(&echo_service_);
@@ -88,20 +89,14 @@ class RpcChannelTest : public ::testing::Test {
     });
     acceptor_->Start();
 
-    server_thread_ = std::thread([this]() { server_ctx_.Start(); });
-    client_thread_ = std::thread([this]() { client_ctx_.Start(); });
+    server_scheduler_.Start();
+    client_scheduler_.Start();
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
 
   void TearDown() override {
-    server_ctx_.Stop();
-    client_ctx_.Stop();
-    if (server_thread_.joinable()) {
-      server_thread_.join();
-    }
-    if (client_thread_.joinable()) {
-      client_thread_.join();
-    }
+    server_scheduler_.Stop();
+    client_scheduler_.Stop();
     if (server_socket_ >= 0) {
       close(server_socket_);
     }

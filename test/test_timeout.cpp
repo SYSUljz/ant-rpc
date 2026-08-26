@@ -10,14 +10,15 @@
 #include <sys/socket.h>
 
 #include "ant_server/server.hpp"
+#include "ant_server/scheduler/scheduler.hpp"
 
 int main() {
   std::cout << "[Test] Starting Server on port 8016..." << std::endl;
-  Context context(256);
+  Scheduler scheduler(1, 1);
+  Context& context = scheduler.GetIOContext(0);
   Server server(context, AF_INET, 8016, SOCK_STREAM, 0, 10, INADDR_ANY);
 
-  // Run server context in background thread
-  std::thread server_thread([&context]() { context.Start(); });
+  scheduler.Start();
 
   std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
@@ -30,8 +31,7 @@ int main() {
 
   if (connect(sock, reinterpret_cast<struct sockaddr*>(&serv_addr), sizeof(serv_addr)) < 0) {
     std::cerr << "[Client] Connection failed!" << std::endl;
-    context.Stop();
-    server_thread.join();
+    scheduler.Stop();
     return 1;
   }
   std::cout << "[Client] Connected to server." << std::endl;
@@ -65,8 +65,7 @@ int main() {
   }
 
   close(sock);
-  context.Stop();
-  server_thread.join();
+  scheduler.Stop();
   std::cout << "[Test] Completed successfully." << std::endl;
   return 0;
 }

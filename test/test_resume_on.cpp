@@ -81,38 +81,7 @@ TEST(ResumeOnAwaiterTest, DirectResumeOnAwaiterUsage) {
   executor.Stop();
 }
 
-// 3. Test targeted thread pinning (co_await resume_on(executor, target_tid))
-TEST(ResumeOnAwaiterTest, TargetedThreadPinning) {
-  constexpr size_t kNumWorkers = 4;
-  WorkStealingExecutor executor(kNumWorkers);
-  executor.Start();
-
-  for (size_t target_id = 0; target_id < kNumWorkers; ++target_id) {
-    std::atomic<bool> finished {false};
-    std::atomic<size_t> observed_tid {static_cast<size_t>(-1)};
-
-    [](Executor& exec, size_t target, std::atomic<bool>& out_finished, std::atomic<size_t>& out_tid) -> DetachedTask {
-      co_await resume_on(exec, target);
-      out_tid.store(g_thread_id, std::memory_order_release);
-      out_finished.store(true, std::memory_order_release);
-    }(executor, target_id, finished, observed_tid);
-
-    auto start = std::chrono::steady_clock::now();
-    while (!finished.load(std::memory_order_acquire)) {
-      if (std::chrono::steady_clock::now() - start > std::chrono::seconds(2)) {
-        break;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    }
-
-    EXPECT_TRUE(finished.load());
-    EXPECT_EQ(observed_tid.load(), target_id);
-  }
-
-  executor.Stop();
-}
-
-// 4. Test multi-hop between two distinct Executors
+// 3. Test multi-hop between two distinct Executors
 TEST(ResumeOnAwaiterTest, MultiHopBetweenExecutors) {
   WorkStealingExecutor executor_a(2);
   WorkStealingExecutor executor_b(2);

@@ -1,7 +1,10 @@
 #include "ant_server/server.hpp"
+#include "ant_server/scheduler/scheduler.hpp"
 int main() {
-  Context context(256);
+  Scheduler scheduler(1, 1);
+  Context& context = scheduler.GetIOContext(0);
   Server server = Server(context, AF_INET, 8012, SOCK_STREAM, 0, 10, INADDR_ANY);
-  context.Start();
+  scheduler.Start();
+  scheduler.Wait();
   return 0;
 }

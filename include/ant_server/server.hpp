@@ -53,12 +53,6 @@ class Server {
     if (server_socket_ >= 0) {
       close(server_socket_);
     }
-    if (default_timer_keeper_) {
-      default_timer_keeper_->Stop();
-    }
-    if (default_executor_) {
-      default_executor_->Stop();
-    }
   }
 
   Server(const Server&) = delete;
@@ -75,17 +69,8 @@ class Server {
       exit(EXIT_FAILURE);
     }
 
-    if (!ctx_.GetScheduler() && !g_scheduler) {
-      default_executor_ = std::make_unique<WorkStealingExecutor>(1);
-      default_executor_->Start();
-      default_timer_keeper_ = std::make_unique<TimerKeeper>(*default_executor_);
-      default_timer_keeper_->Start();
-    }
-
     acceptor_ = std::make_unique<Acceptor>(ctx_, server_socket_, [this](int client_fd) {
-      TimerKeeper& tk = default_timer_keeper_ ? *default_timer_keeper_
-                                              : (ctx_.GetScheduler() ? ctx_.GetScheduler()->GetTimerKeeper()
-                                                                     : ant_server::GetEffectiveTimerKeeper());
+      TimerKeeper& tk = ctx_.GetTimerKeeper();
 
       [](Context& ctx, TimerKeeper& timer_keeper, int fd) -> DetachedTask {
         co_await with_timeout(timer_keeper, std::chrono::seconds(5), [&]() { return handle_http_client(ctx, fd); });
@@ -98,8 +83,6 @@ class Server {
   butil::EndPoint endpoint_;
   int server_socket_ {-1};
   std::unique_ptr<Acceptor> acceptor_;
-  std::unique_ptr<WorkStealingExecutor> default_executor_;
-  std::unique_ptr<TimerKeeper> default_timer_keeper_;
 };
 
 inline HttpTask handle_http_client(Context& ctx, int client_fd) {

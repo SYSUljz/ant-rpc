@@ -11,6 +11,7 @@
 #include "ant_server/rpc/controller.hpp"
 #include "ant_server/rpc/error_code.hpp"
 #include "ant_server/rpc/rpc_server.hpp"
+#include "ant_server/scheduler/scheduler.hpp"
 #include "echo.pb.h"
 
 using namespace ant_server::rpc;
@@ -45,16 +46,14 @@ class EchoServiceImpl : public ant_rpc::EchoService {
 class RpcServerTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    context_ = std::make_unique<Context>(256);
     // Port 0 tells OS to assign an available ephemeral port
-    server_ = std::make_unique<RpcServer>(*context_, 0);
+    server_ = std::make_unique<RpcServer>(server_context_, 0);
 
     // Register services (bRPC style)
     echo_service_ = std::make_shared<EchoServiceImpl>();
     server_->AddService(echo_service_);
 
-    // Start server in background thread
-    server_thread_ = std::thread([this]() { context_->Start(); });
+    scheduler_.Start();
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     port_ = server_->GetEndPoint().port;
@@ -63,18 +62,16 @@ class RpcServerTest : public ::testing::Test {
 
   void TearDown() override {
     channel_.Close();
-    context_->Stop();
-    if (server_thread_.joinable()) {
-      server_thread_.join();
-    }
+    scheduler_.Stop();
   }
 
   int port_ {0};
-  std::unique_ptr<Context> context_;
+  Scheduler scheduler_ {1, 2};
+  Context& server_context_ {scheduler_.GetIOContext(0)};
+  Context& client_context_ {scheduler_.GetIOContext(1)};
   std::shared_ptr<EchoServiceImpl> echo_service_;
   std::unique_ptr<RpcServer> server_;
-  std::thread server_thread_;
-  RpcChannel channel_;
+  RpcChannel channel_ {client_context_};
 };
 
 // 1. Basic Echo RPC Call via Protobuf Stub
@@ -159,7 +156,7 @@ TEST_F(RpcServerTest, ConcurrentRequests) {
 
   for (size_t t = 0; t < kNumThreads; ++t) {
     threads.emplace_back([this, &success_count, t]() {
-      RpcChannel ch;
+      RpcChannel ch(client_context_);
       ch.Init("127.0.0.1", port_);
       ant_rpc::EchoService_Stub stub(&ch);
 

@@ -52,6 +52,13 @@ struct IOuringSocketService : public BaseService {
     ctx_.Submit();
   }
 
+  void SubmitConnect(int fd, const sockaddr* address, socklen_t address_len, void* handler) {
+    io_uring_sqe* sqe = ctx_.GetSqe();
+    io_uring_prep_connect(sqe, fd, address, address_len);
+    io_uring_sqe_set_data(sqe, handler);
+    ctx_.Submit();
+  }
+
   void SubmitClose(int fd, void* handler, bool is_fixed = true) {
     struct io_uring_sqe* sqe = ctx_.GetSqe();
     if (is_fixed) {
