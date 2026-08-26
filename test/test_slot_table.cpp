@@ -127,4 +127,38 @@ TEST(SlotTableTest, LateResponseAfterCancellationIsIgnored) {
   EXPECT_EQ(second_ran.load(), 1);
 }
 
+TEST(SlotTableTest, ConfiguredMaxInFlightBoundsAllocatedSlots) {
+  ant_server::rpc::SlotTable<2> slots;
+  ant_server::rpc::RpcController controller;
+  std::atomic<int> ran {0};
+  CountingTask task(ran);
+  butil::IOBuf body;
+
+  const uint64_t first = slots.AllocateSlot(&task, nullptr, &controller, {}, nullptr, /*max_in_flight=*/1);
+  ASSERT_NE(first, 0);
+  EXPECT_EQ(slots.active_slot_count(), 1U);
+  EXPECT_EQ(slots.AllocateSlot(&task, nullptr, &controller, {}, nullptr, /*max_in_flight=*/1), 0U);
+
+  ASSERT_EQ(slots.PublishSlot(first), ant_server::rpc::PublishOutcome::kInFlight);
+  ASSERT_TRUE(slots.CompleteSlot(first, body));
+  EXPECT_EQ(slots.active_slot_count(), 0U);
+  EXPECT_NE(slots.AllocateSlot(&task, nullptr, &controller, {}, nullptr, /*max_in_flight=*/1), 0U);
+}
+
+TEST(SlotTableTest, LocalFailurePreservesItsErrorCodeAndReleasesQuota) {
+  ant_server::rpc::SlotTable<1> slots;
+  ant_server::rpc::RpcController controller;
+  std::atomic<int> ran {0};
+  CountingTask task(ran);
+
+  const uint64_t cid = slots.AllocateSlot(&task, nullptr, &controller, {}, nullptr, /*max_in_flight=*/1);
+  ASSERT_NE(cid, 0);
+  ASSERT_EQ(slots.PublishSlot(cid), ant_server::rpc::PublishOutcome::kInFlight);
+  ASSERT_TRUE(slots.FailSlot(cid, ant_server::rpc::RPC_EOVERLOAD, "outbound queue full"));
+
+  EXPECT_EQ(controller.ErrorCode(), ant_server::rpc::RPC_EOVERLOAD);
+  EXPECT_EQ(ran.load(), 1);
+  EXPECT_EQ(slots.active_slot_count(), 0U);
+}
+
 }  // namespace

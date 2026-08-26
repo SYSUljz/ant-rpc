@@ -5,15 +5,23 @@ namespace ant_server::rpc::detail {
 inline DetachedTask RpcChannelIoDriver::WriteFrame(std::shared_ptr<RpcChannelIoDriver> self, OutboundFrame frame) {
   while (!frame.buffer->empty() && self->state_->running.load(std::memory_order_acquire)) {
     const int written = co_await IOBufWriteAwaiter(self->context_, self->fd(), *frame.buffer, false);
+    // BeginCloseOnIoThread() releases the IO queue's remaining reservation.
+    // Do not release the copied front frame a second time after a close.
+    if (!self->state_->running.load(std::memory_order_acquire)) {
+      break;
+    }
     if (written <= 0) {
-      self->state_->slots.TimeoutSlot(frame.correlation_id, "Failed to send RPC request");
+      self->state_->slots.FailSlot(frame.correlation_id, RPC_ECONN_FAILED, "Failed to send RPC request");
       self->state_->running.store(false, std::memory_order_release);
       if (const int current_fd = self->fd(); current_fd >= 0) {
         shutdown(current_fd, SHUT_RDWR);
       }
+      self->FailAndClearOutboundOnIoThread(RPC_ECONN_FAILED, "Connection closed during write");
       break;
     }
-    frame.buffer->pop_front(static_cast<size_t>(written));
+    const std::size_t consumed = static_cast<std::size_t>(written);
+    frame.buffer->pop_front(consumed);
+    self->ReleaseReservedOutboundBytes(consumed);
   }
   self->writing_ = false;
   if (!self->outbound_.empty()) {

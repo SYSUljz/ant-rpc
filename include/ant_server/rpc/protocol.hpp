@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -43,7 +44,15 @@ struct RpcHeader {
 
 static_assert(sizeof(RpcHeader) == 16, "RpcHeader must be exactly 16 bytes");
 
-enum class FrameParseStatus { SUCCESS, NEED_MORE_DATA, ERROR_MAGIC_MISMATCH, ERROR_CORRUPTED_FRAME };
+inline constexpr std::size_t kDefaultMaxRpcFrameBytes = 16U * 1024U * 1024U;
+
+enum class FrameParseStatus {
+  SUCCESS,
+  NEED_MORE_DATA,
+  ERROR_MAGIC_MISMATCH,
+  ERROR_FRAME_TOO_LARGE,
+  ERROR_CORRUPTED_FRAME,
+};
 
 struct FrameParseResult {
   FrameParseStatus status {FrameParseStatus::NEED_MORE_DATA};
@@ -54,8 +63,10 @@ struct FrameParseResult {
   butil::IOBuf attachment_iobuf;  // Zero-copy raw binary payload
 };
 
-// Try parsing one complete RPC frame from IOBuf
-inline FrameParseResult TryParseRpcFrame(const butil::IOBuf& buf) {
+// Try parsing one complete RPC frame from IOBuf. The limit covers the complete
+// wire frame, including RpcHeader and RpcMeta.
+inline FrameParseResult TryParseRpcFrame(const butil::IOBuf& buf,
+                                         std::size_t max_frame_bytes = kDefaultMaxRpcFrameBytes) {
   if (buf.size() < sizeof(RpcHeader)) {
     return {FrameParseStatus::NEED_MORE_DATA, 0, {}, {}, {}, {}};
   }
@@ -67,7 +78,11 @@ inline FrameParseResult TryParseRpcFrame(const butil::IOBuf& buf) {
     return {FrameParseStatus::ERROR_MAGIC_MISMATCH, 0, {}, {}, {}, {}};
   }
 
-  size_t total_needed = sizeof(RpcHeader) + header.meta_len + header.body_len;
+  const std::size_t payload_size = static_cast<std::size_t>(header.meta_len) + header.body_len;
+  if (payload_size > max_frame_bytes || sizeof(RpcHeader) > max_frame_bytes - payload_size) {
+    return {FrameParseStatus::ERROR_FRAME_TOO_LARGE, 0, header, {}, {}, {}};
+  }
+  const std::size_t total_needed = sizeof(RpcHeader) + payload_size;
   if (buf.size() < total_needed) {
     return {FrameParseStatus::NEED_MORE_DATA, total_needed, header, {}, {}, {}};
   }

@@ -6,6 +6,7 @@
 #include <google/protobuf/service.h>
 #include <gtest/gtest.h>
 
+#include "ant_server/rpc/protocol.hpp"
 #include "butil/iobuf.h"
 #include "echo.pb.h"
 
@@ -63,4 +64,15 @@ TEST(ProtobufTest, ServiceReflectionAndDynamicInvocation) {
   auto* resp = dynamic_cast<ant_rpc::EchoResponse*>(resp_msg.get());
   ASSERT_NE(resp, nullptr);
   EXPECT_EQ(resp->message(), "Echo: Reflection call test");
+}
+
+TEST(ProtobufTest, FrameParserRejectsConfiguredMaxFrameBytes) {
+  ant_rpc::EchoRequest request;
+  request.set_message("frame-limit");
+  butil::IOBuf frame;
+  ant_rpc::PackRpcFrame(/*msg_type=*/0, /*correlation_id=*/7, "ant_rpc.EchoService", "Echo", request, frame);
+
+  ASSERT_GT(frame.size(), sizeof(ant_server::rpc::RpcHeader));
+  const auto result = ant_server::rpc::TryParseRpcFrame(frame, frame.size() - 1);
+  EXPECT_EQ(result.status, ant_server::rpc::FrameParseStatus::ERROR_FRAME_TOO_LARGE);
 }

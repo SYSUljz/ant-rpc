@@ -35,6 +35,7 @@ enum class SlotState : uint32_t {
   COMPLETED = 5,
   TIMED_OUT = 6,
   CANCELED = 7,
+  FAILED = 8,
 };
 
 // Result of handing an ARMING slot to the resolver side. A pending failure is
@@ -113,9 +114,14 @@ class SlotTable {
   // Allocate a slot in ARMING state and generate a 64-bit correlation_id.
   // The slot is not resolvable until PublishSlot() moves it to IN_FLIGHT.
   uint64_t AllocateSlot(TaskNode* task, google::protobuf::Message* response_msg, RpcController* controller,
-                        ContinuationTarget target, butil::IOBuf* raw_resp_body = nullptr) {
+                        ContinuationTarget target, butil::IOBuf* raw_resp_body = nullptr,
+                        std::size_t max_in_flight = Capacity) {
+    if (max_in_flight == 0 || max_in_flight > Capacity || !TryAcquireLiveSlot(max_in_flight)) {
+      return 0;
+    }
     uint32_t slot_id = PopFreeSlot();
     if (slot_id == INVALID_SLOT) {
+      ReleaseLiveSlot();
       return 0;  // Capacity exhausted
     }
 
@@ -261,6 +267,23 @@ class SlotTable {
     return ResolveFailure(correlation_id, SlotState::CANCELED, RPC_ECANCELED, err_msg);
   }
 
+  // Fails an already-published call for transport and local resource errors.
+  // Unlike TimeoutSlot this preserves the supplied error code.
+  bool FailSlot(uint64_t correlation_id, int error_code, const std::string& err_msg) {
+    CallSlot* slot_ptr = LookupSlot(correlation_id);
+    if (slot_ptr == nullptr) {
+      return false;
+    }
+    CallSlot& slot = *slot_ptr;
+    uint32_t expected = static_cast<uint32_t>(SlotState::IN_FLIGHT);
+    if (!slot.state.compare_exchange_strong(expected, static_cast<uint32_t>(SlotState::FAILED),
+                                            std::memory_order_acq_rel)) {
+      return false;
+    }
+    FinishFailure(slot, GetSlotId(correlation_id), error_code, err_msg);
+    return true;
+  }
+
   static constexpr uint64_t MakeCorrelationId(uint32_t version, uint32_t slot_id) {
     return (static_cast<uint64_t>(version) << 32) | static_cast<uint64_t>(slot_id);
   }
@@ -270,6 +293,8 @@ class SlotTable {
   }
 
   static constexpr uint32_t GetVersion(uint64_t correlation_id) { return static_cast<uint32_t>(correlation_id >> 32); }
+
+  [[nodiscard]] std::size_t active_slot_count() const noexcept { return active_slots_.load(std::memory_order_acquire); }
 
  private:
   static constexpr uint64_t PackTaggedIndex(uint32_t index, uint32_t tag) {
@@ -349,6 +374,19 @@ class SlotTable {
     }
   }
 
+  bool TryAcquireLiveSlot(std::size_t limit) {
+    std::size_t current = active_slots_.load(std::memory_order_acquire);
+    while (current < limit) {
+      if (active_slots_.compare_exchange_weak(current, current + 1, std::memory_order_acq_rel,
+                                              std::memory_order_acquire)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void ReleaseLiveSlot() { active_slots_.fetch_sub(1, std::memory_order_acq_rel); }
+
   uint32_t PopFreeSlot() {
     uint64_t current = free_head_.load(std::memory_order_acquire);
     while (true) {
@@ -375,6 +413,7 @@ class SlotTable {
     slots_[slot_id].executor = nullptr;
     slots_[slot_id].origin_thread = 0;
     slots_[slot_id].state.store(static_cast<uint32_t>(SlotState::FREE), std::memory_order_release);
+    ReleaseLiveSlot();
 
     uint64_t current = free_head_.load(std::memory_order_acquire);
     while (true) {
@@ -390,6 +429,7 @@ class SlotTable {
 
   std::unique_ptr<CallSlot[]> slots_;
   std::atomic<uint64_t> free_head_ {0};
+  std::atomic<std::size_t> active_slots_ {0};
 };
 
 }  // namespace ant_server::rpc

@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -16,6 +17,7 @@
 #include "ant_server/context/context.hpp"
 #include "ant_server/coroutine/task.hpp"
 #include "ant_server/rpc/core/channel_state.hpp"
+#include "ant_server/rpc/error_code.hpp"
 #include "ant_server/scheduler/timer_keeper.hpp"
 #include "ant_server/type.hpp"
 #include "butil/iobuf.h"
@@ -43,15 +45,37 @@ class RpcChannelIoDriver : public IoCommandMailbox, public std::enable_shared_fr
   };
 
   RpcChannelIoDriver(Context& context, std::shared_ptr<ChannelState> state, int fd, const sockaddr* address,
-                     socklen_t address_len, TimerKeeper& timer_keeper, std::chrono::milliseconds connect_timeout)
+                     socklen_t address_len, TimerKeeper& timer_keeper, std::chrono::milliseconds connect_timeout,
+                     std::size_t max_frame_bytes, std::size_t max_outbound_bytes)
       : context_(context), state_(std::move(state)), fd_(fd), timer_keeper_(timer_keeper),
-        connect_timeout_(connect_timeout), connect_address_len_(address_len) {
+        connect_timeout_(connect_timeout), max_frame_bytes_(max_frame_bytes), max_outbound_bytes_(max_outbound_bytes),
+        connect_address_len_(address_len) {
     std::memcpy(&connect_address_, address, address_len);
   }
 
   int fd() const noexcept { return fd_.load(std::memory_order_acquire); }
   void Start() { PostCommand(ChannelCommand::Start()); }
-  void Enqueue(OutboundFrame frame) { PostCommand(ChannelCommand::SendFrame(std::move(frame))); }
+
+  // Reserve before publishing a command so the limit covers both the MPSC
+  // mailbox and the IO-owned outbound queue.
+  bool TryReserveOutboundBytes(std::size_t bytes) noexcept {
+    if (bytes > max_outbound_bytes_) {
+      return false;
+    }
+    std::size_t current = outbound_bytes_.load(std::memory_order_acquire);
+    while (current <= max_outbound_bytes_ - bytes) {
+      if (outbound_bytes_.compare_exchange_weak(current, current + bytes, std::memory_order_acq_rel,
+                                                std::memory_order_acquire)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  void ReleaseReservedOutboundBytes(std::size_t bytes) noexcept {
+    outbound_bytes_.fetch_sub(bytes, std::memory_order_acq_rel);
+  }
+  // Requires a successful TryReserveOutboundBytes() for frame.buffer->size().
+  void EnqueueReserved(OutboundFrame frame) { PostCommand(ChannelCommand::SendFrame(std::move(frame))); }
   void RequestClose();
   void WaitClosed();
   void DrainCommandsOnIoThread() override;
@@ -61,6 +85,7 @@ class RpcChannelIoDriver : public IoCommandMailbox, public std::enable_shared_fr
   void StartOnIoThread();
   void BeginCloseOnIoThread();
   void StartNextWriteOnIoThread();
+  void FailAndClearOutboundOnIoThread(int error_code, const char* error_message);
   void TryFinishCloseOnIoThread();
   void FinishConnectOnIoThread(int result);
   void CancelPendingConnectOnIoThread();
@@ -77,6 +102,9 @@ class RpcChannelIoDriver : public IoCommandMailbox, public std::enable_shared_fr
   std::atomic<int> fd_ {-1};
   TimerKeeper& timer_keeper_;
   std::chrono::milliseconds connect_timeout_;
+  const std::size_t max_frame_bytes_;
+  const std::size_t max_outbound_bytes_;
+  std::atomic<std::size_t> outbound_bytes_ {0};
   sockaddr_storage connect_address_ {};
   socklen_t connect_address_len_ {0};
   MpscQueue<ChannelCommand> commands_;
@@ -116,7 +144,10 @@ inline void RpcChannelIoDriver::DrainCommandsOnIoThread() {
         break;
       case ChannelCommand::Type::kSendFrame:
         if (!state_->running.load(std::memory_order_acquire)) {
-          state_->slots.TimeoutSlot(command.frame.correlation_id, "Connection closed");
+          if (command.frame.buffer) {
+            ReleaseReservedOutboundBytes(command.frame.buffer->size());
+          }
+          state_->slots.FailSlot(command.frame.correlation_id, RPC_ECONN_FAILED, "Connection closed");
           break;
         }
         outbound_.push_back(std::move(command.frame));
@@ -137,7 +168,7 @@ inline void RpcChannelIoDriver::BeginCloseOnIoThread() {
   if (!receiver_started_) {
     receiver_exited_ = true;
   }
-  outbound_.clear();
+  FailAndClearOutboundOnIoThread(RPC_ECONN_FAILED, "Connection closed");
   TryFinishCloseOnIoThread();
 }
 
@@ -161,6 +192,16 @@ inline void RpcChannelIoDriver::FinishConnectOnIoThread(int result) {
     state_->connect_finished = true;
     state_->connect_cv.notify_all();
   }
+}
+
+inline void RpcChannelIoDriver::FailAndClearOutboundOnIoThread(int error_code, const char* error_message) {
+  for (const OutboundFrame& frame : outbound_) {
+    if (frame.buffer) {
+      ReleaseReservedOutboundBytes(frame.buffer->size());
+    }
+    state_->slots.FailSlot(frame.correlation_id, error_code, error_message);
+  }
+  outbound_.clear();
 }
 
 }  // namespace ant_server::rpc::detail

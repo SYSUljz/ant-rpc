@@ -12,7 +12,7 @@ inline DetachedTask RpcChannelIoDriver::ReceiveLoop(std::shared_ptr<RpcChannelIo
       break;
     }
     while (true) {
-      FrameParseResult result = TryParseRpcFrame(recv_buffer);
+      FrameParseResult result = TryParseRpcFrame(recv_buffer, self->max_frame_bytes_);
       if (result.status == FrameParseStatus::NEED_MORE_DATA) {
         break;
       }
@@ -27,7 +27,7 @@ inline DetachedTask RpcChannelIoDriver::ReceiveLoop(std::shared_ptr<RpcChannelIo
   }
   self->state_->running.store(false, std::memory_order_release);
   self->receiver_exited_ = true;
-  self->outbound_.clear();
+  self->FailAndClearOutboundOnIoThread(RPC_ECONN_FAILED, "Connection closed");
   self->TryFinishCloseOnIoThread();
 }
 

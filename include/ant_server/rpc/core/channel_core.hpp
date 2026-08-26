@@ -2,8 +2,11 @@
 
 #include <unistd.h>
 
-#include <coroutine>
+#include <cerrno>
 #include <chrono>
+#include <cstddef>
+#include <coroutine>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -33,8 +36,11 @@
 namespace ant_server::rpc {
 
 struct RpcChannelOptions {
-  int connect_timeout_ms {1000};
-  int64_t timeout_ms {5000};
+  std::chrono::milliseconds connect_timeout {1000};
+  std::chrono::milliseconds default_rpc_timeout {5000};
+  std::size_t max_frame_bytes {kDefaultMaxRpcFrameBytes};
+  std::size_t max_in_flight {65536};
+  std::size_t max_outbound_bytes {16U * 1024U * 1024U};
   bool tcp_no_delay {true};
 };
 using ChannelOptions = RpcChannelOptions;
@@ -103,13 +109,15 @@ class RpcChannel : public google::protobuf::RpcChannel {
     return Init(std::string(ip), port, options);
   }
   int Init(butil::EndPoint endpoint, const RpcChannelOptions* options = nullptr) {
+    const RpcChannelOptions requested_options = options ? *options : RpcChannelOptions {};
+    if (!ValidateOptions(requested_options)) {
+      return -1;
+    }
     Close();
     if (!ctx_->GetScheduler().IsRunning()) {
       return -1;
     }
-    if (options) {
-      options_ = *options;
-    }
+    options_ = requested_options;
     endpoint_ = endpoint;
     const int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -132,7 +140,8 @@ class RpcChannel : public google::protobuf::RpcChannel {
     auto driver = std::make_shared<detail::RpcChannelIoDriver>(*ctx_, state, fd,
                                                                 reinterpret_cast<const sockaddr*>(&address),
                                                                 sizeof(address), *timer_keeper_,
-                                                                std::chrono::milliseconds(options_.connect_timeout_ms));
+                                                                options_.connect_timeout, options_.max_frame_bytes,
+                                                                options_.max_outbound_bytes);
     {
       std::lock_guard<std::mutex> lock(channel_mu_);
       // Init still waits on this local shared_ptr for the asynchronous connect
@@ -208,7 +217,8 @@ class RpcChannel : public google::protobuf::RpcChannel {
       return;
     }
     const int64_t timeout =
-        rpc_controller && rpc_controller->TimeoutMs() > 0 ? rpc_controller->TimeoutMs() : options_.timeout_ms;
+        rpc_controller && rpc_controller->TimeoutMs() > 0 ? rpc_controller->TimeoutMs()
+                                                          : options_.default_rpc_timeout.count();
     AwaitBlockingCall(state_, result.correlation_id, notification, timeout);
   }
 
@@ -228,7 +238,8 @@ class RpcChannel : public google::protobuf::RpcChannel {
       task.run();
       return;
     }
-    const int64_t timeout = controller.TimeoutMs() > 0 ? controller.TimeoutMs() : options_.timeout_ms;
+    const int64_t timeout =
+        controller.TimeoutMs() > 0 ? controller.TimeoutMs() : options_.default_rpc_timeout.count();
     AwaitBlockingCall(state_, result.correlation_id, notification, timeout);
   }
 
@@ -267,9 +278,10 @@ class RpcChannel : public google::protobuf::RpcChannel {
       SetInlineFailure(controller, "Connection closed");
       return {};
     }
-    const uint64_t correlation_id = state->slots.AllocateSlot(task, response, controller, target, raw_response_body);
+    const uint64_t correlation_id =
+        state->slots.AllocateSlot(task, response, controller, target, raw_response_body, options_.max_in_flight);
     if (correlation_id == 0) {
-      SetInlineFailure(controller, "RPC slot table capacity exhausted", RPC_EOVERLOAD);
+      SetInlineFailure(controller, "RPC max_in_flight limit reached", RPC_EOVERLOAD);
       return {};
     }
     if (controller) {
@@ -287,7 +299,8 @@ class RpcChannel : public google::protobuf::RpcChannel {
     meta.set_method_name(std::string(method_name));
     if (controller) {
       meta.set_log_id(controller->LogId());
-      meta.set_timeout_ms(controller->TimeoutMs());
+      meta.set_timeout_ms(controller->TimeoutMs() > 0 ? controller->TimeoutMs()
+                                                       : options_.default_rpc_timeout.count());
       if (!controller->Headers().empty()) {
         *meta.mutable_headers() = controller->Headers();
       }
@@ -302,8 +315,17 @@ class RpcChannel : public google::protobuf::RpcChannel {
       butil::IOBuf empty;
       PackRpcFrame(meta, empty, attachment, *frame);
     }
+    const std::size_t frame_bytes = frame->size();
+    if (frame_bytes > options_.max_frame_bytes) {
+      return ResolveArmingFailure(state, correlation_id, RPC_EINVALID_DATA,
+                                  "RPC request frame exceeds max_frame_bytes");
+    }
+    if (!driver->TryReserveOutboundBytes(frame_bytes)) {
+      return ResolveArmingFailure(state, correlation_id, RPC_EOVERLOAD, "RPC max_outbound_bytes limit reached");
+    }
     const PublishOutcome publish = state->slots.PublishSlot(correlation_id);
     if (publish == PublishOutcome::kInvalid) {
+      driver->ReleaseReservedOutboundBytes(frame_bytes);
       state->slots.DiscardArmingSlot(correlation_id);
       SetInlineFailure(controller, "Failed to publish RPC slot", RPC_EINTERNAL);
       return {};
@@ -311,10 +333,31 @@ class RpcChannel : public google::protobuf::RpcChannel {
     // From PublishSlot onwards SlotTable may dispatch task on another thread;
     // do not read request, response, controller, or task below this line.
     if (publish != PublishOutcome::kInFlight) {
+      driver->ReleaseReservedOutboundBytes(frame_bytes);
       return {correlation_id, StartOutcome::kResolvedBySlot};
     }
-    driver->Enqueue({correlation_id, std::move(frame)});
+    driver->EnqueueReserved({correlation_id, std::move(frame)});
     return {correlation_id, StartOutcome::kInFlight};
+  }
+
+  static bool ValidateOptions(const RpcChannelOptions& options) noexcept {
+    return options.connect_timeout.count() > 0 &&
+           options.connect_timeout.count() <= std::numeric_limits<int>::max() &&
+           options.default_rpc_timeout.count() > 0 && options.max_frame_bytes >= sizeof(RpcHeader) &&
+           options.max_in_flight > 0 && options.max_in_flight <= 65536 &&
+           options.max_outbound_bytes >= sizeof(RpcHeader);
+  }
+
+  // Local failures can arrive after a stop callback has changed ARMING into a
+  // pending terminal state. Publishing first lets SlotTable choose that winner
+  // safely; otherwise this local error becomes an ordinary slot failure.
+  static StartResult ResolveArmingFailure(const std::shared_ptr<detail::ChannelState>& state, uint64_t correlation_id,
+                                          int error_code, const std::string& message) {
+    const PublishOutcome publish = state->slots.PublishSlot(correlation_id);
+    if (publish == PublishOutcome::kInFlight) {
+      state->slots.FailSlot(correlation_id, error_code, message);
+    }
+    return {correlation_id, StartOutcome::kResolvedBySlot};
   }
 
   static void SetInlineFailure(RpcController* controller, const std::string& message,
