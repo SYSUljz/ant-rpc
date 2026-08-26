@@ -14,6 +14,14 @@ struct ChannelState {
   SlotTable<65536> slots;
   std::atomic<bool> running {false};
 
+  // Init remains a synchronous protobuf-compatible facade, but the actual
+  // connection attempt runs on the owning Context. This condition variable is
+  // only its compatibility bridge; it is not part of the IO state machine.
+  std::mutex connect_mu;
+  std::condition_variable connect_cv;
+  bool connect_finished {false};
+  int connect_result {-1};
+
   std::mutex close_mu;
   std::condition_variable close_cv;
   bool closed {true};

@@ -22,7 +22,7 @@
 #include "ant_server/context/context.hpp"
 #include "ant_server/coroutine/task.hpp"
 #include "ant_server/rpc/controller.hpp"
-#include "ant_server/rpc/core/channel_io_driver.hpp"
+#include "ant_server/rpc/io_driver/channel_io_driver.hpp"
 #include "ant_server/rpc/error_code.hpp"
 #include "ant_server/rpc/protocol.hpp"
 #include "ant_server/scheduler/scheduler.hpp"
@@ -84,7 +84,7 @@ struct StartResult {
 };
 
 // Thread-safe protobuf-compatible facade. IO-thread-only socket state lives
-// in core/channel_io_driver.hpp.
+// in io_driver/channel_io_driver.hpp.
 class RpcChannel : public google::protobuf::RpcChannel {
  public:
   RpcChannel() = delete;
