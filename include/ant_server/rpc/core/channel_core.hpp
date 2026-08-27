@@ -4,8 +4,8 @@
 
 #include <cerrno>
 #include <chrono>
-#include <cstddef>
 #include <coroutine>
+#include <cstddef>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -25,8 +25,8 @@
 #include "ant_server/context/context.hpp"
 #include "ant_server/coroutine/task.hpp"
 #include "ant_server/rpc/controller.hpp"
-#include "ant_server/rpc/io_driver/channel_io_driver.hpp"
 #include "ant_server/rpc/error_code.hpp"
+#include "ant_server/rpc/io_driver/channel_io_driver.hpp"
 #include "ant_server/rpc/protocol.hpp"
 #include "ant_server/scheduler/scheduler.hpp"
 #include "ant_server/scheduler/timer_keeper.hpp"
@@ -42,6 +42,12 @@ struct RpcChannelOptions {
   std::size_t max_in_flight {65536};
   std::size_t max_outbound_bytes {16U * 1024U * 1024U};
   bool tcp_no_delay {true};
+
+  [[nodiscard]] bool IsValid() const noexcept {
+    return connect_timeout.count() > 0 && connect_timeout.count() <= std::numeric_limits<int>::max() &&
+           default_rpc_timeout.count() > 0 && max_frame_bytes >= kRpcHeaderBytes && max_in_flight > 0 &&
+           max_in_flight <= 65536 && max_outbound_bytes >= kRpcHeaderBytes;
+  }
 };
 using ChannelOptions = RpcChannelOptions;
 
@@ -95,8 +101,7 @@ class RpcChannel : public google::protobuf::RpcChannel {
  public:
   RpcChannel() = delete;
   explicit RpcChannel(Context& context)
-      : ctx_(&context), timer_keeper_(&context.GetTimerKeeper()),
-        state_(std::make_shared<detail::ChannelState>()) {}
+      : ctx_(&context), timer_keeper_(&context.GetTimerKeeper()), state_(std::make_shared<detail::ChannelState>()) {}
   ~RpcChannel() override { Close(); }
   RpcChannel(const RpcChannel&) = delete;
   RpcChannel& operator=(const RpcChannel&) = delete;
@@ -110,7 +115,7 @@ class RpcChannel : public google::protobuf::RpcChannel {
   }
   int Init(butil::EndPoint endpoint, const RpcChannelOptions* options = nullptr) {
     const RpcChannelOptions requested_options = options ? *options : RpcChannelOptions {};
-    if (!ValidateOptions(requested_options)) {
+    if (!requested_options.IsValid()) {
       return -1;
     }
     Close();
@@ -137,11 +142,9 @@ class RpcChannel : public google::protobuf::RpcChannel {
       state->closed = false;
     }
     state->running.store(true, std::memory_order_release);
-    auto driver = std::make_shared<detail::RpcChannelIoDriver>(*ctx_, state, fd,
-                                                                reinterpret_cast<const sockaddr*>(&address),
-                                                                sizeof(address), *timer_keeper_,
-                                                                options_.connect_timeout, options_.max_frame_bytes,
-                                                                options_.max_outbound_bytes);
+    auto driver = std::make_shared<detail::RpcChannelIoDriver>(
+        *ctx_, state, fd, reinterpret_cast<const sockaddr*>(&address), sizeof(address), *timer_keeper_,
+        options_.connect_timeout, options_.max_frame_bytes, options_.max_outbound_bytes);
     {
       std::lock_guard<std::mutex> lock(channel_mu_);
       // Init still waits on this local shared_ptr for the asynchronous connect
@@ -216,9 +219,8 @@ class RpcChannel : public google::protobuf::RpcChannel {
       task.run();
       return;
     }
-    const int64_t timeout =
-        rpc_controller && rpc_controller->TimeoutMs() > 0 ? rpc_controller->TimeoutMs()
-                                                          : options_.default_rpc_timeout.count();
+    const int64_t timeout = rpc_controller && rpc_controller->TimeoutMs() > 0 ? rpc_controller->TimeoutMs()
+                                                                              : options_.default_rpc_timeout.count();
     AwaitBlockingCall(state_, result.correlation_id, notification, timeout);
   }
 
@@ -238,8 +240,7 @@ class RpcChannel : public google::protobuf::RpcChannel {
       task.run();
       return;
     }
-    const int64_t timeout =
-        controller.TimeoutMs() > 0 ? controller.TimeoutMs() : options_.default_rpc_timeout.count();
+    const int64_t timeout = controller.TimeoutMs() > 0 ? controller.TimeoutMs() : options_.default_rpc_timeout.count();
     AwaitBlockingCall(state_, result.correlation_id, notification, timeout);
   }
 
@@ -299,27 +300,27 @@ class RpcChannel : public google::protobuf::RpcChannel {
     meta.set_method_name(std::string(method_name));
     if (controller) {
       meta.set_log_id(controller->LogId());
-      meta.set_timeout_ms(controller->TimeoutMs() > 0 ? controller->TimeoutMs()
-                                                       : options_.default_rpc_timeout.count());
+      meta.set_timeout_ms(controller->TimeoutMs() > 0 ? controller->TimeoutMs() : options_.default_rpc_timeout.count());
       if (!controller->Headers().empty()) {
         *meta.mutable_headers() = controller->Headers();
       }
     }
     auto frame = std::make_shared<butil::IOBuf>();
     const butil::IOBuf* attachment = controller ? &controller->RequestAttachment() : nullptr;
+    bool packed = false;
     if (request) {
-      PackRpcFrame(meta, request, attachment, *frame);
+      packed = PackRpcFrame(meta, request, attachment, *frame, options_.max_frame_bytes);
     } else if (raw_request_body) {
-      PackRpcFrame(meta, *raw_request_body, attachment, *frame);
+      packed = PackRpcFrame(meta, *raw_request_body, attachment, *frame, options_.max_frame_bytes);
     } else {
       butil::IOBuf empty;
-      PackRpcFrame(meta, empty, attachment, *frame);
+      packed = PackRpcFrame(meta, empty, attachment, *frame, options_.max_frame_bytes);
     }
-    const std::size_t frame_bytes = frame->size();
-    if (frame_bytes > options_.max_frame_bytes) {
+    if (!packed) {
       return ResolveArmingFailure(state, correlation_id, RPC_EINVALID_DATA,
                                   "RPC request frame exceeds max_frame_bytes");
     }
+    const std::size_t frame_bytes = frame->size();
     if (!driver->TryReserveOutboundBytes(frame_bytes)) {
       return ResolveArmingFailure(state, correlation_id, RPC_EOVERLOAD, "RPC max_outbound_bytes limit reached");
     }
@@ -338,14 +339,6 @@ class RpcChannel : public google::protobuf::RpcChannel {
     }
     driver->EnqueueReserved({correlation_id, std::move(frame)});
     return {correlation_id, StartOutcome::kInFlight};
-  }
-
-  static bool ValidateOptions(const RpcChannelOptions& options) noexcept {
-    return options.connect_timeout.count() > 0 &&
-           options.connect_timeout.count() <= std::numeric_limits<int>::max() &&
-           options.default_rpc_timeout.count() > 0 && options.max_frame_bytes >= sizeof(RpcHeader) &&
-           options.max_in_flight > 0 && options.max_in_flight <= 65536 &&
-           options.max_outbound_bytes >= sizeof(RpcHeader);
   }
 
   // Local failures can arrive after a stop callback has changed ARMING into a

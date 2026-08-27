@@ -1,5 +1,5 @@
-#include "ant_server/server.hpp"
 #include "ant_server/scheduler/scheduler.hpp"
+#include "ant_server/server.hpp"
 int main() {
   Scheduler scheduler(1, 1);
   Context& context = scheduler.GetIOContext(0);

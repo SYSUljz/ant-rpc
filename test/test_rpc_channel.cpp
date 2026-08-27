@@ -16,12 +16,12 @@
 #include "ant_server/context/context.hpp"
 #include "ant_server/coroutine/task.hpp"
 #include "ant_server/handler/acceptor.hpp"
-#include "ant_server/scheduler/scheduler.hpp"
 #include "ant_server/rpc/channel.hpp"
 #include "ant_server/rpc/controller.hpp"
 #include "ant_server/rpc/protocol.hpp"
 #include "ant_server/rpc/rpc_server.hpp"
 #include "ant_server/rpc/service_registry.hpp"
+#include "ant_server/scheduler/scheduler.hpp"
 #include "echo.pb.h"
 
 class EchoServiceImpl : public ant_rpc::EchoService {

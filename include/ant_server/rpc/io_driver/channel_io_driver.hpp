@@ -47,8 +47,13 @@ class RpcChannelIoDriver : public IoCommandMailbox, public std::enable_shared_fr
   RpcChannelIoDriver(Context& context, std::shared_ptr<ChannelState> state, int fd, const sockaddr* address,
                      socklen_t address_len, TimerKeeper& timer_keeper, std::chrono::milliseconds connect_timeout,
                      std::size_t max_frame_bytes, std::size_t max_outbound_bytes)
-      : context_(context), state_(std::move(state)), fd_(fd), timer_keeper_(timer_keeper),
-        connect_timeout_(connect_timeout), max_frame_bytes_(max_frame_bytes), max_outbound_bytes_(max_outbound_bytes),
+      : context_(context),
+        state_(std::move(state)),
+        fd_(fd),
+        timer_keeper_(timer_keeper),
+        connect_timeout_(connect_timeout),
+        max_frame_bytes_(max_frame_bytes),
+        max_outbound_bytes_(max_outbound_bytes),
         connect_address_len_(address_len) {
     std::memcpy(&connect_address_, address, address_len);
   }

@@ -26,7 +26,9 @@ class RpcServer {
   enum class Status : uint8_t { kCreated, kRunning, kStopping, kStopped, kFailed };
 
   explicit RpcServer(Context& ctx, butil::EndPoint endpoint, RpcServerOptions options = {})
-      : ctx_(ctx), endpoint_(endpoint), options_(std::move(options)),
+      : ctx_(ctx),
+        endpoint_(endpoint),
+        options_(std::move(options)),
         runtime_(std::make_shared<detail::ServerRuntime>(ctx, options_)) {}
   explicit RpcServer(Context& ctx, int port, butil::ip_t ip = butil::IP_ANY, RpcServerOptions options = {})
       : RpcServer(ctx, butil::EndPoint(ip, port), std::move(options)) {}
@@ -43,7 +45,9 @@ class RpcServer {
   }
   bool AddService(std::shared_ptr<google::protobuf::Service> service) {
     absl::MutexLock lock(&lifecycle_mu_);
-    if (status_ != Status::kCreated || !service) return false;
+    if (status_ != Status::kCreated || !service) {
+      return false;
+    }
     owned_services_.push_back(service);
     return registry_.RegisterService(service.get());
   }
@@ -51,15 +55,22 @@ class RpcServer {
   // Bind/listen and arm accept only after services and options are final.
   bool Start() {
     absl::MutexLock lock(&lifecycle_mu_);
-    if (status_ != Status::kCreated || !ValidateOptions(options_)) return false;
+    if (status_ != Status::kCreated || !options_.IsValid()) {
+      return false;
+    }
     server_socket_ = butil::tcp_listen(endpoint_);
     if (server_socket_ < 0) {
       status_ = Status::kFailed;
       return false;
     }
-    if (endpoint_.port == 0) butil::get_local_side(server_socket_, &endpoint_);
+    if (endpoint_.port == 0) {
+      butil::get_local_side(server_socket_, &endpoint_);
+    }
     acceptor_ = std::make_unique<Acceptor>(ctx_, server_socket_, [this](int client_fd) {
-      if (!runtime_->TryAcquireConnection()) { close(client_fd); return; }
+      if (!runtime_->TryAcquireConnection()) {
+        close(client_fd);
+        return;
+      }
       auto connection = std::make_shared<detail::ServerConnection>(ctx_, client_fd, registry_, runtime_);
       runtime_->TrackConnection(connection);
       connection->Start();
@@ -74,7 +85,9 @@ class RpcServer {
   void Stop() {
     {
       absl::MutexLock lock(&lifecycle_mu_);
-      if (status_ == Status::kStopped || status_ == Status::kStopping) return;
+      if (status_ == Status::kStopped || status_ == Status::kStopping) {
+        return;
+      }
       status_ = (status_ == Status::kRunning) ? Status::kStopping : Status::kStopped;
     }
     if (server_socket_ >= 0) {
@@ -91,8 +104,12 @@ class RpcServer {
   bool Join() {
     {
       absl::MutexLock lock(&lifecycle_mu_);
-      if (status_ == Status::kCreated || status_ == Status::kRunning || status_ == Status::kFailed) return false;
-      if (status_ == Status::kStopped) return true;
+      if (status_ == Status::kCreated || status_ == Status::kRunning || status_ == Status::kFailed) {
+        return false;
+      }
+      if (status_ == Status::kStopped) {
+        return true;
+      }
     }
     runtime_->WaitForDrained();
     absl::MutexLock lock(&lifecycle_mu_);
@@ -110,10 +127,6 @@ class RpcServer {
   }
 
  private:
-  static bool ValidateOptions(const RpcServerOptions& options) noexcept {
-    return options.max_connections > 0 && options.max_in_flight > 0 && options.max_frame_bytes >= sizeof(RpcHeader) &&
-           options.graceful_stop_timeout.count() >= 0 && options.idle_timeout.count() >= 0;
-  }
   Context& ctx_;
   butil::EndPoint endpoint_;
   const RpcServerOptions options_;
@@ -133,4 +146,6 @@ inline DetachedTask handle_rpc_client(Context& ctx, int client_fd, ServiceRegist
 
 }  // namespace ant_server::rpc
 
-namespace ant_rpc { using namespace ant_server::rpc; }
+namespace ant_rpc {
+using namespace ant_server::rpc;
+}

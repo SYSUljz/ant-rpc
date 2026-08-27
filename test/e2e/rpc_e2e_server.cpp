@@ -12,8 +12,8 @@ namespace {
 
 class EchoService final : public ant_rpc::EchoService {
  public:
-  void Echo(google::protobuf::RpcController*, const ant_rpc::EchoRequest* request,
-            ant_rpc::EchoResponse* response, google::protobuf::Closure* done) override {
+  void Echo(google::protobuf::RpcController*, const ant_rpc::EchoRequest* request, ant_rpc::EchoResponse* response,
+            google::protobuf::Closure* done) override {
     response->set_message("Echo: " + request->message());
     if (done) {
       done->Run();
@@ -44,16 +44,12 @@ int main(int argc, char** argv) {
 
   Scheduler scheduler(1, 1);
   ant_rpc::RpcServer server(scheduler.GetIOContext(0), requested_port, butil::IP_ANY);
-  if (server.GetSocketFd() < 0) {
-    std::cerr << "failed to listen: " << errno << '\n';
-    return 1;
-  }
   if (!server.AddService(std::make_shared<EchoService>())) {
     std::cerr << "failed to register Echo service\n";
     return 1;
   }
   if (!server.Start()) {
-    std::cerr << "failed to start RPC server\n";
+    std::cerr << "failed to start RPC server: " << errno << '\n';
     return 1;
   }
 

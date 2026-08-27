@@ -43,8 +43,8 @@ class EchoServiceImpl : public ant_rpc::EchoService {
 
 class BlockingEchoService final : public ant_rpc::EchoService {
  public:
-  void Echo(google::protobuf::RpcController*, const ant_rpc::EchoRequest* request,
-            ant_rpc::EchoResponse* response, google::protobuf::Closure* done) override {
+  void Echo(google::protobuf::RpcController*, const ant_rpc::EchoRequest* request, ant_rpc::EchoResponse* response,
+            google::protobuf::Closure* done) override {
     entered.Notify();
     release.WaitForNotification();
     response->set_message("Echo: " + request->message());
@@ -62,6 +62,45 @@ struct NotifyClosure final : google::protobuf::Closure {
   void Run() override { notification.Notify(); }
   absl::Notification& notification;
 };
+
+TEST(RpcOptionsTest, RejectsInvalidChannelAndServerConfigurations) {
+  RpcChannelOptions channel_options;
+  EXPECT_TRUE(channel_options.IsValid());
+  channel_options.connect_timeout = std::chrono::milliseconds {0};
+  EXPECT_FALSE(channel_options.IsValid());
+  channel_options = {};
+  channel_options.default_rpc_timeout = std::chrono::milliseconds {-1};
+  EXPECT_FALSE(channel_options.IsValid());
+  channel_options = {};
+  channel_options.max_frame_bytes = kRpcHeaderBytes - 1;
+  EXPECT_FALSE(channel_options.IsValid());
+  channel_options = {};
+  channel_options.max_in_flight = 0;
+  EXPECT_FALSE(channel_options.IsValid());
+  channel_options = {};
+  channel_options.max_in_flight = 65537;
+  EXPECT_FALSE(channel_options.IsValid());
+  channel_options = {};
+  channel_options.max_outbound_bytes = kRpcHeaderBytes - 1;
+  EXPECT_FALSE(channel_options.IsValid());
+
+  RpcServerOptions server_options;
+  EXPECT_TRUE(server_options.IsValid());
+  server_options.max_connections = 0;
+  EXPECT_FALSE(server_options.IsValid());
+  server_options = {};
+  server_options.max_in_flight = 0;
+  EXPECT_FALSE(server_options.IsValid());
+  server_options = {};
+  server_options.max_frame_bytes = kRpcHeaderBytes - 1;
+  EXPECT_FALSE(server_options.IsValid());
+  server_options = {};
+  server_options.graceful_stop_timeout = std::chrono::milliseconds {-1};
+  EXPECT_FALSE(server_options.IsValid());
+  server_options = {};
+  server_options.idle_timeout = std::chrono::milliseconds {-1};
+  EXPECT_FALSE(server_options.IsValid());
+}
 
 }  // namespace
 

@@ -6,19 +6,17 @@
 
 #include <gtest/gtest.h>
 
+#include "ant_server/coroutine/operator/when_any.hpp"
 #include "ant_server/scheduler/scheduler.hpp"
 #include "ant_server/scheduler/timer_keeper.hpp"
 #include "ant_server/type.hpp"
 #include "ant_server/utils/sleep.hpp"
-#include "ant_server/coroutine/operator/when_any.hpp"
 
 using namespace std::chrono_literals;
 
 namespace {
 
-ant_server::Task<int> ImmediateValue(int value) {
-  co_return value;
-}
+ant_server::Task<int> ImmediateValue(int value) { co_return value; }
 
 ant_server::Task<int> DelayedValue(TimerKeeper& timer_keeper, std::chrono::milliseconds delay, int value) {
   co_await sleep_for(timer_keeper, delay);

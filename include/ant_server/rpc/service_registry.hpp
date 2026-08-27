@@ -58,8 +58,7 @@ class ServiceRegistry {
     if (!service) {
       resp_meta.set_error_code(RPC_ENOSERVICE);
       resp_meta.set_error_text("Service not found: " + service_name);
-      PackRpcFrame(resp_meta, nullptr, nullptr, resp_out_buf);
-      return true;
+      return PackRpcFrame(resp_meta, nullptr, nullptr, resp_out_buf);
     }
 
     const auto* service_desc = service->GetDescriptor();
@@ -67,8 +66,7 @@ class ServiceRegistry {
     if (!method_desc) {
       resp_meta.set_error_code(RPC_ENOMETHOD);
       resp_meta.set_error_text("Method not found: " + method_name);
-      PackRpcFrame(resp_meta, nullptr, nullptr, resp_out_buf);
-      return true;
+      return PackRpcFrame(resp_meta, nullptr, nullptr, resp_out_buf);
     }
 
     // 1. Dynamically create Request and Response prototypes
@@ -81,8 +79,7 @@ class ServiceRegistry {
       if (!req_msg->ParseFromZeroCopyStream(&zc_in)) {
         resp_meta.set_error_code(RPC_EINVALID_DATA);
         resp_meta.set_error_text("Failed to parse request protobuf");
-        PackRpcFrame(resp_meta, nullptr, nullptr, resp_out_buf);
-        return true;
+        return PackRpcFrame(resp_meta, nullptr, nullptr, resp_out_buf);
       }
     }
 
@@ -110,9 +107,7 @@ class ServiceRegistry {
 
     // 6. Pack response frame
     const butil::IOBuf* resp_attach = !cntl.ResponseAttachment().empty() ? &cntl.ResponseAttachment() : nullptr;
-    PackRpcFrame(resp_meta, resp_msg.get(), resp_attach, resp_out_buf);
-
-    return true;
+    return PackRpcFrame(resp_meta, resp_msg.get(), resp_attach, resp_out_buf);
   }
 
  private:

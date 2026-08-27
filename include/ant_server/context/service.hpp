@@ -70,6 +70,19 @@ struct IOuringSocketService : public BaseService {
     ctx_.Submit();
   }
 
+  // accept_direct returns a registered-file index rather than a process fd.
+  // ServerConnection uses this operation to make a protocol/close event
+  // visible to the peer before releasing that registered-file slot.
+  void SubmitShutdown(int fd, int how, bool is_fixed = true) {
+    struct io_uring_sqe* sqe = ctx_.GetSqe();
+    io_uring_prep_shutdown(sqe, fd, how);
+    if (is_fixed) {
+      sqe->flags |= IOSQE_FIXED_FILE;
+    }
+    io_uring_sqe_set_data(sqe, nullptr);
+    ctx_.Submit();
+  }
+
   void SubmitCancel(void* handler) {
     struct io_uring_sqe* sqe = ctx_.GetSqe();
     io_uring_prep_cancel(sqe, handler, 0);

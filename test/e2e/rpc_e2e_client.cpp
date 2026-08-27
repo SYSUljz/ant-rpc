@@ -47,8 +47,8 @@ int main(int argc, char** argv) {
 
   const bool passed = !controller.Failed() && response.message() == "Echo: process-e2e";
   if (!passed) {
-    std::cerr << "RPC failed: " << controller.ErrorCode() << " " << controller.ErrorText()
-              << ", response='" << response.message() << "'\n";
+    std::cerr << "RPC failed: " << controller.ErrorCode() << " " << controller.ErrorText() << ", response='"
+              << response.message() << "'\n";
   }
   channel.Close();
   scheduler.Stop();
