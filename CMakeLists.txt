@@ -103,6 +103,22 @@ target_link_libraries(test_timeout PRIVATE ant_server ${URING_LIBRARIES} absl::s
 # --- GoogleTest Configuration ---
 enable_testing()
 
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
+add_executable(rpc_e2e_server test/e2e/rpc_e2e_server.cpp)
+target_link_libraries(rpc_e2e_server PRIVATE ant_server ${URING_LIBRARIES} absl::synchronization absl::base)
+
+add_executable(rpc_e2e_client test/e2e/rpc_e2e_client.cpp)
+target_link_libraries(rpc_e2e_client PRIVATE ant_server ${URING_LIBRARIES} absl::synchronization absl::base)
+
+add_test(
+    NAME rpc_process_e2e
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/test/e2e/test_rpc_process.py
+        --server $<TARGET_FILE:rpc_e2e_server>
+        --client $<TARGET_FILE:rpc_e2e_client>
+)
+set_tests_properties(rpc_process_e2e PROPERTIES TIMEOUT 20)
+
 add_executable(unit_tests 
     test/test_read_awaiter_cancel.cpp 
     test/test_iobuf.cpp 
