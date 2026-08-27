@@ -3,6 +3,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -10,6 +11,7 @@
 #include <google/protobuf/service.h>
 #include <sys/socket.h>
 
+#include "absl/synchronization/mutex.h"
 #include "ant_server/context/context.hpp"
 #include "ant_server/handler/acceptor.hpp"
 #include "ant_server/rpc/server/server_connection.hpp"
@@ -21,40 +23,40 @@ namespace ant_server::rpc {
 // server_connection.hpp and is not mixed into this lifecycle API.
 class RpcServer {
  public:
+  enum class Status : uint8_t { kCreated, kRunning, kStopping, kStopped, kFailed };
+
   explicit RpcServer(Context& ctx, butil::EndPoint endpoint, RpcServerOptions options = {})
       : ctx_(ctx), endpoint_(endpoint), options_(std::move(options)),
-        runtime_(std::make_shared<detail::ServerRuntime>(ctx, options_)) { Init(); }
+        runtime_(std::make_shared<detail::ServerRuntime>(ctx, options_)) {}
   explicit RpcServer(Context& ctx, int port, butil::ip_t ip = butil::IP_ANY, RpcServerOptions options = {})
       : RpcServer(ctx, butil::EndPoint(ip, port), std::move(options)) {}
-  ~RpcServer() { Stop(); }
+  ~RpcServer() {
+    Stop();
+    Join();
+  }
   RpcServer(const RpcServer&) = delete;
   RpcServer& operator=(const RpcServer&) = delete;
 
-  bool AddService(google::protobuf::Service* service) { return registry_.RegisterService(service); }
+  bool AddService(google::protobuf::Service* service) {
+    absl::MutexLock lock(&lifecycle_mu_);
+    return status_ == Status::kCreated && registry_.RegisterService(service);
+  }
   bool AddService(std::shared_ptr<google::protobuf::Service> service) {
-    if (!service) return false;
+    absl::MutexLock lock(&lifecycle_mu_);
+    if (status_ != Status::kCreated || !service) return false;
     owned_services_.push_back(service);
     return registry_.RegisterService(service.get());
   }
-  void Stop() {
-    if (stopped_.exchange(true, std::memory_order_acq_rel)) return;
-    if (server_socket_ >= 0) { shutdown(server_socket_, SHUT_RDWR); close(server_socket_); server_socket_ = -1; }
-    runtime_->BeginGracefulStop();
-  }
-  ServiceRegistry& GetRegistry() noexcept { return registry_; }
-  [[nodiscard]] int GetSocketFd() const noexcept { return server_socket_; }
-  [[nodiscard]] const butil::EndPoint& GetEndPoint() const noexcept { return endpoint_; }
-  [[nodiscard]] const RpcServerOptions& options() const noexcept { return options_; }
 
- private:
-  static bool ValidateOptions(const RpcServerOptions& options) noexcept {
-    return options.max_connections > 0 && options.max_in_flight > 0 && options.max_frame_bytes >= sizeof(RpcHeader) &&
-           options.graceful_stop_timeout.count() >= 0 && options.idle_timeout.count() >= 0;
-  }
-  void Init() {
-    if (!ValidateOptions(options_)) return;
+  // Bind/listen and arm accept only after services and options are final.
+  bool Start() {
+    absl::MutexLock lock(&lifecycle_mu_);
+    if (status_ != Status::kCreated || !ValidateOptions(options_)) return false;
     server_socket_ = butil::tcp_listen(endpoint_);
-    if (server_socket_ < 0) { perror("Failed to start listening with butil::tcp_listen..."); return; }
+    if (server_socket_ < 0) {
+      status_ = Status::kFailed;
+      return false;
+    }
     if (endpoint_.port == 0) butil::get_local_side(server_socket_, &endpoint_);
     acceptor_ = std::make_unique<Acceptor>(ctx_, server_socket_, [this](int client_fd) {
       if (!runtime_->TryAcquireConnection()) { close(client_fd); return; }
@@ -63,12 +65,61 @@ class RpcServer {
       connection->Start();
     });
     acceptor_->Start();
+    status_ = Status::kRunning;
+    return true;
+  }
+
+  // Stop accepting immediately. Existing connections get the configured
+  // graceful deadline, then ServerRuntime requests their IO-owner close.
+  void Stop() {
+    {
+      absl::MutexLock lock(&lifecycle_mu_);
+      if (status_ == Status::kStopped || status_ == Status::kStopping) return;
+      status_ = (status_ == Status::kRunning) ? Status::kStopping : Status::kStopped;
+    }
+    if (server_socket_ >= 0) {
+      shutdown(server_socket_, SHUT_RDWR);
+      close(server_socket_);
+      server_socket_ = -1;
+    }
+    runtime_->BeginGracefulStop();
+  }
+
+  // Separate from Stop so multiple servers may begin shutdown together.
+  // It also waits for running service code: closing an fd cannot safely
+  // destroy ServiceRegistry while a worker is still executing Dispatch().
+  bool Join() {
+    {
+      absl::MutexLock lock(&lifecycle_mu_);
+      if (status_ == Status::kCreated || status_ == Status::kRunning || status_ == Status::kFailed) return false;
+      if (status_ == Status::kStopped) return true;
+    }
+    runtime_->WaitForDrained();
+    absl::MutexLock lock(&lifecycle_mu_);
+    status_ = Status::kStopped;
+    return true;
+  }
+
+  ServiceRegistry& GetRegistry() noexcept { return registry_; }
+  [[nodiscard]] int GetSocketFd() const noexcept { return server_socket_; }
+  [[nodiscard]] const butil::EndPoint& GetEndPoint() const noexcept { return endpoint_; }
+  [[nodiscard]] const RpcServerOptions& options() const noexcept { return options_; }
+  [[nodiscard]] Status status() const noexcept {
+    absl::MutexLock lock(&lifecycle_mu_);
+    return status_;
+  }
+
+ private:
+  static bool ValidateOptions(const RpcServerOptions& options) noexcept {
+    return options.max_connections > 0 && options.max_in_flight > 0 && options.max_frame_bytes >= sizeof(RpcHeader) &&
+           options.graceful_stop_timeout.count() >= 0 && options.idle_timeout.count() >= 0;
   }
   Context& ctx_;
   butil::EndPoint endpoint_;
   const RpcServerOptions options_;
   std::shared_ptr<detail::ServerRuntime> runtime_;
-  std::atomic<bool> stopped_ {false};
+  mutable absl::Mutex lifecycle_mu_;
+  Status status_ {Status::kCreated};
   int server_socket_ {-1};
   ServiceRegistry registry_;
   std::vector<std::shared_ptr<google::protobuf::Service>> owned_services_;

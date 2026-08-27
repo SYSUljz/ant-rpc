@@ -52,6 +52,10 @@ int main(int argc, char** argv) {
     std::cerr << "failed to register Echo service\n";
     return 1;
   }
+  if (!server.Start()) {
+    std::cerr << "failed to start RPC server\n";
+    return 1;
+  }
 
   scheduler.Start();
   std::cout << "READY " << server.GetEndPoint().port << std::endl;
@@ -60,6 +64,8 @@ int main(int argc, char** argv) {
   // shutdown. A production server would instead use its signal/admin path.
   std::string command;
   std::getline(std::cin, command);
+  server.Stop();
+  server.Join();
   scheduler.Stop();
   return 0;
 }

@@ -9,12 +9,12 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
-#include <mutex>
 #include <utility>
 #include <vector>
 
 #include <sys/socket.h>
 
+#include "absl/synchronization/mutex.h"
 #include "ant_server/awaiter/resume_on.hpp"
 #include "ant_server/awaiter/socket_awaiter.hpp"
 #include "ant_server/context/context.hpp"
@@ -51,21 +51,36 @@ class ServerRuntime final : public std::enable_shared_from_this<ServerRuntime> {
     }
     return false;
   }
-  void ReleaseInFlight() noexcept { in_flight_.fetch_sub(1, std::memory_order_acq_rel); }
+  void ReleaseInFlight() noexcept {
+    in_flight_.fetch_sub(1, std::memory_order_acq_rel);
+    NotifyDrained();
+  }
   void BeginGracefulStop();
+  void WaitForDrained() {
+    absl::MutexLock lock(&drain_mu_);
+    drain_mu_.Await(absl::Condition(this, &ServerRuntime::IsDrained));
+  }
   const RpcServerOptions& options() const noexcept { return options_; }
 
  private:
   void ForceCloseLiveConnections();
   void CancelGracefulStopTimer();
+  bool IsDrained() const {
+    return active_connections_.load(std::memory_order_acquire) == 0 &&
+           in_flight_.load(std::memory_order_acquire) == 0;
+  }
+  // Abseil's Await waiters are re-evaluated on unlock. The counters are
+  // atomic hot-path state, so take this control lock only to publish a change.
+  void NotifyDrained() { absl::MutexLock lock(&drain_mu_); }
   TimerKeeper& timer_keeper_;
   const RpcServerOptions options_;
   std::atomic<bool> accepting_ {true};
   std::atomic<std::size_t> active_connections_ {0};
   std::atomic<std::size_t> in_flight_ {0};
   std::atomic<uint64_t> graceful_stop_timer_id_ {0};
-  std::mutex connections_mu_;
+  absl::Mutex connections_mu_;
   std::vector<std::shared_ptr<ServerConnection>> connections_;
+  absl::Mutex drain_mu_;
 };
 
 inline void PackServerErrorResponse(const FrameParseResult& request, int error_code, const char* error_text,
@@ -228,12 +243,13 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
 };
 
 inline void ServerRuntime::TrackConnection(const std::shared_ptr<ServerConnection>& connection) {
-  std::lock_guard<std::mutex> lock(connections_mu_); connections_.push_back(connection);
+  absl::MutexLock lock(&connections_mu_); connections_.push_back(connection);
 }
 inline void ServerRuntime::ReleaseConnection(const std::shared_ptr<ServerConnection>& connection) {
-  { std::lock_guard<std::mutex> lock(connections_mu_); std::erase(connections_, connection); }
+  { absl::MutexLock lock(&connections_mu_); std::erase(connections_, connection); }
   active_connections_.fetch_sub(1, std::memory_order_acq_rel);
   if (active_connections_.load(std::memory_order_acquire) == 0) CancelGracefulStopTimer();
+  NotifyDrained();
 }
 inline void ServerRuntime::BeginGracefulStop() {
   accepting_.store(false, std::memory_order_release);
@@ -246,7 +262,7 @@ inline void ServerRuntime::BeginGracefulStop() {
 }
 inline void ServerRuntime::ForceCloseLiveConnections() {
   std::vector<std::shared_ptr<ServerConnection>> snapshot;
-  { std::lock_guard<std::mutex> lock(connections_mu_); snapshot = connections_; }
+  { absl::MutexLock lock(&connections_mu_); snapshot = connections_; }
   for (const auto& connection : snapshot) connection->RequestClose();
 }
 inline void ServerRuntime::CancelGracefulStopTimer() {

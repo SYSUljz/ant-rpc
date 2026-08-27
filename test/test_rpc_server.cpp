@@ -4,6 +4,7 @@
 #include <thread>
 #include <vector>
 
+#include <absl/synchronization/notification.h>
 #include <gtest/gtest.h>
 
 #include "ant_server/context/context.hpp"
@@ -40,6 +41,28 @@ class EchoServiceImpl : public ant_rpc::EchoService {
   }
 };
 
+class BlockingEchoService final : public ant_rpc::EchoService {
+ public:
+  void Echo(google::protobuf::RpcController*, const ant_rpc::EchoRequest* request,
+            ant_rpc::EchoResponse* response, google::protobuf::Closure* done) override {
+    entered.Notify();
+    release.WaitForNotification();
+    response->set_message("Echo: " + request->message());
+    if (done) {
+      done->Run();
+    }
+  }
+
+  absl::Notification entered;
+  absl::Notification release;
+};
+
+struct NotifyClosure final : google::protobuf::Closure {
+  explicit NotifyClosure(absl::Notification& notification) : notification(notification) {}
+  void Run() override { notification.Notify(); }
+  absl::Notification& notification;
+};
+
 }  // namespace
 
 // Test Suite for RpcServer with dynamic ephemeral port binding
@@ -51,7 +74,8 @@ class RpcServerTest : public ::testing::Test {
 
     // Register services (bRPC style)
     echo_service_ = std::make_shared<EchoServiceImpl>();
-    server_->AddService(echo_service_);
+    ASSERT_TRUE(server_->AddService(echo_service_));
+    ASSERT_TRUE(server_->Start());
 
     scheduler_.Start();
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -62,6 +86,8 @@ class RpcServerTest : public ::testing::Test {
 
   void TearDown() override {
     channel_.Close();
+    server_->Stop();
+    EXPECT_TRUE(server_->Join());
     scheduler_.Stop();
   }
 
@@ -183,4 +209,72 @@ TEST_F(RpcServerTest, ConcurrentRequests) {
   }
 
   EXPECT_EQ(success_count.load(), kNumThreads * kCallsPerThread);
+}
+
+TEST(RpcServerLifecycleTest, ConstructionDoesNotListenAndLifecycleIsExplicit) {
+  Scheduler scheduler {1, 1};
+  Context& context = scheduler.GetIOContext(0);
+  RpcServer server(context, 0);
+  auto service = std::make_shared<EchoServiceImpl>();
+
+  EXPECT_EQ(server.status(), RpcServer::Status::kCreated);
+  EXPECT_EQ(server.GetSocketFd(), -1);
+  EXPECT_TRUE(server.AddService(service));
+  EXPECT_TRUE(server.Start());
+  EXPECT_EQ(server.status(), RpcServer::Status::kRunning);
+  EXPECT_GT(server.GetSocketFd(), -1);
+  EXPECT_FALSE(server.Start());
+  EXPECT_FALSE(server.AddService(std::make_shared<EchoServiceImpl>()));
+
+  scheduler.Start();
+  server.Stop();
+  EXPECT_EQ(server.status(), RpcServer::Status::kStopping);
+  EXPECT_TRUE(server.Join());
+  EXPECT_EQ(server.status(), RpcServer::Status::kStopped);
+  EXPECT_TRUE(server.Join());
+  scheduler.Stop();
+}
+
+TEST(RpcServerOptionsTest, MaxInFlightReturnsOverloadWithoutBlockingReceiveLoop) {
+  RpcServerOptions options;
+  options.max_in_flight = 1;
+  Scheduler scheduler {1, 2};
+  Context& server_context = scheduler.GetIOContext(0);
+  Context& client_context = scheduler.GetIOContext(1);
+  RpcServer server(server_context, 0, butil::IP_ANY, options);
+  auto service = std::make_shared<BlockingEchoService>();
+  ASSERT_TRUE(server.AddService(service));
+  ASSERT_TRUE(server.Start());
+  scheduler.Start();
+
+  RpcChannel channel(client_context);
+  ASSERT_EQ(channel.Init("127.0.0.1", server.GetEndPoint().port), 0);
+  ant_rpc::EchoService_Stub stub(&channel);
+
+  ant_rpc::EchoRequest first_request;
+  first_request.set_message("first");
+  ant_rpc::EchoResponse first_response;
+  RpcController first_controller;
+  absl::Notification first_done;
+  NotifyClosure first_closure(first_done);
+  stub.Echo(&first_controller, &first_request, &first_response, &first_closure);
+  ASSERT_TRUE(service->entered.WaitForNotificationWithTimeout(absl::Seconds(2)));
+
+  ant_rpc::EchoRequest second_request;
+  second_request.set_message("second");
+  ant_rpc::EchoResponse second_response;
+  RpcController second_controller;
+  stub.Echo(&second_controller, &second_request, &second_response, nullptr);
+  EXPECT_TRUE(second_controller.Failed());
+  EXPECT_EQ(second_controller.ErrorCode(), RPC_EOVERLOAD);
+
+  service->release.Notify();
+  ASSERT_TRUE(first_done.WaitForNotificationWithTimeout(absl::Seconds(2)));
+  EXPECT_FALSE(first_controller.Failed()) << first_controller.ErrorText();
+  EXPECT_EQ(first_response.message(), "Echo: first");
+
+  channel.Close();
+  server.Stop();
+  EXPECT_TRUE(server.Join());
+  scheduler.Stop();
 }
