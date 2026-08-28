@@ -40,6 +40,13 @@ def request_frame(correlation_id: int, message: str) -> bytes:
     return wire_header(body_len=len(body), meta_len=len(meta)) + meta + body
 
 
+def non_response_frame() -> bytes:
+    # A syntactically valid RpcMeta with its default msg_type (RPC_REQUEST).
+    # A client channel must reject it even before correlation-id completion.
+    meta = b"\x08\x01"
+    return wire_header(meta_len=len(meta)) + meta
+
+
 def read_ready(server: subprocess.Popen[str]) -> int:
     if server.stdout is None:
         raise RuntimeError("server stdout is not piped")
@@ -182,6 +189,7 @@ def main() -> int:
         verify_client_rejects_bad_response(args.client, "version", wire_header(flags=0x02000000))
         verify_client_rejects_bad_response(args.client, "oversized-length",
                                             wire_header(body_len=0xFFFFFFFF, meta_len=0xFFFFFFFF))
+        verify_client_rejects_bad_response(args.client, "message-type", non_response_frame())
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
         failure = str(error)
     finally:

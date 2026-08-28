@@ -26,7 +26,7 @@ struct RpcCallAwaiter {
     // coroutine frame alive for an inline failure instead of resuming it from
     // inside await_suspend.
     const StartResult result = channel.StartUnaryCall(service_name, method_name, controller, request, response, &task_,
-                                                      CurrentContinuationTarget(), &stop_callback_);
+                                                      channel.CurrentCallContinuationTarget(), &stop_callback_);
     return result.outcome != StartOutcome::kFailedInline;
   }
   void await_resume() noexcept {}

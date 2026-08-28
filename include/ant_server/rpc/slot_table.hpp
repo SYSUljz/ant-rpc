@@ -44,20 +44,27 @@ enum class SlotState : uint32_t {
 // delivered by PublishSlot itself, never by the thread that requested it.
 enum class PublishOutcome : uint8_t { kInFlight, kCanceled, kTimedOut, kFailed, kInvalid };
 
-// Where a slot's continuation should run once the slot resolves.
-// A null executor means "run inline on the resolving thread", which is what blocking call paths
-// want (their continuation only signals a Notification and must not be queued behind a worker).
+// Where a slot's continuation should run once the slot resolves. Every live
+// RPC slot owns a worker executor; IO threads never run a completion inline.
 struct ContinuationTarget {
   Executor* executor {nullptr};
-  uint32_t thread_id {0};
+  static ContinuationTarget Worker(Executor& executor) noexcept { return ContinuationTarget {&executor}; }
 };
 
-// Captures the current thread's executor affinity. Coroutine call paths use this so that a
-// resumed coroutine wakes up on the thread it suspended on, keeping g_local_context /
-// g_thread_id consistent (io_uring rings are single-thread owned and must not be crossed).
-inline ContinuationTarget CurrentContinuationTarget() noexcept {
-  return ContinuationTarget {g_executor, static_cast<uint32_t>(g_thread_id)};
+// All RPC completions are load-balanced by the channel worker executor. A
+// network round-trip makes preserving the issuing worker's CPU-cache locality
+// ineffective, and business coroutines are intentionally migratable.
+inline ContinuationTarget CurrentContinuationTarget(Executor& fallback_executor) noexcept {
+  return ContinuationTarget::Worker(fallback_executor);
 }
+
+enum class ResponseCompletionOutcome : uint8_t { kCompleted, kUnknownCorrelationId, kLateResponse };
+
+struct ResponseCompletionStats {
+  uint64_t completed {0};
+  uint64_t unknown_correlation_id {0};
+  uint64_t late_response {0};
+};
 
 // Type-erased cancel functor stored inside a caller-owned std::stop_callback.
 // Deliberately trivial (24 bytes, no allocation) so it never lands in std::function.
@@ -87,7 +94,6 @@ struct alignas(ant_server::constants::kCacheLineSize) CallSlot {
   RpcController* controller {nullptr};
   butil::IOBuf* raw_resp_body {nullptr};
   Executor* executor {nullptr};
-  uint32_t origin_thread {0};
   uint32_t next_free {0};
 };
 
@@ -118,7 +124,8 @@ class SlotTable {
   uint64_t AllocateSlot(TaskNode* task, google::protobuf::Message* response_msg, RpcController* controller,
                         ContinuationTarget target, butil::IOBuf* raw_resp_body = nullptr,
                         std::size_t max_in_flight = Capacity) {
-    if (max_in_flight == 0 || max_in_flight > Capacity || !TryAcquireLiveSlot(max_in_flight)) {
+    if (target.executor == nullptr || max_in_flight == 0 || max_in_flight > Capacity ||
+        !TryAcquireLiveSlot(max_in_flight)) {
       return 0;
     }
     uint32_t slot_id = PopFreeSlot();
@@ -136,7 +143,6 @@ class SlotTable {
     slot.controller = controller;
     slot.raw_resp_body = raw_resp_body;
     slot.executor = target.executor;
-    slot.origin_thread = target.thread_id;
     slot.state.store(static_cast<uint32_t>(SlotState::ARMING), std::memory_order_release);
 
     return MakeCorrelationId(version, slot_id);
@@ -220,20 +226,28 @@ class SlotTable {
                          this, correlation_id};
   }
 
-  // Complete slot on receiving network response (Zero-Copy parse Protobuf + dispatch continuation)
-  bool CompleteSlot(uint64_t correlation_id, const butil::IOBuf& body_iobuf, RpcMeta&& meta,
-                    const butil::IOBuf& attachment_iobuf) {
-    CallSlot* slot_ptr = LookupSlot(correlation_id);
-    if (slot_ptr == nullptr) {
-      return false;
+  // Complete a slot on receiving a network response (Zero-Copy protobuf parse
+  // plus continuation dispatch). The result preserves observability for
+  // unknown and stale correlation IDs without ever completing a recycled slot.
+  ResponseCompletionOutcome CompleteResponseSlot(uint64_t correlation_id, const butil::IOBuf& body_iobuf,
+                                                 RpcMeta&& meta, const butil::IOBuf& attachment_iobuf) {
+    const uint32_t slot_id = GetSlotId(correlation_id);
+    if (slot_id >= Capacity) {
+      unknown_correlation_id_.fetch_add(1, std::memory_order_relaxed);
+      return ResponseCompletionOutcome::kUnknownCorrelationId;
     }
-    CallSlot& slot = *slot_ptr;
+    CallSlot& slot = slots_[slot_id];
+    if (slot.version.load(std::memory_order_acquire) != GetVersion(correlation_id)) {
+      late_response_.fetch_add(1, std::memory_order_relaxed);
+      return ResponseCompletionOutcome::kLateResponse;
+    }
 
     // Atomic CAS transition: IN_FLIGHT -> COMPLETED
     uint32_t expected = static_cast<uint32_t>(SlotState::IN_FLIGHT);
     if (!slot.state.compare_exchange_strong(expected, static_cast<uint32_t>(SlotState::COMPLETED),
                                             std::memory_order_acq_rel)) {
-      return false;  // Not published yet, or lost race against timeout/cancellation
+      late_response_.fetch_add(1, std::memory_order_relaxed);
+      return ResponseCompletionOutcome::kLateResponse;
     }
 
     if (slot.controller) {
@@ -264,8 +278,15 @@ class SlotTable {
     }
 
     UnregisterPublishedSlot(correlation_id);
-    ReleaseAndDispatch(slot, GetSlotId(correlation_id));
-    return true;
+    completed_responses_.fetch_add(1, std::memory_order_relaxed);
+    ReleaseAndDispatch(slot, slot_id);
+    return ResponseCompletionOutcome::kCompleted;
+  }
+
+  bool CompleteSlot(uint64_t correlation_id, const butil::IOBuf& body_iobuf, RpcMeta&& meta,
+                    const butil::IOBuf& attachment_iobuf) {
+    return CompleteResponseSlot(correlation_id, body_iobuf, std::move(meta), attachment_iobuf) ==
+           ResponseCompletionOutcome::kCompleted;
   }
 
   bool CompleteSlot(uint64_t correlation_id, const butil::IOBuf& body_iobuf, const RpcMeta& meta,
@@ -345,6 +366,10 @@ class SlotTable {
   static constexpr uint32_t GetVersion(uint64_t correlation_id) { return static_cast<uint32_t>(correlation_id >> 32); }
 
   [[nodiscard]] std::size_t active_slot_count() const noexcept { return active_slots_.load(std::memory_order_acquire); }
+  [[nodiscard]] ResponseCompletionStats response_completion_stats() const noexcept {
+    return {completed_responses_.load(std::memory_order_relaxed),
+            unknown_correlation_id_.load(std::memory_order_relaxed), late_response_.load(std::memory_order_relaxed)};
+  }
 
  private:
   static constexpr uint64_t PackTaggedIndex(uint32_t index, uint32_t tag) {
@@ -435,21 +460,18 @@ class SlotTable {
   void ReleaseAndDispatch(CallSlot& slot, uint32_t slot_id) {
     TaskNode* task = slot.task;
     Executor* executor = slot.executor;
-    std::size_t thread_id = slot.origin_thread;
 
     PushFreeSlot(slot_id);
 
     if (task == nullptr) {
       return;
     }
-    if (executor != nullptr) {
-      // Resume on the thread the call was issued from: thread-local scheduler/io_uring context
-      // must stay consistent across the suspension point.
-      executor->schedule(task, thread_id);
-    } else {
-      // No executor affinity (blocking call paths, unit tests): run inline on this thread.
-      task->run();
+    // AllocateSlot rejects a null executor. Keep this guard defensive because
+    // the slot may be inspected while being recycled in debug tooling.
+    if (executor == nullptr) {
+      std::terminate();
     }
+    executor->schedule(task);
   }
 
   bool TryAcquireLiveSlot(std::size_t limit) {
@@ -489,7 +511,6 @@ class SlotTable {
     slots_[slot_id].controller = nullptr;
     slots_[slot_id].raw_resp_body = nullptr;
     slots_[slot_id].executor = nullptr;
-    slots_[slot_id].origin_thread = 0;
     slots_[slot_id].state.store(static_cast<uint32_t>(SlotState::FREE), std::memory_order_release);
     ReleaseLiveSlot();
 
@@ -508,6 +529,9 @@ class SlotTable {
   std::unique_ptr<CallSlot[]> slots_;
   std::atomic<uint64_t> free_head_ {0};
   std::atomic<std::size_t> active_slots_ {0};
+  std::atomic<uint64_t> completed_responses_ {0};
+  std::atomic<uint64_t> unknown_correlation_id_ {0};
+  std::atomic<uint64_t> late_response_ {0};
   absl::Mutex active_calls_mu_;
   std::unordered_set<uint64_t> active_calls_;
   bool connection_failed_ {false};

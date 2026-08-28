@@ -24,9 +24,14 @@ inline DetachedTask RpcChannelIoDriver::ReceiveLoop(std::shared_ptr<RpcChannelIo
         self->HandleTerminalFailureOnIoThread(RPC_ECONN_FAILED, "Invalid RPC response frame");
         co_return;
       }
+      if (result.meta.msg_type() != RPC_RESPONSE) {
+        self->receiver_exited_ = true;
+        self->HandleTerminalFailureOnIoThread(RPC_ECONN_FAILED, "Received a non-response RPC frame on client channel");
+        co_return;
+      }
       recv_buffer.pop_front(result.total_frame_bytes);
-      self->state_->slots.CompleteSlot(result.meta.correlation_id(), result.body_iobuf, std::move(result.meta),
-                                       result.attachment_iobuf);
+      self->state_->slots.CompleteResponseSlot(result.meta.correlation_id(), result.body_iobuf, std::move(result.meta),
+                                               result.attachment_iobuf);
     }
   }
   self->receiver_exited_ = true;

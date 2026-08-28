@@ -220,7 +220,7 @@ class RpcChannel : public google::protobuf::RpcChannel {
     if (done) {
       auto* task = new detail::ClosureTask(done, true);
       const StartResult result = StartUnaryCall(method->service()->full_name(), method->name(), rpc_controller, request,
-                                                response, task, CurrentContinuationTarget(), &task->stop_callback);
+                                                response, task, CurrentCallContinuationTarget(), &task->stop_callback);
       if (result.outcome == StartOutcome::kFailedInline) {
         task->run();
       }
@@ -235,7 +235,7 @@ class RpcChannel : public google::protobuf::RpcChannel {
     detail::ClosureTask task(&closure);
     SlotStopCallback stop_callback;
     const StartResult result = StartUnaryCall(method->service()->full_name(), method->name(), rpc_controller, request,
-                                              response, &task, ContinuationTarget {}, &stop_callback);
+                                              response, &task, CurrentCallContinuationTarget(), &stop_callback);
     if (result.outcome == StartOutcome::kFailedInline) {
       task.run();
       return;
@@ -255,8 +255,9 @@ class RpcChannel : public google::protobuf::RpcChannel {
     } closure(notification);
     detail::ClosureTask task(&closure);
     SlotStopCallback stop_callback;
-    const StartResult result = StartUnaryCall(service_name, method_name, &controller, nullptr, nullptr, &task,
-                                              ContinuationTarget {}, &stop_callback, &request_body, &response_body);
+    const StartResult result =
+        StartUnaryCall(service_name, method_name, &controller, nullptr, nullptr, &task, CurrentCallContinuationTarget(),
+                       &stop_callback, &request_body, &response_body);
     if (result.outcome == StartOutcome::kFailedInline) {
       task.run();
       return;
@@ -275,6 +276,15 @@ class RpcChannel : public google::protobuf::RpcChannel {
 
  private:
   friend struct RpcCallAwaiter;
+
+  // Before Init() has bound a Context, StartUnaryCall fails before it allocates
+  // a slot, so this empty target can never reach completion dispatch.
+  ContinuationTarget CurrentCallContinuationTarget() const noexcept {
+    if (ctx_ && ctx_->GetExecutor()) {
+      return CurrentContinuationTarget(*ctx_->GetExecutor());
+    }
+    return {};
+  }
 
   StartResult StartUnaryCall(std::string_view service_name, std::string_view method_name, RpcController* controller,
                              const google::protobuf::Message* request, google::protobuf::Message* response,
