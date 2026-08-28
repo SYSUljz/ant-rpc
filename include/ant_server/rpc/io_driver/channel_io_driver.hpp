@@ -173,6 +173,7 @@ inline void RpcChannelIoDriver::BeginCloseOnIoThread() {
   if (!receiver_started_) {
     receiver_exited_ = true;
   }
+  state_->slots.FailAllActiveSlots(RPC_ECONN_FAILED, "Connection closed");
   FailAndClearOutboundOnIoThread(RPC_ECONN_FAILED, "Connection closed");
   TryFinishCloseOnIoThread();
 }

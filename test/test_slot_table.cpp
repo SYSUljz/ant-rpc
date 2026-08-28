@@ -161,4 +161,52 @@ TEST(SlotTableTest, LocalFailurePreservesItsErrorCodeAndReleasesQuota) {
   EXPECT_EQ(slots.active_slot_count(), 0U);
 }
 
+TEST(SlotTableTest, FailAllActiveSlotsFailsPublishedCalls) {
+  ant_server::rpc::SlotTable<4> slots;
+  ant_server::rpc::RpcController first_controller;
+  ant_server::rpc::RpcController second_controller;
+  std::atomic<int> first_ran {0};
+  std::atomic<int> second_ran {0};
+  CountingTask first_task(first_ran);
+  CountingTask second_task(second_ran);
+
+  const uint64_t first = slots.AllocateSlot(&first_task, nullptr, &first_controller, {});
+  const uint64_t second = slots.AllocateSlot(&second_task, nullptr, &second_controller, {});
+  ASSERT_NE(first, 0);
+  ASSERT_NE(second, 0);
+  ASSERT_EQ(slots.PublishSlot(first), ant_server::rpc::PublishOutcome::kInFlight);
+  ASSERT_EQ(slots.PublishSlot(second), ant_server::rpc::PublishOutcome::kInFlight);
+
+  EXPECT_EQ(slots.FailAllActiveSlots(ant_server::rpc::RPC_ECONN_FAILED, "peer closed"), 2U);
+  EXPECT_TRUE(first_controller.Failed());
+  EXPECT_TRUE(second_controller.Failed());
+  EXPECT_EQ(first_controller.ErrorCode(), ant_server::rpc::RPC_ECONN_FAILED);
+  EXPECT_EQ(second_controller.ErrorCode(), ant_server::rpc::RPC_ECONN_FAILED);
+  EXPECT_EQ(first_ran.load(), 1);
+  EXPECT_EQ(second_ran.load(), 1);
+  EXPECT_EQ(slots.active_slot_count(), 0U);
+}
+
+TEST(SlotTableTest, FailAllActiveSlotsDefersArmingCallUntilPublish) {
+  ant_server::rpc::SlotTable<4> slots;
+  ant_server::rpc::RpcController controller;
+  std::atomic<int> ran {0};
+  CountingTask task(ran);
+
+  const uint64_t cid = slots.AllocateSlot(&task, nullptr, &controller, {});
+  ASSERT_NE(cid, 0);
+
+  EXPECT_EQ(slots.FailAllActiveSlots(ant_server::rpc::RPC_ECONN_FAILED, "peer closed"), 0U)
+      << "ARMING calls are not yet in the active published-call set";
+  EXPECT_FALSE(controller.Failed()) << "ARMING must retain caller-owned objects until PublishSlot";
+  EXPECT_EQ(ran.load(), 0);
+  EXPECT_EQ(slots.active_slot_count(), 1U);
+
+  EXPECT_EQ(slots.PublishSlot(cid), ant_server::rpc::PublishOutcome::kFailed);
+  EXPECT_TRUE(controller.Failed());
+  EXPECT_EQ(controller.ErrorCode(), ant_server::rpc::RPC_ECONN_FAILED);
+  EXPECT_EQ(ran.load(), 1);
+  EXPECT_EQ(slots.active_slot_count(), 0U);
+}
+
 }  // namespace

@@ -11,11 +11,11 @@ inline DetachedTask RpcChannelIoDriver::WriteFrame(std::shared_ptr<RpcChannelIoD
       break;
     }
     if (written <= 0) {
-      self->state_->slots.FailSlot(frame.correlation_id, RPC_ECONN_FAILED, "Failed to send RPC request");
       self->state_->running.store(false, std::memory_order_release);
       if (const int current_fd = self->fd(); current_fd >= 0) {
         shutdown(current_fd, SHUT_RDWR);
       }
+      self->state_->slots.FailAllActiveSlots(RPC_ECONN_FAILED, "Connection closed during write");
       self->FailAndClearOutboundOnIoThread(RPC_ECONN_FAILED, "Connection closed during write");
       break;
     }

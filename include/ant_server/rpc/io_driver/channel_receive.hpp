@@ -27,6 +27,7 @@ inline DetachedTask RpcChannelIoDriver::ReceiveLoop(std::shared_ptr<RpcChannelIo
   }
   self->state_->running.store(false, std::memory_order_release);
   self->receiver_exited_ = true;
+  self->state_->slots.FailAllActiveSlots(RPC_ECONN_FAILED, "Connection closed while receiving response");
   self->FailAndClearOutboundOnIoThread(RPC_ECONN_FAILED, "Connection closed");
   self->TryFinishCloseOnIoThread();
 }

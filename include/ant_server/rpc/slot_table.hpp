@@ -8,10 +8,12 @@
 #include <stop_token>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 
 #include <google/protobuf/message.h>
 
+#include "absl/synchronization/mutex.h"
 #include "ant_server/constants.hpp"
 #include "ant_server/rpc/controller.hpp"
 #include "ant_server/rpc/error_code.hpp"
@@ -40,7 +42,7 @@ enum class SlotState : uint32_t {
 
 // Result of handing an ARMING slot to the resolver side. A pending failure is
 // delivered by PublishSlot itself, never by the thread that requested it.
-enum class PublishOutcome : uint8_t { kInFlight, kCanceled, kTimedOut, kInvalid };
+enum class PublishOutcome : uint8_t { kInFlight, kCanceled, kTimedOut, kFailed, kInvalid };
 
 // Where a slot's continuation should run once the slot resolves.
 // A null executor means "run inline on the resolving thread", which is what blocking call paths
@@ -149,24 +151,46 @@ class SlotTable {
       return PublishOutcome::kInvalid;
     }
 
+    int failure_code = RPC_ECONN_FAILED;
+    std::string failure_message;
+    if (!RegisterPublishedSlot(correlation_id, &failure_code, &failure_message)) {
+      uint32_t expected = static_cast<uint32_t>(SlotState::ARMING);
+      if (slot->state.compare_exchange_strong(expected, static_cast<uint32_t>(SlotState::FAILED),
+                                              std::memory_order_acq_rel)) {
+        FinishFailure(*slot, correlation_id, failure_code, failure_message);
+        return PublishOutcome::kFailed;
+      }
+      return PublishOutcome::kInvalid;
+    }
+
     uint32_t expected = static_cast<uint32_t>(SlotState::ARMING);
     if (slot->state.compare_exchange_strong(expected, static_cast<uint32_t>(SlotState::IN_FLIGHT),
                                             std::memory_order_acq_rel)) {
+      if (TakeConnectionFailure(correlation_id, &failure_code, &failure_message)) {
+        expected = static_cast<uint32_t>(SlotState::IN_FLIGHT);
+        if (slot->state.compare_exchange_strong(expected, static_cast<uint32_t>(SlotState::FAILED),
+                                                std::memory_order_acq_rel)) {
+          FinishFailure(*slot, correlation_id, failure_code, failure_message);
+          return PublishOutcome::kFailed;
+        }
+        return PublishOutcome::kInvalid;
+      }
       return PublishOutcome::kInFlight;
     }
 
+    UnregisterPublishedSlot(correlation_id);
     if (expected == static_cast<uint32_t>(SlotState::CANCEL_PENDING)) {
       expected = static_cast<uint32_t>(SlotState::CANCEL_PENDING);
       if (slot->state.compare_exchange_strong(expected, static_cast<uint32_t>(SlotState::CANCELED),
                                               std::memory_order_acq_rel)) {
-        FinishFailure(*slot, GetSlotId(correlation_id), RPC_ECANCELED, "RPC call canceled via stop_token");
+        FinishFailure(*slot, correlation_id, RPC_ECANCELED, "RPC call canceled via stop_token");
         return PublishOutcome::kCanceled;
       }
     } else if (expected == static_cast<uint32_t>(SlotState::TIMEOUT_PENDING)) {
       expected = static_cast<uint32_t>(SlotState::TIMEOUT_PENDING);
       if (slot->state.compare_exchange_strong(expected, static_cast<uint32_t>(SlotState::TIMED_OUT),
                                               std::memory_order_acq_rel)) {
-        FinishFailure(*slot, GetSlotId(correlation_id), RPC_ETIMEOUT, "RPC call timed out");
+        FinishFailure(*slot, correlation_id, RPC_ETIMEOUT, "RPC call timed out");
         return PublishOutcome::kTimedOut;
       }
     }
@@ -239,6 +263,7 @@ class SlotTable {
       *slot.raw_resp_body = body_iobuf;
     }
 
+    UnregisterPublishedSlot(correlation_id);
     ReleaseAndDispatch(slot, GetSlotId(correlation_id));
     return true;
   }
@@ -280,8 +305,33 @@ class SlotTable {
                                             std::memory_order_acq_rel)) {
       return false;
     }
-    FinishFailure(slot, GetSlotId(correlation_id), error_code, err_msg);
+    FinishFailure(slot, correlation_id, error_code, err_msg);
     return true;
+  }
+
+  // Fail every published call after a channel-level terminal event. The active
+  // set is protected by a mutex rather than made lock-free deliberately: this
+  // rare control-plane operation must be O(active calls), and safe concurrent
+  // removal is more valuable here than a lock-free list on the hot path.
+  //
+  // Marking the table failed while taking the set closes the PublishSlot race:
+  // an ARMING call that was not in the snapshot fails itself when it publishes.
+  std::size_t FailAllActiveSlots(int error_code, std::string_view err_msg) {
+    std::unordered_set<uint64_t> active_calls;
+    {
+      absl::MutexLock lock(&active_calls_mu_);
+      if (connection_failed_) {
+        return 0;
+      }
+      connection_failed_ = true;
+      connection_failure_code_ = error_code;
+      connection_failure_message_ = std::string(err_msg);
+      active_calls.swap(active_calls_);
+    }
+    for (uint64_t correlation_id : active_calls) {
+      FailSlot(correlation_id, error_code, std::string(err_msg));
+    }
+    return active_calls.size();
   }
 
   static constexpr uint64_t MakeCorrelationId(uint32_t version, uint32_t slot_id) {
@@ -339,16 +389,44 @@ class SlotTable {
       return false;  // Another resolver won, or this slot has already been recycled.
     }
 
-    FinishFailure(slot, GetSlotId(correlation_id), error_code, err_msg);
+    FinishFailure(slot, correlation_id, error_code, err_msg);
     return true;
   }
 
-  void FinishFailure(CallSlot& slot, uint32_t slot_id, int error_code, std::string_view err_msg) {
+  bool RegisterPublishedSlot(uint64_t correlation_id, int* failure_code, std::string* failure_message) {
+    absl::MutexLock lock(&active_calls_mu_);
+    if (!connection_failed_) {
+      active_calls_.insert(correlation_id);
+      return true;
+    }
+    *failure_code = connection_failure_code_;
+    *failure_message = connection_failure_message_;
+    return false;
+  }
+
+  bool TakeConnectionFailure(uint64_t correlation_id, int* failure_code, std::string* failure_message) {
+    absl::MutexLock lock(&active_calls_mu_);
+    if (!connection_failed_) {
+      return false;
+    }
+    active_calls_.erase(correlation_id);
+    *failure_code = connection_failure_code_;
+    *failure_message = connection_failure_message_;
+    return true;
+  }
+
+  void UnregisterPublishedSlot(uint64_t correlation_id) {
+    absl::MutexLock lock(&active_calls_mu_);
+    active_calls_.erase(correlation_id);
+  }
+
+  void FinishFailure(CallSlot& slot, uint64_t correlation_id, int error_code, std::string_view err_msg) {
     if (slot.controller) {
       slot.controller->SetFailed(error_code, err_msg);
       slot.controller->set_latency_us(slot.controller->CalculateElapsedUs());
     }
-    ReleaseAndDispatch(slot, slot_id);
+    UnregisterPublishedSlot(correlation_id);
+    ReleaseAndDispatch(slot, GetSlotId(correlation_id));
   }
 
   // Recycle the slot, then hand the continuation to its origin executor.
@@ -430,6 +508,11 @@ class SlotTable {
   std::unique_ptr<CallSlot[]> slots_;
   std::atomic<uint64_t> free_head_ {0};
   std::atomic<std::size_t> active_slots_ {0};
+  absl::Mutex active_calls_mu_;
+  std::unordered_set<uint64_t> active_calls_;
+  bool connection_failed_ {false};
+  int connection_failure_code_ {RPC_ECONN_FAILED};
+  std::string connection_failure_message_;
 };
 
 }  // namespace ant_server::rpc

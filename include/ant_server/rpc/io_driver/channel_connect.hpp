@@ -48,6 +48,7 @@ inline DetachedTask RpcChannelIoDriver::ConnectOnIoThread(std::shared_ptr<RpcCha
     if (const int current_fd = self->fd(); current_fd >= 0) {
       shutdown(current_fd, SHUT_RDWR);
     }
+    self->state_->slots.FailAllActiveSlots(RPC_ECONN_FAILED, "Failed to connect RPC channel");
     self->FinishConnectOnIoThread(connect_result == 0 ? -ECANCELED : connect_result);
     self->receiver_exited_ = true;
     self->TryFinishCloseOnIoThread();
