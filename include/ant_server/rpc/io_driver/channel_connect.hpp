@@ -43,12 +43,7 @@ inline Task<int> RpcChannelIoDriver::AsyncConnect(std::shared_ptr<RpcChannelIoDr
 inline DetachedTask RpcChannelIoDriver::ConnectOnIoThread(std::shared_ptr<RpcChannelIoDriver> self) {
   const int connect_result = co_await self->AsyncConnect(self);
   if (connect_result != 0 || !self->state_->running.load(std::memory_order_acquire)) {
-    self->state_->running.store(false, std::memory_order_release);
-    self->CancelPendingConnectOnIoThread();
-    if (const int current_fd = self->fd(); current_fd >= 0) {
-      shutdown(current_fd, SHUT_RDWR);
-    }
-    self->state_->slots.FailAllActiveSlots(RPC_ECONN_FAILED, "Failed to connect RPC channel");
+    self->HandleTerminalFailureOnIoThread(RPC_ECONN_FAILED, "Failed to connect RPC channel");
     self->FinishConnectOnIoThread(connect_result == 0 ? -ECANCELED : connect_result);
     self->receiver_exited_ = true;
     self->TryFinishCloseOnIoThread();

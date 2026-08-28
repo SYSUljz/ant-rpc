@@ -9,7 +9,10 @@ inline DetachedTask RpcChannelIoDriver::ReceiveLoop(std::shared_ptr<RpcChannelIo
   while (self->state_->running.load(std::memory_order_acquire)) {
     const int bytes_read = co_await ReadAwaiter(self->context_, self->fd(), recv_buffer, false);
     if (bytes_read <= 0) {
-      break;
+      self->receiver_exited_ = true;
+      self->HandleTerminalFailureOnIoThread(
+          RPC_ECONN_FAILED, bytes_read == 0 ? "RPC peer closed connection" : "Failed to read RPC response");
+      co_return;
     }
     while (true) {
       FrameParseResult result = TryParseRpcFrame(recv_buffer, self->max_frame_bytes_);
@@ -17,19 +20,17 @@ inline DetachedTask RpcChannelIoDriver::ReceiveLoop(std::shared_ptr<RpcChannelIo
         break;
       }
       if (result.status != FrameParseStatus::SUCCESS) {
-        recv_buffer.clear();
-        break;
+        self->receiver_exited_ = true;
+        self->HandleTerminalFailureOnIoThread(RPC_ECONN_FAILED, "Invalid RPC response frame");
+        co_return;
       }
       recv_buffer.pop_front(result.total_frame_bytes);
       self->state_->slots.CompleteSlot(result.meta.correlation_id(), result.body_iobuf, std::move(result.meta),
                                        result.attachment_iobuf);
     }
   }
-  self->state_->running.store(false, std::memory_order_release);
   self->receiver_exited_ = true;
-  self->state_->slots.FailAllActiveSlots(RPC_ECONN_FAILED, "Connection closed while receiving response");
-  self->FailAndClearOutboundOnIoThread(RPC_ECONN_FAILED, "Connection closed");
-  self->TryFinishCloseOnIoThread();
+  self->HandleTerminalFailureOnIoThread(RPC_ECONN_FAILED, "Connection closed while receiving response");
 }
 
 }  // namespace ant_server::rpc::detail

@@ -90,6 +90,10 @@ class RpcChannelIoDriver : public IoCommandMailbox, public std::enable_shared_fr
   void StartOnIoThread();
   void BeginCloseOnIoThread();
   void StartNextWriteOnIoThread();
+  // IO-thread-only terminal transition shared by connect, read, write and
+  // protocol failures. It is idempotent because multiple CQEs may report the
+  // same broken socket while close is already in progress.
+  void HandleTerminalFailureOnIoThread(int error_code, const char* error_message);
   void FailAndClearOutboundOnIoThread(int error_code, const char* error_message);
   void TryFinishCloseOnIoThread();
   void FinishConnectOnIoThread(int result);
@@ -166,6 +170,11 @@ inline void RpcChannelIoDriver::DrainCommandsOnIoThread() {
 }
 
 inline void RpcChannelIoDriver::BeginCloseOnIoThread() {
+  HandleTerminalFailureOnIoThread(RPC_ECONN_FAILED, "Connection closed");
+}
+
+inline void RpcChannelIoDriver::HandleTerminalFailureOnIoThread(int error_code, const char* error_message) {
+  state_->running.store(false, std::memory_order_release);
   CancelPendingConnectOnIoThread();
   if (const int current_fd = fd(); current_fd >= 0) {
     shutdown(current_fd, SHUT_RDWR);
@@ -173,8 +182,8 @@ inline void RpcChannelIoDriver::BeginCloseOnIoThread() {
   if (!receiver_started_) {
     receiver_exited_ = true;
   }
-  state_->slots.FailAllActiveSlots(RPC_ECONN_FAILED, "Connection closed");
-  FailAndClearOutboundOnIoThread(RPC_ECONN_FAILED, "Connection closed");
+  state_->slots.FailAllActiveSlots(error_code, error_message);
+  FailAndClearOutboundOnIoThread(error_code, error_message);
   TryFinishCloseOnIoThread();
 }
 
