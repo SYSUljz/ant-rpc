@@ -125,6 +125,26 @@ TEST_F(RpcChannelTest, ProtobufStubSyncCall) {
   channel.Close();
 }
 
+TEST_F(RpcChannelTest, DefaultChannelUsesProcessRuntime) {
+  ASSERT_TRUE(ant_rpc::InitRuntime({.worker_threads = 1, .io_threads = 1}));
+
+  ant_rpc::RpcChannel channel;
+  ASSERT_EQ(channel.Init("127.0.0.1:" + std::to_string(port_)), 0);
+
+  ant_rpc::EchoService_Stub stub(&channel);
+  ant_rpc::EchoRequest req;
+  req.set_message("global-runtime");
+  ant_rpc::EchoResponse resp;
+  ant_rpc::RpcController cntl;
+  stub.Echo(&cntl, &req, &resp, nullptr);
+
+  EXPECT_FALSE(cntl.Failed()) << cntl.ErrorText();
+  EXPECT_EQ(resp.message(), "Echo: global-runtime");
+
+  channel.Close();
+  EXPECT_TRUE(ant_rpc::ShutdownRuntime());
+}
+
 TEST_F(RpcChannelTest, AsyncCallbackCall) {
   ant_rpc::RpcChannel channel(client_ctx_);
   ASSERT_EQ(channel.Init("127.0.0.1", port_), 0);

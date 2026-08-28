@@ -28,6 +28,7 @@
 #include "ant_server/rpc/error_code.hpp"
 #include "ant_server/rpc/io_driver/channel_io_driver.hpp"
 #include "ant_server/rpc/protocol.hpp"
+#include "ant_server/rpc/runtime.hpp"
 #include "ant_server/scheduler/scheduler.hpp"
 #include "ant_server/scheduler/timer_keeper.hpp"
 #include "butil/endpoint.h"
@@ -99,13 +100,27 @@ struct StartResult {
 // in io_driver/channel_io_driver.hpp.
 class RpcChannel : public google::protobuf::RpcChannel {
  public:
-  RpcChannel() = delete;
+  // The normal application-facing API. Init() binds this channel to one IO
+  // Context selected by the process Runtime; Context is never exposed to the
+  // caller.
+  RpcChannel() : state_(std::make_shared<detail::ChannelState>()) {}
+
+  // Advanced/testing API. The caller owns the Context and must keep its
+  // Scheduler alive until this channel has been closed or destroyed.
   explicit RpcChannel(Context& context)
       : ctx_(&context), timer_keeper_(&context.GetTimerKeeper()), state_(std::make_shared<detail::ChannelState>()) {}
   ~RpcChannel() override { Close(); }
   RpcChannel(const RpcChannel&) = delete;
   RpcChannel& operator=(const RpcChannel&) = delete;
 
+  // bRPC-style endpoint API for normal application code.
+  int Init(const std::string& server_addr_and_port, const RpcChannelOptions* options = nullptr) {
+    butil::EndPoint endpoint;
+    return butil::str2endpoint(server_addr_and_port.c_str(), &endpoint) == 0 ? Init(endpoint, options) : -1;
+  }
+  int Init(const char* server_addr_and_port, const RpcChannelOptions* options = nullptr) {
+    return server_addr_and_port ? Init(std::string(server_addr_and_port), options) : -1;
+  }
   int Init(const std::string& server_ip, int port, const RpcChannelOptions* options = nullptr) {
     butil::ip_t ip_value;
     return butil::str2ip(server_ip.c_str(), &ip_value) == 0 ? Init(butil::EndPoint(ip_value, port), options) : -1;
@@ -119,13 +134,18 @@ class RpcChannel : public google::protobuf::RpcChannel {
       return -1;
     }
     Close();
+    if (!BindDefaultRuntime()) {
+      return -1;
+    }
     if (!ctx_->GetScheduler().IsRunning()) {
+      ReleaseDefaultRuntimeBinding();
       return -1;
     }
     options_ = requested_options;
     endpoint_ = endpoint;
     const int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
+      ReleaseDefaultRuntimeBinding();
       return -1;
     }
     if (options_.tcp_no_delay) {
@@ -177,6 +197,7 @@ class RpcChannel : public google::protobuf::RpcChannel {
         driver_.reset();
       }
     }
+    ReleaseDefaultRuntimeBinding();
   }
 
   int fd() const noexcept {
@@ -372,6 +393,28 @@ class RpcChannel : public google::protobuf::RpcChannel {
     }
   }
 
+  bool BindDefaultRuntime() {
+    if (ctx_ != nullptr) {
+      return true;
+    }
+    runtime_ = detail::AcquireDefaultRuntime();
+    if (!runtime_ || !runtime_->IsRunning()) {
+      runtime_.reset();
+      return false;
+    }
+    ctx_ = &runtime_->AcquireChannelContext();
+    timer_keeper_ = &ctx_->GetTimerKeeper();
+    return true;
+  }
+
+  void ReleaseDefaultRuntimeBinding() {
+    if (runtime_) {
+      runtime_.reset();
+      ctx_ = nullptr;
+      timer_keeper_ = nullptr;
+    }
+  }
+
   Context* ctx_ {nullptr};
   butil::EndPoint endpoint_;
   RpcChannelOptions options_;
@@ -379,6 +422,7 @@ class RpcChannel : public google::protobuf::RpcChannel {
   std::shared_ptr<detail::ChannelState> state_;
   std::shared_ptr<detail::RpcChannelIoDriver> driver_;
   TimerKeeper* timer_keeper_ {nullptr};
+  std::shared_ptr<Runtime> runtime_;
 };
 
 }  // namespace ant_server::rpc

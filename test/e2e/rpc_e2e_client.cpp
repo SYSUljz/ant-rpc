@@ -4,7 +4,6 @@
 
 #include "ant_server/rpc/channel.hpp"
 #include "ant_server/rpc/controller.hpp"
-#include "ant_server/scheduler/scheduler.hpp"
 #include "echo.pb.h"
 
 namespace {
@@ -28,13 +27,15 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  Scheduler scheduler(1, 1);
-  scheduler.Start();
-  ant_rpc::RpcChannel channel(scheduler.GetIOContext(0));
-  const int init_result = channel.Init(argv[1], port);
+  if (!ant_rpc::InitRuntime({.worker_threads = 1, .io_threads = 1})) {
+    std::cerr << "runtime init failed\n";
+    return 1;
+  }
+  ant_rpc::RpcChannel channel;
+  const int init_result = channel.Init(std::string(argv[1]) + ":" + std::to_string(port));
   if (init_result != 0) {
     std::cerr << "channel init failed: " << init_result << '\n';
-    scheduler.Stop();
+    ant_rpc::ShutdownRuntime();
     return 1;
   }
 
@@ -51,7 +52,10 @@ int main(int argc, char** argv) {
               << response.message() << "'\n";
   }
   channel.Close();
-  scheduler.Stop();
+  if (!ant_rpc::ShutdownRuntime()) {
+    std::cerr << "runtime shutdown failed\n";
+    return 1;
+  }
   if (!passed) {
     return 1;
   }
