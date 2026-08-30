@@ -108,7 +108,9 @@ class RpcChannel : public google::protobuf::RpcChannel {
   // Advanced/testing API. The caller owns the Context and must keep its
   // Scheduler alive until this channel has been closed or destroyed.
   explicit RpcChannel(Context& context)
-      : ctx_(&context), timer_keeper_(&context.GetTimerKeeper()), state_(std::make_shared<detail::ChannelState>()) {}
+      : ctx_(&context), timer_keeper_(&context.GetTimerKeeper()), state_(std::make_shared<detail::ChannelState>()) {
+    state_->slots.SetDeadlineTimerKeeper(*timer_keeper_);
+  }
   ~RpcChannel() override { Close(); }
   RpcChannel(const RpcChannel&) = delete;
   RpcChannel& operator=(const RpcChannel&) = delete;
@@ -157,6 +159,7 @@ class RpcChannel : public google::protobuf::RpcChannel {
     address.sin_port = htons(endpoint_.port);
     address.sin_addr = endpoint_.ip;
     auto state = std::make_shared<detail::ChannelState>();
+    state->slots.SetDeadlineTimerKeeper(*timer_keeper_);
     {
       std::lock_guard<std::mutex> lock(state->close_mu);
       state->closed = false;
@@ -240,9 +243,7 @@ class RpcChannel : public google::protobuf::RpcChannel {
       task.run();
       return;
     }
-    const int64_t timeout = rpc_controller && rpc_controller->TimeoutMs() > 0 ? rpc_controller->TimeoutMs()
-                                                                              : options_.default_rpc_timeout.count();
-    AwaitBlockingCall(state_, result.correlation_id, notification, timeout);
+    AwaitBlockingCall(notification);
   }
 
   void CallMethod(std::string_view service_name, std::string_view method_name, RpcController& controller,
@@ -262,8 +263,7 @@ class RpcChannel : public google::protobuf::RpcChannel {
       task.run();
       return;
     }
-    const int64_t timeout = controller.TimeoutMs() > 0 ? controller.TimeoutMs() : options_.default_rpc_timeout.count();
-    AwaitBlockingCall(state_, result.correlation_id, notification, timeout);
+    AwaitBlockingCall(notification);
   }
 
   RpcCallAwaiter CallAsync(const google::protobuf::MethodDescriptor* method, RpcController* controller,
@@ -329,14 +329,30 @@ class RpcChannel : public google::protobuf::RpcChannel {
       // CANCEL_PENDING while ARMING; PublishSlot() performs the completion.
       stop_callback->emplace(stop_token, state->slots.MakeCancelFn(correlation_id));
     }
+    const int64_t timeout_ms =
+        controller && controller->TimeoutMs() > 0 ? controller->TimeoutMs() : options_.default_rpc_timeout.count();
+    if (timer_keeper_ == nullptr) {
+      return ResolveArmingFailure(state, correlation_id, RPC_EINTERNAL, "RPC deadline timer is unavailable");
+    }
+    std::weak_ptr<detail::ChannelState> weak_state = state;
+    const uint64_t deadline_timer_id =
+        timer_keeper_->AddTimer(std::chrono::milliseconds(timeout_ms), [weak_state, correlation_id] {
+          if (auto locked_state = weak_state.lock()) {
+            locked_state->slots.TimeoutSlot(correlation_id);
+          }
+        });
+    if (!state->slots.AttachDeadlineTimer(correlation_id, deadline_timer_id)) {
+      timer_keeper_->CancelTimer(deadline_timer_id);
+      return ResolveArmingFailure(state, correlation_id, RPC_EINTERNAL, "Failed to install RPC deadline timer");
+    }
     RpcMeta meta;
     meta.set_msg_type(RPC_REQUEST);
     meta.set_correlation_id(correlation_id);
     meta.set_service_name(std::string(service_name));
     meta.set_method_name(std::string(method_name));
+    meta.set_timeout_ms(timeout_ms);
     if (controller) {
       meta.set_log_id(controller->LogId());
-      meta.set_timeout_ms(controller->TimeoutMs() > 0 ? controller->TimeoutMs() : options_.default_rpc_timeout.count());
       if (!controller->Headers().empty()) {
         *meta.mutable_headers() = controller->Headers();
       }
@@ -396,17 +412,11 @@ class RpcChannel : public google::protobuf::RpcChannel {
     }
   }
 
-  static void AwaitBlockingCall(const std::shared_ptr<detail::ChannelState>& state, uint64_t correlation_id,
-                                absl::Notification& notification, int64_t timeout_ms) {
-    if (notification.WaitForNotificationWithTimeout(absl::Milliseconds(timeout_ms))) {
-      return;
-    }
-    // If timeout loses to response/cancellation, wait until that winner has
-    // dispatched the stack-owned notification task before returning.
-    if (!state->slots.TimeoutSlot(correlation_id)) {
-      notification.WaitForNotification();
-    }
-  }
+  // Every unary call, including a blocking protobuf call, now owns the same
+  // asynchronous SlotTable deadline. Waiting here is therefore only waiting
+  // for its already-scheduled completion task; it never implements a second
+  // timeout path against a stack-owned ClosureTask.
+  static void AwaitBlockingCall(absl::Notification& notification) { notification.WaitForNotification(); }
 
   bool BindDefaultRuntime() {
     if (ctx_ != nullptr) {

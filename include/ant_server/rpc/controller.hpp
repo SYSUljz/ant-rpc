@@ -44,6 +44,9 @@ class RpcCallCancellationTarget {
 // ============================================================================
 class RpcController : public google::protobuf::RpcController {
  public:
+  // Thread-safety: while a call is active, StartCancel() may be invoked from
+  // any thread. All other mutation, Reset(), and destruction are owner-side
+  // operations and must not race with an active call or its completion.
   RpcController() = default;
   ~RpcController() override = default;
 

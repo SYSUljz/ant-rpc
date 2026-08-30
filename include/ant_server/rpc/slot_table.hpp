@@ -18,6 +18,7 @@
 #include "ant_server/rpc/controller.hpp"
 #include "ant_server/rpc/error_code.hpp"
 #include "ant_server/rpc/protocol.hpp"
+#include "ant_server/scheduler/timer_keeper.hpp"
 #include "ant_server/type.hpp"
 #include "butil/iobuf.h"
 
@@ -95,6 +96,7 @@ struct alignas(ant_server::constants::kCacheLineSize) CallSlot {
   butil::IOBuf* raw_resp_body {nullptr};
   Executor* executor {nullptr};
   uint32_t next_free {0};
+  std::atomic<uint64_t> deadline_timer_id {0};
 };
 
 static_assert(sizeof(CallSlot) == 64, "CallSlot must stay within a single cache line");
@@ -118,6 +120,11 @@ class SlotTable {
 
   SlotTable(const SlotTable&) = delete;
   SlotTable& operator=(const SlotTable&) = delete;
+
+  // Must be configured before this table accepts calls with deadlines. The
+  // keeper itself is thread-safe; terminal resolution may cancel a timer from
+  // an IO, worker, or timer thread.
+  void SetDeadlineTimerKeeper(TimerKeeper& timer_keeper) noexcept { deadline_timer_keeper_ = &timer_keeper; }
 
   // Allocate a slot in ARMING state and generate a 64-bit correlation_id.
   // The slot is not resolvable until PublishSlot() moves it to IN_FLIGHT.
@@ -143,6 +150,7 @@ class SlotTable {
     slot.controller = controller;
     slot.raw_resp_body = raw_resp_body;
     slot.executor = target.executor;
+    slot.deadline_timer_id.store(0, std::memory_order_relaxed);
     slot.state.store(static_cast<uint32_t>(SlotState::ARMING), std::memory_order_release);
 
     return MakeCorrelationId(version, slot_id);
@@ -216,6 +224,7 @@ class SlotTable {
                                              std::memory_order_acq_rel)) {
       return false;
     }
+    CancelDeadlineTimer(*slot);
     if (slot->controller) {
       slot->controller->ClearActiveSlot(correlation_id);
     }
@@ -227,6 +236,25 @@ class SlotTable {
   SlotCancelFn MakeCancelFn(uint64_t correlation_id) noexcept {
     return SlotCancelFn {[](void* table, uint64_t cid) noexcept { static_cast<SlotTable*>(table)->CancelSlot(cid); },
                          this, correlation_id};
+  }
+
+  // A deadline is installed while the slot is ARMING. A timer that fires
+  // before PublishSlot() can only move the slot to TIMEOUT_PENDING; the
+  // sender remains the sole owner of caller data until PublishSlot().
+  bool AttachDeadlineTimer(uint64_t correlation_id, uint64_t timer_id) {
+    if (timer_id == 0) {
+      return false;
+    }
+    CallSlot* slot = LookupSlot(correlation_id);
+    if (slot == nullptr) {
+      return false;
+    }
+    const SlotState state = static_cast<SlotState>(slot->state.load(std::memory_order_acquire));
+    if (state != SlotState::ARMING && state != SlotState::CANCEL_PENDING && state != SlotState::TIMEOUT_PENDING) {
+      return false;
+    }
+    slot->deadline_timer_id.store(timer_id, std::memory_order_release);
+    return true;
   }
 
   // Complete a slot on receiving a network response (Zero-Copy protobuf parse
@@ -466,6 +494,8 @@ class SlotTable {
     TaskNode* task = slot.task;
     Executor* executor = slot.executor;
 
+    CancelDeadlineTimer(slot);
+
     PushFreeSlot(slot_id);
 
     if (task == nullptr) {
@@ -516,6 +546,7 @@ class SlotTable {
     slots_[slot_id].controller = nullptr;
     slots_[slot_id].raw_resp_body = nullptr;
     slots_[slot_id].executor = nullptr;
+    slots_[slot_id].deadline_timer_id.store(0, std::memory_order_relaxed);
     slots_[slot_id].state.store(static_cast<uint32_t>(SlotState::FREE), std::memory_order_release);
     ReleaseLiveSlot();
 
@@ -531,9 +562,17 @@ class SlotTable {
     }
   }
 
+  void CancelDeadlineTimer(CallSlot& slot) {
+    const uint64_t timer_id = slot.deadline_timer_id.exchange(0, std::memory_order_acq_rel);
+    if (timer_id != 0 && deadline_timer_keeper_ != nullptr) {
+      deadline_timer_keeper_->CancelTimer(timer_id);
+    }
+  }
+
   std::unique_ptr<CallSlot[]> slots_;
   std::atomic<uint64_t> free_head_ {0};
   std::atomic<std::size_t> active_slots_ {0};
+  TimerKeeper* deadline_timer_keeper_ {nullptr};
   std::atomic<uint64_t> completed_responses_ {0};
   std::atomic<uint64_t> unknown_correlation_id_ {0};
   std::atomic<uint64_t> late_response_ {0};

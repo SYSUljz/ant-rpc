@@ -56,7 +56,7 @@ class ForeignRpcController final : public google::protobuf::RpcController {
 
 class RawTerminalPeer {
  public:
-  enum class Action { kReset, kMalformedResponse };
+  enum class Action { kReset, kMalformedResponse, kHoldOpen };
 
   explicit RawTerminalPeer(Action action) : action_(action) {
     listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
@@ -97,9 +97,11 @@ class RawTerminalPeer {
     if (action_ == Action::kMalformedResponse) {
       const std::array<char, 16> invalid_header {'N', 'O', 'P', 'E'};
       (void)send(peer, invalid_header.data(), invalid_header.size(), MSG_NOSIGNAL);
-    } else {
+    } else if (action_ == Action::kReset) {
       linger reset {1, 0};
       (void)setsockopt(peer, SOL_SOCKET, SO_LINGER, &reset, sizeof(reset));
+    } else {
+      std::this_thread::sleep_for(std::chrono::milliseconds(300));
     }
     close(peer);
   }
@@ -189,6 +191,66 @@ TEST(RpcChannelCancellationTest, StartCancelResolvesAnActiveSlot) {
   EXPECT_TRUE(controller.Failed());
   EXPECT_EQ(controller.ErrorCode(), ant_rpc::RPC_ECANCELED);
   EXPECT_EQ(remaining.load(), 0);
+
+  channel.Close();
+  scheduler.Stop();
+}
+
+TEST(RpcChannelDeadlineTest, CallbackCallTimesOutWithoutPeerResponse) {
+  RawTerminalPeer peer(RawTerminalPeer::Action::kHoldOpen);
+  Scheduler scheduler {1, 1};
+  Context& context = scheduler.GetIOContext(0);
+  scheduler.Start();
+
+  ant_rpc::RpcChannel channel(context);
+  ant_rpc::RpcChannelOptions options;
+  options.default_rpc_timeout = std::chrono::milliseconds(30);
+  ASSERT_EQ(channel.Init("127.0.0.1", peer.port(), &options), 0);
+  ant_rpc::EchoService_Stub stub(&channel);
+  ant_rpc::EchoRequest request;
+  request.set_message("deadline-callback");
+  ant_rpc::EchoResponse response;
+  ant_rpc::RpcController controller;
+  std::atomic<int> remaining {1};
+  absl::Notification done;
+  CountdownClosure closure(remaining, done);
+
+  stub.Echo(&controller, &request, &response, &closure);
+
+  ASSERT_TRUE(done.WaitForNotificationWithTimeout(absl::Seconds(2)));
+  EXPECT_TRUE(controller.Failed());
+  EXPECT_EQ(controller.ErrorCode(), ant_rpc::RPC_ETIMEOUT);
+  EXPECT_EQ(remaining.load(), 0);
+
+  channel.Close();
+  scheduler.Stop();
+}
+
+TEST(RpcChannelDeadlineTest, CoroutineCallTimesOutWithoutPeerResponse) {
+  RawTerminalPeer peer(RawTerminalPeer::Action::kHoldOpen);
+  Scheduler scheduler {1, 1};
+  Context& context = scheduler.GetIOContext(0);
+  scheduler.Start();
+
+  ant_rpc::RpcChannel channel(context);
+  ant_rpc::RpcChannelOptions options;
+  options.default_rpc_timeout = std::chrono::milliseconds(30);
+  ASSERT_EQ(channel.Init("127.0.0.1", peer.port(), &options), 0);
+  absl::Notification done;
+  std::atomic<int> observed_error {ant_rpc::RPC_SUCCESS};
+
+  [](ant_rpc::RpcChannel& channel, std::atomic<int>& observed_error, absl::Notification& done) -> DetachedTask {
+    ant_rpc::EchoRequest request;
+    request.set_message("deadline-coroutine");
+    ant_rpc::EchoResponse response;
+    ant_rpc::RpcController controller;
+    co_await channel.CallAsync("ant_rpc.EchoService", "Echo", &controller, &request, &response);
+    observed_error.store(controller.ErrorCode(), std::memory_order_release);
+    done.Notify();
+  }(channel, observed_error, done);
+
+  ASSERT_TRUE(done.WaitForNotificationWithTimeout(absl::Seconds(2)));
+  EXPECT_EQ(observed_error.load(std::memory_order_acquire), ant_rpc::RPC_ETIMEOUT);
 
   channel.Close();
   scheduler.Stop();

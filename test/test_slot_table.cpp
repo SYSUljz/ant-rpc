@@ -146,6 +146,33 @@ TEST(SlotTableTest, LateResponseAfterCancellationIsIgnored) {
   EXPECT_EQ(stats.unknown_correlation_id, 0U);
 }
 
+TEST(SlotTableTest, LateTimeoutAfterSlotReuseCannotResolveNewCall) {
+  ant_server::rpc::SlotTable<1> slots;
+  ant_server::rpc::RpcController first_controller;
+  ant_server::rpc::RpcController second_controller;
+  std::atomic<int> first_ran {0};
+  std::atomic<int> second_ran {0};
+  CountingTask first_task(first_ran);
+  CountingTask second_task(second_ran);
+  butil::IOBuf body;
+
+  const uint64_t first_cid = slots.AllocateSlot(&first_task, nullptr, &first_controller, TestContinuationTarget());
+  ASSERT_NE(first_cid, 0);
+  ASSERT_EQ(slots.PublishSlot(first_cid), ant_server::rpc::PublishOutcome::kInFlight);
+  ASSERT_TRUE(slots.TimeoutSlot(first_cid));
+
+  const uint64_t second_cid = slots.AllocateSlot(&second_task, nullptr, &second_controller, TestContinuationTarget());
+  ASSERT_NE(second_cid, 0);
+  ASSERT_NE(first_cid, second_cid);
+  ASSERT_EQ(slots.PublishSlot(second_cid), ant_server::rpc::PublishOutcome::kInFlight);
+
+  EXPECT_FALSE(slots.TimeoutSlot(first_cid));
+  EXPECT_TRUE(slots.CompleteSlot(second_cid, body));
+  EXPECT_FALSE(second_controller.Failed());
+  EXPECT_EQ(first_ran.load(), 1);
+  EXPECT_EQ(second_ran.load(), 1);
+}
+
 TEST(SlotTableTest, UnknownCorrelationIdIsCountedAndIgnored) {
   ant_server::rpc::SlotTable<4> slots;
   butil::IOBuf body;
