@@ -1,7 +1,10 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <stop_token>
 #include <string>
@@ -17,6 +20,23 @@
 
 namespace ant_server::rpc {
 
+template <size_t Capacity>
+class SlotTable;
+
+namespace detail {
+
+// The channel-side endpoint of a controller's active RPC registration.  It
+// deliberately exposes only cancellation: RpcController must not know about
+// a channel's IO driver, slot storage, or connection lifecycle.
+class RpcCallCancellationTarget {
+ public:
+  virtual ~RpcCallCancellationTarget() = default;
+
+  virtual bool CancelRpcSlot(uint64_t correlation_id) = 0;
+};
+
+}  // namespace detail
+
 // ============================================================================
 // RpcController: The central invocation context for RPC requests & responses.
 // Production-ready implementation of google::protobuf::RpcController.
@@ -29,15 +49,15 @@ class RpcController : public google::protobuf::RpcController {
 
   RpcController(const RpcController&) = delete;
   RpcController& operator=(const RpcController&) = delete;
-  RpcController(RpcController&&) noexcept = default;
-  RpcController& operator=(RpcController&&) noexcept = default;
+  RpcController(RpcController&&) = delete;
+  RpcController& operator=(RpcController&&) = delete;
 
   // --------------------------------------------------------------------------
   // 1. Standard google::protobuf::RpcController Interface
   // --------------------------------------------------------------------------
   void Reset() override {
     failed_ = false;
-    canceled_ = false;
+    cancel_requested_.store(false, std::memory_order_release);
     error_code_ = RPC_SUCCESS;
     error_text_.clear();
     correlation_id_ = 0;
@@ -58,15 +78,24 @@ class RpcController : public google::protobuf::RpcController {
 
   [[nodiscard]] std::string ErrorText() const override { return error_text_; }
 
+  // Thread-safe cancellation request. For an active client call this enters
+  // SlotTable::CancelSlot(correlation_id); SlotTable, rather than this method,
+  // decides whether cancellation wins against response, timeout, or close.
   void StartCancel() override {
-    canceled_ = true;
-    SetFailed(RPC_ECANCELED, "RPC call was canceled");
+    cancel_requested_.store(true, std::memory_order_release);
+    std::optional<ActiveSlot> active_slot;
+    {
+      std::lock_guard<std::mutex> lock(active_slot_mu_);
+      active_slot = active_slot_;
+    }
+    RequestCancel(active_slot);
   }
 
   void SetFailed(const std::string& reason) override { SetFailed(RPC_EINTERNAL, reason); }
 
   [[nodiscard]] bool IsCanceled() const override {
-    return canceled_ || stop_token_.stop_requested() || (failed_ && error_code_ == RPC_ECANCELED);
+    return cancel_requested_.load(std::memory_order_acquire) || stop_token_.stop_requested() ||
+           (failed_ && error_code_ == RPC_ECANCELED);
   }
 
   void NotifyOnCancel(google::protobuf::Closure* callback) override { (void)callback; }
@@ -198,8 +227,59 @@ class RpcController : public google::protobuf::RpcController {
   }
 
  private:
+  template <size_t Capacity>
+  friend class SlotTable;
+  friend class RpcChannel;
+
+  // A controller has at most one active RPC. correlation_id is versioned by
+  // SlotTable, so a stale cancellation snapshot cannot affect a recycled
+  // slot. The weak target avoids keeping an already-closed channel alive.
+  struct ActiveSlot {
+    std::weak_ptr<detail::RpcCallCancellationTarget> target;
+    uint64_t correlation_id {0};
+  };
+
+  static void RequestCancel(const std::optional<ActiveSlot>& active_slot) {
+    if (!active_slot.has_value()) {
+      return;
+    }
+    if (auto target = active_slot->target.lock()) {
+      (void)target->CancelRpcSlot(active_slot->correlation_id);
+    }
+  }
+
+  // Core-only: the channel binds the one slot currently owned by this
+  // controller. A cancellation that arrived before the bind is delivered
+  // immediately after it, while the slot is still in ARMING.
+  bool BindActiveSlot(const std::shared_ptr<detail::RpcCallCancellationTarget>& target, uint64_t correlation_id) {
+    std::optional<ActiveSlot> active_slot;
+    bool cancel_requested = false;
+    {
+      std::lock_guard<std::mutex> lock(active_slot_mu_);
+      if (active_slot_.has_value()) {
+        return false;
+      }
+      active_slot_ = ActiveSlot {target, correlation_id};
+      active_slot = active_slot_;
+      cancel_requested = cancel_requested_.load(std::memory_order_acquire);
+    }
+    if (cancel_requested) {
+      RequestCancel(active_slot);
+    }
+    return true;
+  }
+
+  // Core-only: only the slot with this exact versioned correlation id may
+  // detach the active slot. This prevents completion of an old call from unbinding
+  // a controller that has subsequently been reused.
+  void ClearActiveSlot(uint64_t correlation_id) {
+    std::lock_guard<std::mutex> lock(active_slot_mu_);
+    if (active_slot_.has_value() && active_slot_->correlation_id == correlation_id) {
+      active_slot_.reset();
+    }
+  }
+
   bool failed_ {false};
-  bool canceled_ {false};
   int error_code_ {RPC_SUCCESS};
   std::string error_text_;
 
@@ -217,6 +297,10 @@ class RpcController : public google::protobuf::RpcController {
 
   int64_t timeout_ms_ {-1};
   std::stop_token stop_token_;
+
+  std::atomic<bool> cancel_requested_ {false};
+  std::mutex active_slot_mu_;
+  std::optional<ActiveSlot> active_slot_;
 
   int64_t latency_us_ {0};
   std::chrono::steady_clock::time_point start_time_ {std::chrono::steady_clock::now()};

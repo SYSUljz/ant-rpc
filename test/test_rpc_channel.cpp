@@ -1,5 +1,6 @@
 #include <unistd.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <memory>
@@ -7,6 +8,7 @@
 #include <thread>
 #include <vector>
 
+#include <absl/synchronization/notification.h>
 #include <arpa/inet.h>
 #include <gtest/gtest.h>
 #include <netinet/in.h>
@@ -51,6 +53,146 @@ class ForeignRpcController final : public google::protobuf::RpcController {
  private:
   std::string error_;
 };
+
+class RawTerminalPeer {
+ public:
+  enum class Action { kReset, kMalformedResponse };
+
+  explicit RawTerminalPeer(Action action) : action_(action) {
+    listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+    EXPECT_GE(listen_fd_, 0);
+    int enabled = 1;
+    EXPECT_EQ(setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled)), 0);
+    sockaddr_in address {};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    EXPECT_EQ(bind(listen_fd_, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
+    EXPECT_EQ(listen(listen_fd_, 1), 0);
+    socklen_t length = sizeof(address);
+    EXPECT_EQ(getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&address), &length), 0);
+    port_ = ntohs(address.sin_port);
+    thread_ = std::thread([this] { ServeOnce(); });
+  }
+
+  ~RawTerminalPeer() {
+    if (thread_.joinable()) {
+      thread_.join();
+    }
+    if (listen_fd_ >= 0) {
+      close(listen_fd_);
+    }
+  }
+
+  int port() const noexcept { return port_; }
+
+ private:
+  void ServeOnce() {
+    const int peer = accept(listen_fd_, nullptr, nullptr);
+    if (peer < 0) {
+      return;
+    }
+    char byte = 0;
+    (void)recv(peer, &byte, sizeof(byte), 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    if (action_ == Action::kMalformedResponse) {
+      const std::array<char, 16> invalid_header {'N', 'O', 'P', 'E'};
+      (void)send(peer, invalid_header.data(), invalid_header.size(), MSG_NOSIGNAL);
+    } else {
+      linger reset {1, 0};
+      (void)setsockopt(peer, SOL_SOCKET, SO_LINGER, &reset, sizeof(reset));
+    }
+    close(peer);
+  }
+
+  Action action_;
+  int listen_fd_ {-1};
+  int port_ {0};
+  std::thread thread_;
+};
+
+struct CountdownClosure final : google::protobuf::Closure {
+  CountdownClosure(std::atomic<int>& remaining, absl::Notification& notification)
+      : remaining(remaining), notification(notification) {}
+  void Run() override {
+    if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      notification.Notify();
+    }
+  }
+  std::atomic<int>& remaining;
+  absl::Notification& notification;
+};
+
+void ExpectActiveCallsFailAfterPeerTerminalEvent(RawTerminalPeer::Action action) {
+  constexpr int kCallCount = 4;
+  RawTerminalPeer peer(action);
+  Scheduler scheduler {1, 1};
+  Context& context = scheduler.GetIOContext(0);
+  scheduler.Start();
+
+  ant_rpc::RpcChannel channel(context);
+  ASSERT_EQ(channel.Init("127.0.0.1", peer.port()), 0);
+  ant_rpc::EchoService_Stub stub(&channel);
+  std::array<ant_rpc::EchoRequest, kCallCount> requests;
+  std::array<ant_rpc::EchoResponse, kCallCount> responses;
+  std::array<ant_rpc::RpcController, kCallCount> controllers;
+  std::atomic<int> remaining {kCallCount};
+  absl::Notification all_done;
+  std::array<CountdownClosure, kCallCount> closures {
+      CountdownClosure(remaining, all_done), CountdownClosure(remaining, all_done),
+      CountdownClosure(remaining, all_done), CountdownClosure(remaining, all_done)};
+
+  for (int index = 0; index < kCallCount; ++index) {
+    requests[index].set_message("terminal-" + std::to_string(index));
+    stub.Echo(&controllers[index], &requests[index], &responses[index], &closures[index]);
+  }
+
+  ASSERT_TRUE(all_done.WaitForNotificationWithTimeout(absl::Seconds(3)));
+  for (const auto& controller : controllers) {
+    EXPECT_TRUE(controller.Failed());
+    EXPECT_EQ(controller.ErrorCode(), ant_rpc::RPC_ECONN_FAILED);
+  }
+
+  channel.Close();
+  scheduler.Stop();
+}
+
+TEST(RpcChannelTerminalFailureTest, PeerResetFailsMultiplePendingCalls) {
+  ExpectActiveCallsFailAfterPeerTerminalEvent(RawTerminalPeer::Action::kReset);
+}
+
+TEST(RpcChannelTerminalFailureTest, ProtocolErrorFailsMultipleActiveCalls) {
+  ExpectActiveCallsFailAfterPeerTerminalEvent(RawTerminalPeer::Action::kMalformedResponse);
+}
+
+TEST(RpcChannelCancellationTest, StartCancelResolvesAnActiveSlot) {
+  RawTerminalPeer peer(RawTerminalPeer::Action::kReset);
+  Scheduler scheduler {1, 1};
+  Context& context = scheduler.GetIOContext(0);
+  scheduler.Start();
+
+  ant_rpc::RpcChannel channel(context);
+  ASSERT_EQ(channel.Init("127.0.0.1", peer.port()), 0);
+  ant_rpc::EchoService_Stub stub(&channel);
+  ant_rpc::EchoRequest request;
+  request.set_message("cancel-me");
+  ant_rpc::EchoResponse response;
+  ant_rpc::RpcController controller;
+  std::atomic<int> remaining {1};
+  absl::Notification done;
+  CountdownClosure closure(remaining, done);
+
+  stub.Echo(&controller, &request, &response, &closure);
+  controller.StartCancel();
+
+  ASSERT_TRUE(done.WaitForNotificationWithTimeout(absl::Seconds(2)));
+  EXPECT_TRUE(controller.IsCanceled());
+  EXPECT_TRUE(controller.Failed());
+  EXPECT_EQ(controller.ErrorCode(), ant_rpc::RPC_ECANCELED);
+  EXPECT_EQ(remaining.load(), 0);
+
+  channel.Close();
+  scheduler.Stop();
+}
 
 class RpcChannelTest : public ::testing::Test {
  protected:

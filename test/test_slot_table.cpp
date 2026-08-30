@@ -175,6 +175,105 @@ TEST(SlotTableTest, CompletionIsAlwaysScheduledOnWorkerExecutor) {
   EXPECT_EQ(executor.schedules.load(), 1);
 }
 
+TEST(SlotTableTest, ResponseWinsWhenItCompletesBeforeClose) {
+  ant_server::rpc::SlotTable<1> slots;
+  ant_server::rpc::RpcController controller;
+  std::atomic<int> ran {0};
+  CountingTask task(ran);
+  butil::IOBuf body;
+
+  const uint64_t cid = slots.AllocateSlot(&task, nullptr, &controller, TestContinuationTarget());
+  ASSERT_NE(cid, 0);
+  ASSERT_EQ(slots.PublishSlot(cid), ant_server::rpc::PublishOutcome::kInFlight);
+  ASSERT_TRUE(slots.CompleteSlot(cid, body));
+  EXPECT_EQ(slots.FailAllActiveSlots(ant_server::rpc::RPC_ECONN_FAILED, "peer closed"), 0U);
+
+  EXPECT_FALSE(controller.Failed());
+  EXPECT_EQ(ran.load(), 1);
+}
+
+TEST(SlotTableTest, CloseWinsAndMakesSubsequentResponseLate) {
+  ant_server::rpc::SlotTable<1> slots;
+  ant_server::rpc::RpcController controller;
+  std::atomic<int> ran {0};
+  CountingTask task(ran);
+  butil::IOBuf body;
+
+  const uint64_t cid = slots.AllocateSlot(&task, nullptr, &controller, TestContinuationTarget());
+  ASSERT_NE(cid, 0);
+  ASSERT_EQ(slots.PublishSlot(cid), ant_server::rpc::PublishOutcome::kInFlight);
+  EXPECT_EQ(slots.FailAllActiveSlots(ant_server::rpc::RPC_ECONN_FAILED, "peer closed"), 1U);
+  EXPECT_FALSE(slots.CompleteSlot(cid, body));
+
+  EXPECT_EQ(controller.ErrorCode(), ant_server::rpc::RPC_ECONN_FAILED);
+  EXPECT_EQ(ran.load(), 1);
+  EXPECT_EQ(slots.response_completion_stats().late_response, 1U);
+}
+
+TEST(SlotTableTest, CancelWinsWhenItRacesCloseFirst) {
+  ant_server::rpc::SlotTable<1> slots;
+  ant_server::rpc::RpcController controller;
+  std::atomic<int> ran {0};
+  CountingTask task(ran);
+
+  const uint64_t cid = slots.AllocateSlot(&task, nullptr, &controller, TestContinuationTarget());
+  ASSERT_NE(cid, 0);
+  ASSERT_EQ(slots.PublishSlot(cid), ant_server::rpc::PublishOutcome::kInFlight);
+  ASSERT_TRUE(slots.CancelSlot(cid));
+  EXPECT_EQ(slots.FailAllActiveSlots(ant_server::rpc::RPC_ECONN_FAILED, "peer closed"), 0U);
+
+  EXPECT_EQ(controller.ErrorCode(), ant_server::rpc::RPC_ECANCELED);
+  EXPECT_EQ(ran.load(), 1);
+}
+
+TEST(SlotTableTest, CloseWinsWhenItRacesCancelFirst) {
+  ant_server::rpc::SlotTable<1> slots;
+  ant_server::rpc::RpcController controller;
+  std::atomic<int> ran {0};
+  CountingTask task(ran);
+
+  const uint64_t cid = slots.AllocateSlot(&task, nullptr, &controller, TestContinuationTarget());
+  ASSERT_NE(cid, 0);
+  ASSERT_EQ(slots.PublishSlot(cid), ant_server::rpc::PublishOutcome::kInFlight);
+  ASSERT_EQ(slots.FailAllActiveSlots(ant_server::rpc::RPC_ECONN_FAILED, "peer closed"), 1U);
+  EXPECT_FALSE(slots.CancelSlot(cid));
+
+  EXPECT_EQ(controller.ErrorCode(), ant_server::rpc::RPC_ECONN_FAILED);
+  EXPECT_EQ(ran.load(), 1);
+}
+
+TEST(SlotTableTest, TimeoutAndCloseResolveExactlyOnce) {
+  ant_server::rpc::SlotTable<1> slots;
+  ant_server::rpc::RpcController controller;
+  std::atomic<int> ran {0};
+  CountingTask task(ran);
+
+  const uint64_t cid = slots.AllocateSlot(&task, nullptr, &controller, TestContinuationTarget());
+  ASSERT_NE(cid, 0);
+  ASSERT_EQ(slots.PublishSlot(cid), ant_server::rpc::PublishOutcome::kInFlight);
+  ASSERT_TRUE(slots.TimeoutSlot(cid));
+  EXPECT_EQ(slots.FailAllActiveSlots(ant_server::rpc::RPC_ECONN_FAILED, "peer closed"), 0U);
+
+  EXPECT_EQ(controller.ErrorCode(), ant_server::rpc::RPC_ETIMEOUT);
+  EXPECT_EQ(ran.load(), 1);
+}
+
+TEST(SlotTableTest, CloseWinsWhenItRacesTimeoutFirst) {
+  ant_server::rpc::SlotTable<1> slots;
+  ant_server::rpc::RpcController controller;
+  std::atomic<int> ran {0};
+  CountingTask task(ran);
+
+  const uint64_t cid = slots.AllocateSlot(&task, nullptr, &controller, TestContinuationTarget());
+  ASSERT_NE(cid, 0);
+  ASSERT_EQ(slots.PublishSlot(cid), ant_server::rpc::PublishOutcome::kInFlight);
+  ASSERT_EQ(slots.FailAllActiveSlots(ant_server::rpc::RPC_ECONN_FAILED, "peer closed"), 1U);
+  EXPECT_FALSE(slots.TimeoutSlot(cid));
+
+  EXPECT_EQ(controller.ErrorCode(), ant_server::rpc::RPC_ECONN_FAILED);
+  EXPECT_EQ(ran.load(), 1);
+}
+
 TEST(SlotTableTest, ConfiguredMaxInFlightBoundsAllocatedSlots) {
   ant_server::rpc::SlotTable<2> slots;
   ant_server::rpc::RpcController controller;
@@ -215,7 +314,7 @@ TEST(SlotTableTest, LocalFailurePreservesItsErrorCodeAndReleasesQuota) {
   EXPECT_EQ(slots.active_slot_count(), 0U);
 }
 
-TEST(SlotTableTest, FailAllActiveSlotsFailsPublishedCalls) {
+TEST(SlotTableTest, TerminalFailureFailsEveryPendingCall) {
   ant_server::rpc::SlotTable<4> slots;
   ant_server::rpc::RpcController first_controller;
   ant_server::rpc::RpcController second_controller;

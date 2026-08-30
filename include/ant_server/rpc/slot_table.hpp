@@ -216,6 +216,9 @@ class SlotTable {
                                              std::memory_order_acq_rel)) {
       return false;
     }
+    if (slot->controller) {
+      slot->controller->ClearActiveSlot(correlation_id);
+    }
     PushFreeSlot(GetSlotId(correlation_id));
     return true;
   }
@@ -251,6 +254,7 @@ class SlotTable {
     }
 
     if (slot.controller) {
+      slot.controller->ClearActiveSlot(correlation_id);
       if (meta.error_code() != RPC_SUCCESS) {
         slot.controller->SetFailed(meta.error_code(), meta.error_text());
       }
@@ -447,6 +451,7 @@ class SlotTable {
 
   void FinishFailure(CallSlot& slot, uint64_t correlation_id, int error_code, std::string_view err_msg) {
     if (slot.controller) {
+      slot.controller->ClearActiveSlot(correlation_id);
       slot.controller->SetFailed(error_code, err_msg);
       slot.controller->set_latency_us(slot.controller->CalculateElapsedUs());
     }

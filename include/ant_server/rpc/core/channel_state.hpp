@@ -10,7 +10,7 @@
 namespace ant_server::rpc::detail {
 
 // State shared by the public channel facade and its IO-thread driver.
-struct ChannelState {
+struct ChannelState final : RpcCallCancellationTarget {
   SlotTable<65536> slots;
   std::atomic<bool> running {false};
 
@@ -25,6 +25,8 @@ struct ChannelState {
   std::mutex close_mu;
   std::condition_variable close_cv;
   bool closed {true};
+
+  bool CancelRpcSlot(uint64_t correlation_id) override { return slots.CancelSlot(correlation_id); }
 };
 
 }  // namespace ant_server::rpc::detail

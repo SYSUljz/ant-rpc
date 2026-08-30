@@ -302,7 +302,7 @@ class RpcChannel : public google::protobuf::RpcChannel {
       controller->RecordStart();
     }
     const std::stop_token stop_token = controller ? controller->GetStopToken() : std::stop_token {};
-    if (stop_token.stop_requested()) {
+    if (stop_token.stop_requested() || (controller && controller->IsCanceled())) {
       SetInlineFailure(controller, "RPC call canceled before send", RPC_ECANCELED);
       return {};
     }
@@ -318,6 +318,11 @@ class RpcChannel : public google::protobuf::RpcChannel {
     }
     if (controller) {
       controller->SetCorrelationId(correlation_id);
+      if (!controller->BindActiveSlot(state, correlation_id)) {
+        state->slots.DiscardArmingSlot(correlation_id);
+        SetInlineFailure(controller, "RpcController is already bound to an active RPC", RPC_EINTERNAL);
+        return {};
+      }
     }
     if (stop_callback && stop_token.stop_possible()) {
       // A stop request may invoke this synchronously. SlotTable records it as
