@@ -1,3 +1,4 @@
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <string>
@@ -57,10 +58,40 @@ class BlockingEchoService final : public ant_rpc::EchoService {
   absl::Notification release;
 };
 
+class OutOfOrderEchoService final : public ant_rpc::EchoService {
+ public:
+  void Echo(google::protobuf::RpcController*, const ant_rpc::EchoRequest* request, ant_rpc::EchoResponse* response,
+            google::protobuf::Closure* done) override {
+    if (request->message() == "slow") {
+      slow_started.Notify();
+      release_slow.WaitForNotification();
+    }
+    response->set_message("Echo: " + request->message());
+    if (done) {
+      done->Run();
+    }
+  }
+
+  absl::Notification slow_started;
+  absl::Notification release_slow;
+};
+
 struct NotifyClosure final : google::protobuf::Closure {
   explicit NotifyClosure(absl::Notification& notification) : notification(notification) {}
   void Run() override { notification.Notify(); }
   absl::Notification& notification;
+};
+
+struct OrderedNotifyClosure final : google::protobuf::Closure {
+  OrderedNotifyClosure(absl::Notification& notification, std::atomic<int>& next_order, std::atomic<int>& order)
+      : notification(notification), next_order(next_order), order(order) {}
+  void Run() override {
+    order.store(next_order.fetch_add(1, std::memory_order_acq_rel) + 1, std::memory_order_release);
+    notification.Notify();
+  }
+  absl::Notification& notification;
+  std::atomic<int>& next_order;
+  std::atomic<int>& order;
 };
 
 TEST(RpcOptionsTest, RejectsInvalidChannelAndServerConfigurations) {
@@ -277,7 +308,9 @@ TEST(RpcServerLifecycleTest, ConstructionDoesNotListenAndLifecycleIsExplicit) {
 TEST(RpcServerOptionsTest, MaxInFlightReturnsOverloadWithoutBlockingReceiveLoop) {
   RpcServerOptions options;
   options.max_in_flight = 1;
-  Scheduler scheduler {1, 2};
+  // One worker intentionally blocks in the first service. A second worker
+  // keeps client completion independent from that server-side business work.
+  Scheduler scheduler {2, 2};
   Context& server_context = scheduler.GetIOContext(0);
   Context& client_context = scheduler.GetIOContext(1);
   RpcServer server(server_context, 0, butil::IP_ANY, options);
@@ -311,6 +344,60 @@ TEST(RpcServerOptionsTest, MaxInFlightReturnsOverloadWithoutBlockingReceiveLoop)
   ASSERT_TRUE(first_done.WaitForNotificationWithTimeout(absl::Seconds(2)));
   EXPECT_FALSE(first_controller.Failed()) << first_controller.ErrorText();
   EXPECT_EQ(first_response.message(), "Echo: first");
+
+  channel.Close();
+  server.Stop();
+  EXPECT_TRUE(server.Join());
+  scheduler.Stop();
+}
+
+TEST(RpcServerConnectionTest, SameConnectionResponsesFollowWorkerCompletionOrder) {
+  Scheduler scheduler {2, 2};
+  Context& server_context = scheduler.GetIOContext(0);
+  Context& client_context = scheduler.GetIOContext(1);
+  RpcServer server(server_context, 0);
+  auto service = std::make_shared<OutOfOrderEchoService>();
+  ASSERT_TRUE(server.AddService(service));
+  ASSERT_TRUE(server.Start());
+  scheduler.Start();
+
+  RpcChannel channel(client_context);
+  ASSERT_EQ(channel.Init("127.0.0.1", server.GetEndPoint().port), 0);
+  ant_rpc::EchoService_Stub stub(&channel);
+
+  RpcController slow_controller;
+  ant_rpc::EchoRequest slow_request;
+  ant_rpc::EchoResponse slow_response;
+  slow_request.set_message("slow");
+  RpcController fast_controller;
+  ant_rpc::EchoRequest fast_request;
+  ant_rpc::EchoResponse fast_response;
+  fast_request.set_message("fast");
+
+  absl::Notification slow_done;
+  absl::Notification fast_done;
+  std::atomic<int> next_order {0};
+  std::atomic<int> slow_order {0};
+  std::atomic<int> fast_order {0};
+  OrderedNotifyClosure slow_closure(slow_done, next_order, slow_order);
+  OrderedNotifyClosure fast_closure(fast_done, next_order, fast_order);
+
+  stub.Echo(&slow_controller, &slow_request, &slow_response, &slow_closure);
+  ASSERT_TRUE(service->slow_started.WaitForNotificationWithTimeout(absl::Seconds(2)));
+
+  // ReceiveLoop has already handed A to a worker. It must keep reading this
+  // same TCP connection so B can execute and respond before A is released.
+  stub.Echo(&fast_controller, &fast_request, &fast_response, &fast_closure);
+  ASSERT_TRUE(fast_done.WaitForNotificationWithTimeout(absl::Seconds(2)));
+  EXPECT_FALSE(fast_controller.Failed()) << fast_controller.ErrorText();
+  EXPECT_EQ(fast_response.message(), "Echo: fast");
+  EXPECT_EQ(fast_order.load(std::memory_order_acquire), 1);
+
+  service->release_slow.Notify();
+  ASSERT_TRUE(slow_done.WaitForNotificationWithTimeout(absl::Seconds(2)));
+  EXPECT_FALSE(slow_controller.Failed()) << slow_controller.ErrorText();
+  EXPECT_EQ(slow_response.message(), "Echo: slow");
+  EXPECT_EQ(slow_order.load(std::memory_order_acquire), 2);
 
   channel.Close();
   server.Stop();

@@ -15,7 +15,6 @@
 #include <sys/socket.h>
 
 #include "absl/synchronization/mutex.h"
-#include "ant_server/awaiter/resume_on.hpp"
 #include "ant_server/awaiter/socket_awaiter.hpp"
 #include "ant_server/context/context.hpp"
 #include "ant_server/rpc/error_code.hpp"
@@ -155,9 +154,34 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
   }
 
  private:
-  struct InFlightGuard {
+  // Ownership hand-off from the IO state machine to one worker execution.
+  // It owns the parsed frame, including its zero-copy IOBuf views.  The IO
+  // thread never accesses the frame after moving it here.
+  struct InboundCallState {
+    InboundCallState(std::weak_ptr<ServerConnection> connection, std::shared_ptr<ServerRuntime> runtime,
+                     FrameParseResult frame)
+        : connection(std::move(connection)), runtime(std::move(runtime)), frame(std::move(frame)) {}
+
+    std::weak_ptr<ServerConnection> connection;
     std::shared_ptr<ServerRuntime> runtime;
-    ~InFlightGuard() { runtime->ReleaseInFlight(); }
+    FrameParseResult frame;
+  };
+
+  // A concrete task rather than an erased closure makes the server's IO to
+  // worker transition visible in the type system and in profiles.
+  struct ServerDispatchTask final : TaskNode {
+    ServerDispatchTask(std::shared_ptr<InboundCallState> call, ServiceRegistry& registry, std::size_t max_frame_bytes)
+        : call(std::move(call)), registry(&registry), max_frame_bytes(max_frame_bytes) {
+      execute = [](TaskNode* task) noexcept {
+        auto* self = static_cast<ServerDispatchTask*>(task);
+        ServerConnection::RunInboundCall(std::move(self->call), *self->registry, self->max_frame_bytes);
+        delete self;
+      };
+    }
+
+    std::shared_ptr<InboundCallState> call;
+    ServiceRegistry* registry;
+    std::size_t max_frame_bytes;
   };
   void PostCommand(ServerCommand command) {
     commands_.Push(std::move(command));
@@ -239,7 +263,7 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
           break;
         }
         self->recv_buffer_.pop_front(frame.total_frame_bytes);
-        self->DispatchRequest(self, std::move(frame));
+        self->DispatchRequest(std::move(frame));
       }
       if (!self->running_.load(std::memory_order_acquire)) {
         break;
@@ -255,35 +279,55 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
     self->outbound_.clear();
     self->TryFinishCloseOnIoThread();
   }
-  DetachedTask DispatchRequest(std::shared_ptr<ServerConnection> self, FrameParseResult frame) {
-    if (!self->runtime_->TryAcquireInFlight()) {
+  void DispatchRequest(FrameParseResult frame) {
+    if (!runtime_->TryAcquireInFlight()) {
       auto response = std::make_shared<butil::IOBuf>();
       if (PackServerErrorResponse(frame, RPC_EOVERLOAD, "RPC server max_in_flight limit reached", *response,
-                                  self->runtime_->options().max_frame_bytes)) {
-        self->EnqueueResponse(std::move(response));
+                                  runtime_->options().max_frame_bytes)) {
+        EnqueueResponse(std::move(response));
       } else {
-        self->RequestClose();
+        RequestClose();
       }
-      co_return;
+      return;
     }
-    InFlightGuard in_flight {self->runtime_};
-    if (auto* executor = self->context_.GetExecutor()) {
-      co_await resume_on(*executor);
+
+    auto call = std::make_shared<InboundCallState>(weak_from_this(), runtime_, std::move(frame));
+    auto* executor = context_.GetExecutor();
+    if (executor == nullptr) {
+      call->runtime->ReleaseInFlight();
+      RequestClose();
+      return;
     }
+    executor->schedule(new ServerDispatchTask(std::move(call), registry_, runtime_->options().max_frame_bytes));
+  }
+
+  static void RunInboundCall(std::shared_ptr<InboundCallState> call, ServiceRegistry& registry,
+                             std::size_t max_frame_bytes) noexcept {
+    struct InFlightGuard {
+      std::shared_ptr<ServerRuntime> runtime;
+      ~InFlightGuard() { runtime->ReleaseInFlight(); }
+    } in_flight {call->runtime};
+
     auto response = std::make_shared<butil::IOBuf>();
-    if (!self->registry_.Dispatch(frame, *response)) {
-      self->RequestClose();
-      co_return;
+    if (!registry.Dispatch(call->frame, *response)) {
+      if (auto connection = call->connection.lock()) {
+        connection->RequestClose();
+      }
+      return;
     }
-    if (response->size() > self->runtime_->options().max_frame_bytes) {
+    if (response->size() > max_frame_bytes) {
       response->clear();
-      if (!PackServerErrorResponse(frame, RPC_EINVALID_DATA, "RPC response exceeds max_frame_bytes", *response,
-                                   self->runtime_->options().max_frame_bytes)) {
-        self->RequestClose();
-        co_return;
+      if (!PackServerErrorResponse(call->frame, RPC_EINVALID_DATA, "RPC response exceeds max_frame_bytes", *response,
+                                   max_frame_bytes)) {
+        if (auto connection = call->connection.lock()) {
+          connection->RequestClose();
+        }
+        return;
       }
     }
-    self->EnqueueResponse(std::move(response));
+    if (auto connection = call->connection.lock()) {
+      connection->EnqueueResponse(std::move(response));
+    }
   }
   DetachedTask WriteFrame(std::shared_ptr<ServerConnection> self, OutboundFrame frame) {
     while (frame.buffer && !frame.buffer->empty() && self->running_.load(std::memory_order_acquire)) {

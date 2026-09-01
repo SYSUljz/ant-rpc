@@ -152,6 +152,22 @@ TEST(SlotTableTest, PublishedSlotResolvesImmediately) {
   EXPECT_EQ(controller.ErrorCode(), ant_server::rpc::RPC_ECANCELED);
 }
 
+TEST(SlotTableTest, PublishedSlotTimesOutImmediately) {
+  ant_server::rpc::SlotTable<4> slots;
+  ant_server::rpc::RpcController controller;
+  std::atomic<int> ran {0};
+  CountingTask task(ran);
+
+  const uint64_t cid = slots.AllocateSlot(&task, nullptr, &controller, TestContinuationTarget());
+  ASSERT_NE(cid, 0);
+  ASSERT_EQ(slots.PublishSlot(cid), ant_server::rpc::PublishOutcome::kInFlight);
+
+  EXPECT_TRUE(slots.TimeoutSlot(cid));
+  EXPECT_EQ(ran.load(), 1);
+  EXPECT_TRUE(controller.Failed());
+  EXPECT_EQ(controller.ErrorCode(), ant_server::rpc::RPC_ETIMEOUT);
+}
+
 TEST(SlotTableTest, ResponseCannotCompleteAnArmingSlot) {
   ant_server::rpc::SlotTable<4> slots;
   ant_server::rpc::RpcController controller;
