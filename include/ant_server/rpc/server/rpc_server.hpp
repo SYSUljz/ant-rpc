@@ -100,7 +100,7 @@ class RpcServer {
 
   // Separate from Stop so multiple servers may begin shutdown together.
   // It also waits for running service code: closing an fd cannot safely
-  // destroy ServiceRegistry while a worker is still executing Dispatch().
+  // destroy ServiceRegistry while a worker is still executing a service.
   bool Join() {
     {
       absl::MutexLock lock(&lifecycle_mu_);

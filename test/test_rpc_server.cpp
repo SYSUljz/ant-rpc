@@ -1,6 +1,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -75,6 +76,67 @@ class OutOfOrderEchoService final : public ant_rpc::EchoService {
   absl::Notification slow_started;
 };
 
+class AsyncDoneEchoService final : public ant_rpc::EchoService {
+ public:
+  ~AsyncDoneEchoService() override { Join(); }
+
+  void Echo(google::protobuf::RpcController*, const ant_rpc::EchoRequest* request, ant_rpc::EchoResponse* response,
+            google::protobuf::Closure* done) override {
+    const std::string message = request->message();
+    std::lock_guard<std::mutex> lock(mu_);
+    worker_ = std::thread([message, response, done] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      response->set_message("Async: " + message);
+      done->Run();
+      // A duplicate completion before the IO owner has removed the call must
+      // be harmless: InboundCallState's CAS admits only the first one.
+      done->Run();
+    });
+  }
+
+  void Join() {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (worker_.joinable()) {
+      worker_.join();
+    }
+  }
+
+ private:
+  std::mutex mu_;
+  std::thread worker_;
+};
+
+class DeferredDoneEchoService final : public ant_rpc::EchoService {
+ public:
+  ~DeferredDoneEchoService() override { Join(); }
+
+  void Echo(google::protobuf::RpcController*, const ant_rpc::EchoRequest* request, ant_rpc::EchoResponse* response,
+            google::protobuf::Closure* done) override {
+    const std::string message = request->message();
+    std::lock_guard<std::mutex> lock(mu_);
+    worker_ = std::thread([this, message, response, done] {
+      entered.Notify();
+      release.WaitForNotification();
+      response->set_message("Deferred: " + message);
+      done->Run();
+    });
+  }
+
+  void Join() {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (worker_.joinable()) {
+      worker_.join();
+    }
+  }
+
+  absl::Notification entered;
+  absl::Notification release;
+
+ private:
+  std::mutex mu_;
+  std::thread worker_;
+};
+
 struct NotifyClosure final : google::protobuf::Closure {
   explicit NotifyClosure(absl::Notification& notification) : notification(notification) {}
   void Run() override { notification.Notify(); }
@@ -91,6 +153,17 @@ struct OrderedNotifyClosure final : google::protobuf::Closure {
   absl::Notification& notification;
   std::atomic<int>& next_order;
   std::atomic<int>& order;
+};
+
+struct CountingNotifyClosure final : google::protobuf::Closure {
+  CountingNotifyClosure(absl::Notification& notification, std::atomic<int>& count)
+      : notification(notification), count(count) {}
+  void Run() override {
+    count.fetch_add(1, std::memory_order_acq_rel);
+    notification.Notify();
+  }
+  absl::Notification& notification;
+  std::atomic<int>& count;
 };
 
 TEST(RpcOptionsTest, RejectsInvalidChannelAndServerConfigurations) {
@@ -398,6 +471,74 @@ TEST(RpcServerConnectionTest, SameConnectionResponsesFollowWorkerCompletionOrder
   EXPECT_EQ(slow_order.load(std::memory_order_acquire), 2);
 
   channel.Close();
+  server.Stop();
+  EXPECT_TRUE(server.Join());
+  scheduler.Stop();
+}
+
+TEST(RpcServerServiceTest, AsyncDoneFromAnotherThreadCompletesExactlyOnce) {
+  Scheduler scheduler {2, 2};
+  Context& server_context = scheduler.GetIOContext(0);
+  Context& client_context = scheduler.GetIOContext(1);
+  RpcServer server(server_context, 0);
+  auto service = std::make_shared<AsyncDoneEchoService>();
+  ASSERT_TRUE(server.AddService(service));
+  ASSERT_TRUE(server.Start());
+  scheduler.Start();
+
+  RpcChannel channel(client_context);
+  ASSERT_EQ(channel.Init("127.0.0.1", server.GetEndPoint().port), 0);
+  ant_rpc::EchoService_Stub stub(&channel);
+  RpcController controller;
+  ant_rpc::EchoRequest request;
+  ant_rpc::EchoResponse response;
+  request.set_message("later");
+  absl::Notification done;
+  std::atomic<int> completion_count {0};
+  CountingNotifyClosure closure(done, completion_count);
+
+  stub.Echo(&controller, &request, &response, &closure);
+  ASSERT_TRUE(done.WaitForNotificationWithTimeout(absl::Seconds(2)));
+  service->Join();
+  EXPECT_FALSE(controller.Failed()) << controller.ErrorText();
+  EXPECT_EQ(response.message(), "Async: later");
+  EXPECT_EQ(completion_count.load(std::memory_order_acquire), 1);
+
+  channel.Close();
+  server.Stop();
+  EXPECT_TRUE(server.Join());
+  scheduler.Stop();
+}
+
+TEST(RpcServerServiceTest, LateDoneAfterClientDisconnectIsSafelyDiscarded) {
+  Scheduler scheduler {2, 2};
+  Context& server_context = scheduler.GetIOContext(0);
+  Context& client_context = scheduler.GetIOContext(1);
+  RpcServer server(server_context, 0);
+  auto service = std::make_shared<DeferredDoneEchoService>();
+  ASSERT_TRUE(server.AddService(service));
+  ASSERT_TRUE(server.Start());
+  scheduler.Start();
+
+  RpcChannel channel(client_context);
+  ASSERT_EQ(channel.Init("127.0.0.1", server.GetEndPoint().port), 0);
+  ant_rpc::EchoService_Stub stub(&channel);
+  RpcController controller;
+  ant_rpc::EchoRequest request;
+  ant_rpc::EchoResponse response;
+  request.set_message("abandoned");
+  absl::Notification callback_done;
+  NotifyClosure closure(callback_done);
+  stub.Echo(&controller, &request, &response, &closure);
+  ASSERT_TRUE(service->entered.WaitForNotificationWithTimeout(absl::Seconds(2)));
+
+  // Closing the peer must not destroy the state that the service still uses
+  // through response and done. The eventual response is simply not written.
+  channel.Close();
+  ASSERT_TRUE(callback_done.WaitForNotificationWithTimeout(absl::Seconds(2)));
+  service->release.Notify();
+  service->Join();
+
   server.Stop();
   EXPECT_TRUE(server.Join());
   scheduler.Stop();
