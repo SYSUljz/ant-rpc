@@ -47,6 +47,13 @@ def non_response_frame() -> bytes:
     return wire_header(meta_len=len(meta)) + meta
 
 
+def non_request_frame() -> bytes:
+    # RpcMeta: correlation_id=1, msg_type=RPC_RESPONSE. A server accepts only
+    # RPC_REQUEST frames, even though this frame is otherwise wire-valid.
+    meta = b"\x08\x01\x10\x01"
+    return wire_header(meta_len=len(meta)) + meta
+
+
 def read_ready(server: subprocess.Popen[str]) -> int:
     if server.stdout is None:
         raise RuntimeError("server stdout is not piped")
@@ -181,6 +188,7 @@ def main() -> int:
             "oversized-length": wire_header(body_len=0xFFFFFFFF, meta_len=0xFFFFFFFF),
             # RpcMeta field 9 attachment_size=2 while body_len=1.
             "attachment-boundary": wire_header(body_len=1, meta_len=2) + b"\x48\x02x",
+            "message-type": non_request_frame(),
         }
         for name, frame in malformed.items():
             expect_server_rejects(port, name, frame)

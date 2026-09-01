@@ -64,7 +64,7 @@ class OutOfOrderEchoService final : public ant_rpc::EchoService {
             google::protobuf::Closure* done) override {
     if (request->message() == "slow") {
       slow_started.Notify();
-      release_slow.WaitForNotification();
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     response->set_message("Echo: " + request->message());
     if (done) {
@@ -73,7 +73,6 @@ class OutOfOrderEchoService final : public ant_rpc::EchoService {
   }
 
   absl::Notification slow_started;
-  absl::Notification release_slow;
 };
 
 struct NotifyClosure final : google::protobuf::Closure {
@@ -386,14 +385,13 @@ TEST(RpcServerConnectionTest, SameConnectionResponsesFollowWorkerCompletionOrder
   ASSERT_TRUE(service->slow_started.WaitForNotificationWithTimeout(absl::Seconds(2)));
 
   // ReceiveLoop has already handed A to a worker. It must keep reading this
-  // same TCP connection so B can execute and respond before A is released.
+  // same TCP connection so B can execute and respond while A sleeps.
   stub.Echo(&fast_controller, &fast_request, &fast_response, &fast_closure);
   ASSERT_TRUE(fast_done.WaitForNotificationWithTimeout(absl::Seconds(2)));
   EXPECT_FALSE(fast_controller.Failed()) << fast_controller.ErrorText();
   EXPECT_EQ(fast_response.message(), "Echo: fast");
   EXPECT_EQ(fast_order.load(std::memory_order_acquire), 1);
 
-  service->release_slow.Notify();
   ASSERT_TRUE(slow_done.WaitForNotificationWithTimeout(absl::Seconds(2)));
   EXPECT_FALSE(slow_controller.Failed()) << slow_controller.ErrorText();
   EXPECT_EQ(slow_response.message(), "Echo: slow");

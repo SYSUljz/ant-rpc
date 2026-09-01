@@ -100,18 +100,29 @@ inline bool PackServerErrorResponse(const FrameParseResult& request, int error_c
 }
 
 // Per-accepted-fd state machine. Only its Context IO thread mutates the fd,
-// receive buffer, outbound queue and write state. Workers use kSendResponse.
+// receive buffer, inbound-call list, outbound queue and write state. Workers
+// return completion through a typed ServerCommand.
 class ServerConnection final : public IoCommandMailbox, public std::enable_shared_from_this<ServerConnection> {
+ private:
+  struct InboundCallState;
+
  public:
   struct OutboundFrame {
     std::shared_ptr<butil::IOBuf> buffer;
   };
   struct ServerCommand {
-    enum class Type : uint8_t { kStart, kSendResponse, kClose };
+    enum class Type : uint8_t { kStart, kSendResponse, kCompleteInbound, kClose };
     Type type;
     OutboundFrame frame {};
+    std::shared_ptr<InboundCallState> inbound_call {};
+    bool close_after_completion {false};
+
     static ServerCommand Start() { return {Type::kStart, {}}; }
     static ServerCommand SendResponse(OutboundFrame frame) { return {Type::kSendResponse, std::move(frame)}; }
+    static ServerCommand CompleteInbound(std::shared_ptr<InboundCallState> call, OutboundFrame frame,
+                                         bool close_after_completion) {
+      return {Type::kCompleteInbound, std::move(frame), std::move(call), close_after_completion};
+    }
     static ServerCommand Close() { return {Type::kClose, {}}; }
   };
 
@@ -145,6 +156,10 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
             outbound_.push_back(std::move(command.frame));
             StartNextWriteOnIoThread();
           }
+          break;
+        case ServerCommand::Type::kCompleteInbound:
+          CompleteInboundOnIoThread(std::move(command.inbound_call), std::move(command.frame),
+                                    command.close_after_completion);
           break;
         case ServerCommand::Type::kClose:
           BeginCloseOnIoThread();
@@ -186,6 +201,25 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
   void PostCommand(ServerCommand command) {
     commands_.Push(std::move(command));
     context_.Notify(shared_from_this());
+  }
+  void CompleteInbound(std::shared_ptr<InboundCallState> call, std::shared_ptr<butil::IOBuf> response,
+                       bool close_after_completion) {
+    PostCommand(ServerCommand::CompleteInbound(std::move(call), {std::move(response)}, close_after_completion));
+  }
+  void CompleteInboundOnIoThread(std::shared_ptr<InboundCallState> call, OutboundFrame response,
+                                 bool close_after_completion) {
+    if (call) {
+      std::erase(inbound_calls_, call);
+    }
+    if (close_after_completion) {
+      running_.store(false, std::memory_order_release);
+      BeginCloseOnIoThread();
+      return;
+    }
+    if (running_.load(std::memory_order_acquire) && response.buffer) {
+      outbound_.push_back(std::move(response));
+      StartNextWriteOnIoThread();
+    }
   }
   void StartOnIoThread() {
     if (!running_.load(std::memory_order_acquire)) {
@@ -262,6 +296,15 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
           }
           break;
         }
+        if (frame.meta.msg_type() != RPC_REQUEST) {
+          // A peer may not send a response or an unspecified message type to
+          // a server connection. Treat it as a terminal protocol violation.
+          self->running_.store(false, std::memory_order_release);
+          if (const int socket = self->fd(); socket >= 0) {
+            self->context_.UseService<IOuringSocketService>().SubmitShutdown(socket, SHUT_RDWR, /*is_fixed=*/true);
+          }
+          break;
+        }
         self->recv_buffer_.pop_front(frame.total_frame_bytes);
         self->DispatchRequest(std::move(frame));
       }
@@ -292,8 +335,10 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
     }
 
     auto call = std::make_shared<InboundCallState>(weak_from_this(), runtime_, std::move(frame));
+    inbound_calls_.push_back(call);
     auto* executor = context_.GetExecutor();
     if (executor == nullptr) {
+      std::erase(inbound_calls_, call);
       call->runtime->ReleaseInFlight();
       RequestClose();
       return;
@@ -309,24 +354,20 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
     } in_flight {call->runtime};
 
     auto response = std::make_shared<butil::IOBuf>();
+    bool close_after_completion = false;
     if (!registry.Dispatch(call->frame, *response)) {
-      if (auto connection = call->connection.lock()) {
-        connection->RequestClose();
-      }
-      return;
-    }
-    if (response->size() > max_frame_bytes) {
+      response.reset();
+      close_after_completion = true;
+    } else if (response->size() > max_frame_bytes) {
       response->clear();
       if (!PackServerErrorResponse(call->frame, RPC_EINVALID_DATA, "RPC response exceeds max_frame_bytes", *response,
                                    max_frame_bytes)) {
-        if (auto connection = call->connection.lock()) {
-          connection->RequestClose();
-        }
-        return;
+        response.reset();
+        close_after_completion = true;
       }
     }
     if (auto connection = call->connection.lock()) {
-      connection->EnqueueResponse(std::move(response));
+      connection->CompleteInbound(std::move(call), std::move(response), close_after_completion);
     }
   }
   DetachedTask WriteFrame(std::shared_ptr<ServerConnection> self, OutboundFrame frame) {
@@ -355,6 +396,7 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
   const std::chrono::milliseconds idle_timeout_;
   MpscQueue<ServerCommand> commands_;
   butil::IOBuf recv_buffer_;
+  std::vector<std::shared_ptr<InboundCallState>> inbound_calls_;
   std::deque<OutboundFrame> outbound_;
   std::atomic<bool> running_ {true};
   std::atomic<bool> released_ {false};
