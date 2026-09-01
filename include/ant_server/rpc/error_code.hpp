@@ -10,7 +10,7 @@ enum RpcErrorCode : int {
   RPC_ENOMETHOD = 1002,      // Method not found in target service
   RPC_EINVALID_DATA = 1003,  // Request/Response payload deserialization failed
   RPC_ETIMEOUT = 1004,       // RPC execution or network timeout
-  RPC_ECANCELED = 1005,      // RPC canceled via std::stop_token or client disconnect
+  RPC_ECANCELED = 1005,      // RPC canceled locally or due to client disconnect
   RPC_EINTERNAL = 1006,      // Internal server or business error
   RPC_EOVERLOAD = 1007,      // Server rejected request due to high load
   RPC_ECONN_FAILED = 1008,   // Failed to connect to remote server

@@ -1,4 +1,6 @@
 #include <atomic>
+#include <barrier>
+#include <thread>
 
 #include <gtest/gtest.h>
 
@@ -13,6 +15,37 @@ struct CountingTask final : TaskNode {
   }
 
   std::atomic<int>& count_;
+};
+
+struct CountingClosure final : google::protobuf::Closure {
+  explicit CountingClosure(std::atomic<int>& count) : count_(count) {}
+  void Run() override { count_.fetch_add(1, std::memory_order_relaxed); }
+
+  std::atomic<int>& count_;
+};
+
+struct OrderedTask final : TaskNode {
+  OrderedTask(std::atomic<int>& order, std::atomic<int>& observed_order)
+      : order_(order), observed_order_(observed_order) {
+    execute = [](TaskNode* self) noexcept {
+      auto* task = static_cast<OrderedTask*>(self);
+      task->observed_order_.store(task->order_.fetch_add(1, std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    };
+  }
+
+  std::atomic<int>& order_;
+  std::atomic<int>& observed_order_;
+};
+
+struct OrderedClosure final : google::protobuf::Closure {
+  OrderedClosure(std::atomic<int>& order, std::atomic<int>& observed_order)
+      : order_(order), observed_order_(observed_order) {}
+  void Run() override {
+    observed_order_.store(order_.fetch_add(1, std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+  }
+
+  std::atomic<int>& order_;
+  std::atomic<int>& observed_order_;
 };
 
 struct RecordingExecutor final : Executor {
@@ -46,6 +79,28 @@ TEST(SlotTableTest, CancelDuringArmingIsDeliveredByPublish) {
   EXPECT_EQ(ran.load(), 1);
   EXPECT_TRUE(controller.Failed());
   EXPECT_EQ(controller.ErrorCode(), ant_server::rpc::RPC_ECANCELED);
+}
+
+TEST(SlotTableTest, NotifyOnCancelRunsOnceBeforeNormalCompletionContinuation) {
+  ant_server::rpc::SlotTable<1> slots;
+  ant_server::rpc::RpcController controller;
+  std::atomic<int> order {0};
+  std::atomic<int> task_order {0};
+  std::atomic<int> notify_order {0};
+  OrderedTask task(order, task_order);
+  OrderedClosure notify(order, notify_order);
+  butil::IOBuf body;
+
+  controller.NotifyOnCancel(&notify);
+  const uint64_t cid = slots.AllocateSlot(&task, nullptr, &controller, TestContinuationTarget());
+  ASSERT_NE(cid, 0);
+  ASSERT_EQ(slots.PublishSlot(cid), ant_server::rpc::PublishOutcome::kInFlight);
+  ASSERT_TRUE(slots.CompleteSlot(cid, body));
+
+  EXPECT_EQ(notify_order.load(), 1);
+  EXPECT_EQ(task_order.load(), 2);
+  controller.StartCancel();
+  EXPECT_EQ(notify_order.load(), 1);
 }
 
 TEST(SlotTableTest, TimeoutDuringArmingIsDeliveredByPublish) {
@@ -299,6 +354,86 @@ TEST(SlotTableTest, CloseWinsWhenItRacesTimeoutFirst) {
 
   EXPECT_EQ(controller.ErrorCode(), ant_server::rpc::RPC_ECONN_FAILED);
   EXPECT_EQ(ran.load(), 1);
+}
+
+TEST(SlotTableConcurrencyTest, ResponseAndTimeoutRaceHasExactlyOneWinner) {
+  constexpr int kIterations = 512;
+  for (int iteration = 0; iteration < kIterations; ++iteration) {
+    ant_server::rpc::SlotTable<1> slots;
+    ant_server::rpc::RpcController controller;
+    std::atomic<int> ran {0};
+    CountingTask task(ran);
+    butil::IOBuf body;
+
+    const uint64_t cid = slots.AllocateSlot(&task, nullptr, &controller, TestContinuationTarget());
+    ASSERT_NE(cid, 0);
+    ASSERT_EQ(slots.PublishSlot(cid), ant_server::rpc::PublishOutcome::kInFlight);
+
+    std::barrier start {3};
+    std::atomic<bool> response_won {false};
+    std::atomic<bool> timeout_won {false};
+    std::thread response_thread([&] {
+      start.arrive_and_wait();
+      response_won.store(slots.CompleteSlot(cid, body), std::memory_order_release);
+    });
+    std::thread timeout_thread([&] {
+      start.arrive_and_wait();
+      timeout_won.store(slots.TimeoutSlot(cid), std::memory_order_release);
+    });
+    start.arrive_and_wait();
+    response_thread.join();
+    timeout_thread.join();
+
+    ASSERT_NE(response_won.load(std::memory_order_acquire), timeout_won.load(std::memory_order_acquire));
+    EXPECT_EQ(ran.load(std::memory_order_acquire), 1);
+    if (response_won.load(std::memory_order_acquire)) {
+      EXPECT_FALSE(controller.Failed());
+    } else {
+      EXPECT_EQ(controller.ErrorCode(), ant_server::rpc::RPC_ETIMEOUT);
+    }
+  }
+}
+
+TEST(SlotTableConcurrencyTest, ResponseCancelAndTimeoutRaceCompletesExactlyOnce) {
+  constexpr int kIterations = 512;
+  for (int iteration = 0; iteration < kIterations; ++iteration) {
+    ant_server::rpc::SlotTable<1> slots;
+    ant_server::rpc::RpcController controller;
+    std::atomic<int> ran {0};
+    CountingTask task(ran);
+    butil::IOBuf body;
+
+    const uint64_t cid = slots.AllocateSlot(&task, nullptr, &controller, TestContinuationTarget());
+    ASSERT_NE(cid, 0);
+    ASSERT_EQ(slots.PublishSlot(cid), ant_server::rpc::PublishOutcome::kInFlight);
+
+    std::barrier start {4};
+    std::atomic<bool> response_won {false};
+    std::atomic<bool> cancel_won {false};
+    std::atomic<bool> timeout_won {false};
+    std::thread response_thread([&] {
+      start.arrive_and_wait();
+      response_won.store(slots.CompleteSlot(cid, body), std::memory_order_release);
+    });
+    std::thread cancel_thread([&] {
+      start.arrive_and_wait();
+      cancel_won.store(slots.CancelSlot(cid), std::memory_order_release);
+    });
+    std::thread timeout_thread([&] {
+      start.arrive_and_wait();
+      timeout_won.store(slots.TimeoutSlot(cid), std::memory_order_release);
+    });
+    start.arrive_and_wait();
+    response_thread.join();
+    cancel_thread.join();
+    timeout_thread.join();
+
+    const int winner_count = static_cast<int>(response_won.load(std::memory_order_acquire)) +
+                             static_cast<int>(cancel_won.load(std::memory_order_acquire)) +
+                             static_cast<int>(timeout_won.load(std::memory_order_acquire));
+    EXPECT_EQ(winner_count, 1);
+    EXPECT_EQ(ran.load(std::memory_order_acquire), 1);
+  }
 }
 
 TEST(SlotTableTest, ConfiguredMaxInFlightBoundsAllocatedSlots) {

@@ -62,7 +62,6 @@ namespace detail {
 struct ClosureTask final : TaskNode {
   google::protobuf::Closure* done {nullptr};
   bool heap_allocated {false};
-  SlotStopCallback stop_callback;
 
   ClosureTask() noexcept {
     execute = [](TaskNode* self) noexcept {
@@ -223,7 +222,7 @@ class RpcChannel : public google::protobuf::RpcChannel {
     if (done) {
       auto* task = new detail::ClosureTask(done, true);
       const StartResult result = StartUnaryCall(method->service()->full_name(), method->name(), rpc_controller, request,
-                                                response, task, CurrentCallContinuationTarget(), &task->stop_callback);
+                                                response, task, CurrentCallContinuationTarget());
       if (result.outcome == StartOutcome::kFailedInline) {
         task->run();
       }
@@ -236,9 +235,8 @@ class RpcChannel : public google::protobuf::RpcChannel {
       absl::Notification& notification;
     } closure(notification);
     detail::ClosureTask task(&closure);
-    SlotStopCallback stop_callback;
     const StartResult result = StartUnaryCall(method->service()->full_name(), method->name(), rpc_controller, request,
-                                              response, &task, CurrentCallContinuationTarget(), &stop_callback);
+                                              response, &task, CurrentCallContinuationTarget());
     if (result.outcome == StartOutcome::kFailedInline) {
       task.run();
       return;
@@ -255,10 +253,8 @@ class RpcChannel : public google::protobuf::RpcChannel {
       absl::Notification& notification;
     } closure(notification);
     detail::ClosureTask task(&closure);
-    SlotStopCallback stop_callback;
-    const StartResult result =
-        StartUnaryCall(service_name, method_name, &controller, nullptr, nullptr, &task, CurrentCallContinuationTarget(),
-                       &stop_callback, &request_body, &response_body);
+    const StartResult result = StartUnaryCall(service_name, method_name, &controller, nullptr, nullptr, &task,
+                                              CurrentCallContinuationTarget(), &request_body, &response_body);
     if (result.outcome == StartOutcome::kFailedInline) {
       task.run();
       return;
@@ -288,8 +284,7 @@ class RpcChannel : public google::protobuf::RpcChannel {
 
   StartResult StartUnaryCall(std::string_view service_name, std::string_view method_name, RpcController* controller,
                              const google::protobuf::Message* request, google::protobuf::Message* response,
-                             TaskNode* task, ContinuationTarget target, SlotStopCallback* stop_callback,
-                             const butil::IOBuf* raw_request_body = nullptr,
+                             TaskNode* task, ContinuationTarget target, const butil::IOBuf* raw_request_body = nullptr,
                              butil::IOBuf* raw_response_body = nullptr) {
     std::shared_ptr<detail::ChannelState> state;
     std::shared_ptr<detail::RpcChannelIoDriver> driver;
@@ -301,8 +296,7 @@ class RpcChannel : public google::protobuf::RpcChannel {
     if (controller) {
       controller->RecordStart();
     }
-    const std::stop_token stop_token = controller ? controller->GetStopToken() : std::stop_token {};
-    if (stop_token.stop_requested() || (controller && controller->IsCanceled())) {
+    if (controller && controller->IsCanceled()) {
       SetInlineFailure(controller, "RPC call canceled before send", RPC_ECANCELED);
       return {};
     }
@@ -323,11 +317,6 @@ class RpcChannel : public google::protobuf::RpcChannel {
         SetInlineFailure(controller, "RpcController is already bound to an active RPC", RPC_EINTERNAL);
         return {};
       }
-    }
-    if (stop_callback && stop_token.stop_possible()) {
-      // A stop request may invoke this synchronously. SlotTable records it as
-      // CANCEL_PENDING while ARMING; PublishSlot() performs the completion.
-      stop_callback->emplace(stop_token, state->slots.MakeCancelFn(correlation_id));
     }
     const int64_t timeout_ms =
         controller && controller->TimeoutMs() > 0 ? controller->TimeoutMs() : options_.default_rpc_timeout.count();
@@ -393,9 +382,9 @@ class RpcChannel : public google::protobuf::RpcChannel {
     return {correlation_id, StartOutcome::kInFlight};
   }
 
-  // Local failures can arrive after a stop callback has changed ARMING into a
-  // pending terminal state. Publishing first lets SlotTable choose that winner
-  // safely; otherwise this local error becomes an ordinary slot failure.
+  // A local failure can arrive after StartCancel() or the deadline has changed
+  // ARMING into a pending terminal state. Publishing first lets SlotTable
+  // choose that winner safely; otherwise this becomes an ordinary slot failure.
   static StartResult ResolveArmingFailure(const std::shared_ptr<detail::ChannelState>& state, uint64_t correlation_id,
                                           int error_code, const std::string& message) {
     const PublishOutcome publish = state->slots.PublishSlot(correlation_id);
@@ -409,6 +398,7 @@ class RpcChannel : public google::protobuf::RpcChannel {
                                int error_code = RPC_ECONN_FAILED) {
     if (controller) {
       controller->SetFailed(error_code, message);
+      RpcController::RunNotifyCallback(controller->TakeNotifyOnCompletion());
     }
   }
 

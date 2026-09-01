@@ -1,4 +1,4 @@
-#include <stop_token>
+#include <atomic>
 #include <string>
 
 #include <gtest/gtest.h>
@@ -80,17 +80,51 @@ TEST(RpcControllerTest, IOBufAttachments) {
   EXPECT_EQ(cntl.ResponseAttachment().size(), 24);
 }
 
-// 5. Test C++20 StopToken Integration
-TEST(RpcControllerTest, StopTokenCancellation) {
+namespace {
+struct CountingClosure final : google::protobuf::Closure {
+  explicit CountingClosure(std::atomic<int>& calls) : calls(calls) {}
+  void Run() override { calls.fetch_add(1, std::memory_order_relaxed); }
+  std::atomic<int>& calls;
+};
+}  // namespace
+
+TEST(RpcControllerTest, NotifyOnCancelRunsImmediatelyAfterStartCancel) {
   RpcController cntl;
-  std::stop_source source;
+  std::atomic<int> calls {0};
+  CountingClosure callback(calls);
 
-  cntl.SetStopToken(source.get_token());
-  EXPECT_FALSE(cntl.IsCanceled());
+  cntl.StartCancel();
+  cntl.NotifyOnCancel(&callback);
 
-  // Trigger stop via stop_source
-  source.request_stop();
-  EXPECT_TRUE(cntl.IsCanceled());
+  EXPECT_EQ(calls.load(), 1);
+}
+
+TEST(RpcControllerTest, NotifyOnCancelRunsOnceWhenStartCancelFollowsRegistration) {
+  RpcController cntl;
+  std::atomic<int> calls {0};
+  CountingClosure callback(calls);
+
+  cntl.NotifyOnCancel(&callback);
+  cntl.StartCancel();
+  cntl.StartCancel();
+
+  EXPECT_EQ(calls.load(), 1);
+}
+
+TEST(RpcControllerTest, NotifyOnCancelRegistrationIsResetWithController) {
+  RpcController cntl;
+  std::atomic<int> calls {0};
+  CountingClosure first_callback(calls);
+  CountingClosure second_callback(calls);
+
+  cntl.NotifyOnCancel(&first_callback);
+  cntl.StartCancel();
+  cntl.Reset();
+
+  cntl.NotifyOnCancel(&second_callback);
+  cntl.StartCancel();
+
+  EXPECT_EQ(calls.load(), 2);
 }
 
 // 6. Test Reset Functionality for Controller Reusability
@@ -104,9 +138,6 @@ TEST(RpcControllerTest, ResetCleansAllState) {
   cntl.SetHeader("k", "v");
   cntl.RequestAttachment().append("payload");
   cntl.ResponseAttachment().append("resp");
-
-  std::stop_source source;
-  cntl.SetStopToken(source.get_token());
 
   // Call Reset()
   cntl.Reset();

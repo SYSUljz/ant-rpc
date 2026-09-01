@@ -5,7 +5,6 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
-#include <stop_token>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -67,24 +66,26 @@ struct ResponseCompletionStats {
   uint64_t late_response {0};
 };
 
-// Type-erased cancel functor stored inside a caller-owned std::stop_callback.
-// Deliberately trivial (24 bytes, no allocation) so it never lands in std::function.
-struct SlotCancelFn {
-  void (*cancel)(void* table, uint64_t correlation_id) noexcept {nullptr};
-  void* table {nullptr};
-  uint64_t correlation_id {0};
+// Non-response terminal events share one state transition and one cleanup
+// path. Response remains separate because it carries protobuf/IOBuf payload,
+// but it joins the same finalizer after applying that payload.
+enum class SlotResolutionKind : uint8_t { kCanceled, kTimedOut, kFailed };
 
-  void operator()() const noexcept {
-    if (cancel) {
-      cancel(table, correlation_id);
-    }
+struct SlotResolution {
+  SlotResolutionKind kind;
+  int error_code;
+  std::string_view error_message;
+
+  static SlotResolution Canceled(std::string_view message = "RPC call canceled") {
+    return {SlotResolutionKind::kCanceled, RPC_ECANCELED, message};
+  }
+  static SlotResolution TimedOut(std::string_view message = "RPC call timed out") {
+    return {SlotResolutionKind::kTimedOut, RPC_ETIMEOUT, message};
+  }
+  static SlotResolution Failed(int error_code, std::string_view message) {
+    return {SlotResolutionKind::kFailed, error_code, message};
   }
 };
-
-// Storage for a slot's cancellation registration. Owned by the CALLER (coroutine frame or the
-// stack of a blocking call), never by the slot: the slot is recycled by whichever thread resolves
-// it, so a callback living there would be concurrently constructed and destroyed.
-using SlotStopCallback = std::optional<std::stop_callback<SlotCancelFn>>;
 
 // Align to 64 bytes (1 CPU Cache Line) to prevent false sharing under high concurrency
 struct alignas(ant_server::constants::kCacheLineSize) CallSlot {
@@ -100,6 +101,31 @@ struct alignas(ant_server::constants::kCacheLineSize) CallSlot {
 };
 
 static_assert(sizeof(CallSlot) == 64, "CallSlot must stay within a single cache line");
+
+// NotifyOnCancel is user code, so it follows the same worker-executor rule as
+// the RPC continuation. The wrapper owns itself and never touches Controller
+// after invoking the closure: user code may destroy that controller.
+struct NotifyThenContinueTask final : TaskNode {
+  NotifyThenContinueTask(google::protobuf::Closure* notify, TaskNode* continuation)
+      : notify_(notify), continuation_(continuation) {
+    execute = [](TaskNode* self) noexcept {
+      auto* task = static_cast<NotifyThenContinueTask*>(self);
+      google::protobuf::Closure* notify = task->notify_;
+      TaskNode* continuation = task->continuation_;
+      delete task;
+      if (notify != nullptr) {
+        notify->Run();
+      }
+      if (continuation != nullptr) {
+        continuation->run();
+      }
+    };
+  }
+
+ private:
+  google::protobuf::Closure* notify_;
+  TaskNode* continuation_;
+};
 
 template <size_t Capacity = 65536>
 class SlotTable {
@@ -171,7 +197,7 @@ class SlotTable {
       uint32_t expected = static_cast<uint32_t>(SlotState::ARMING);
       if (slot->state.compare_exchange_strong(expected, static_cast<uint32_t>(SlotState::FAILED),
                                               std::memory_order_acq_rel)) {
-        FinishFailure(*slot, correlation_id, failure_code, failure_message);
+        ApplyFailureAndFinalize(*slot, correlation_id, SlotResolution::Failed(failure_code, failure_message));
         return PublishOutcome::kFailed;
       }
       return PublishOutcome::kInvalid;
@@ -184,7 +210,7 @@ class SlotTable {
         expected = static_cast<uint32_t>(SlotState::IN_FLIGHT);
         if (slot->state.compare_exchange_strong(expected, static_cast<uint32_t>(SlotState::FAILED),
                                                 std::memory_order_acq_rel)) {
-          FinishFailure(*slot, correlation_id, failure_code, failure_message);
+          ApplyFailureAndFinalize(*slot, correlation_id, SlotResolution::Failed(failure_code, failure_message));
           return PublishOutcome::kFailed;
         }
         return PublishOutcome::kInvalid;
@@ -193,19 +219,9 @@ class SlotTable {
     }
 
     UnregisterPublishedSlot(correlation_id);
-    if (expected == static_cast<uint32_t>(SlotState::CANCEL_PENDING)) {
-      expected = static_cast<uint32_t>(SlotState::CANCEL_PENDING);
-      if (slot->state.compare_exchange_strong(expected, static_cast<uint32_t>(SlotState::CANCELED),
-                                              std::memory_order_acq_rel)) {
-        FinishFailure(*slot, correlation_id, RPC_ECANCELED, "RPC call canceled via stop_token");
-        return PublishOutcome::kCanceled;
-      }
-    } else if (expected == static_cast<uint32_t>(SlotState::TIMEOUT_PENDING)) {
-      expected = static_cast<uint32_t>(SlotState::TIMEOUT_PENDING);
-      if (slot->state.compare_exchange_strong(expected, static_cast<uint32_t>(SlotState::TIMED_OUT),
-                                              std::memory_order_acq_rel)) {
-        FinishFailure(*slot, correlation_id, RPC_ETIMEOUT, "RPC call timed out");
-        return PublishOutcome::kTimedOut;
+    if (const auto pending = PendingResolution(static_cast<SlotState>(expected)); pending.has_value()) {
+      if (TransitionAndFinalize(*slot, correlation_id, static_cast<SlotState>(expected), *pending)) {
+        return pending->kind == SlotResolutionKind::kCanceled ? PublishOutcome::kCanceled : PublishOutcome::kTimedOut;
       }
     }
     return PublishOutcome::kInvalid;
@@ -230,12 +246,6 @@ class SlotTable {
     }
     PushFreeSlot(GetSlotId(correlation_id));
     return true;
-  }
-
-  // Build a cancel functor for caller-owned std::stop_callback storage.
-  SlotCancelFn MakeCancelFn(uint64_t correlation_id) noexcept {
-    return SlotCancelFn {[](void* table, uint64_t cid) noexcept { static_cast<SlotTable*>(table)->CancelSlot(cid); },
-                         this, correlation_id};
   }
 
   // A deadline is installed while the slot is ARMING. A timer that fires
@@ -309,9 +319,8 @@ class SlotTable {
       *slot.raw_resp_body = body_iobuf;
     }
 
-    UnregisterPublishedSlot(correlation_id);
     completed_responses_.fetch_add(1, std::memory_order_relaxed);
-    ReleaseAndDispatch(slot, slot_id);
+    FinalizeSlotAndDispatch(slot, correlation_id, slot_id);
     return ResponseCompletionOutcome::kCompleted;
   }
 
@@ -337,29 +346,18 @@ class SlotTable {
 
   // Timeout slot
   bool TimeoutSlot(uint64_t correlation_id, const std::string& err_msg = "RPC call timed out") {
-    return ResolveFailure(correlation_id, SlotState::TIMED_OUT, RPC_ETIMEOUT, err_msg);
+    return ResolveTerminal(correlation_id, SlotResolution::TimedOut(err_msg), /*defer_while_arming=*/true);
   }
 
-  // Cancel slot on stop_token trigger
-  bool CancelSlot(uint64_t correlation_id, const std::string& err_msg = "RPC call canceled via stop_token") {
-    return ResolveFailure(correlation_id, SlotState::CANCELED, RPC_ECANCELED, err_msg);
+  // Cancellation is requested through RpcController::StartCancel().
+  bool CancelSlot(uint64_t correlation_id, const std::string& err_msg = "RPC call canceled") {
+    return ResolveTerminal(correlation_id, SlotResolution::Canceled(err_msg), /*defer_while_arming=*/true);
   }
 
   // Fails an already-published call for transport and local resource errors.
   // Unlike TimeoutSlot this preserves the supplied error code.
   bool FailSlot(uint64_t correlation_id, int error_code, const std::string& err_msg) {
-    CallSlot* slot_ptr = LookupSlot(correlation_id);
-    if (slot_ptr == nullptr) {
-      return false;
-    }
-    CallSlot& slot = *slot_ptr;
-    uint32_t expected = static_cast<uint32_t>(SlotState::IN_FLIGHT);
-    if (!slot.state.compare_exchange_strong(expected, static_cast<uint32_t>(SlotState::FAILED),
-                                            std::memory_order_acq_rel)) {
-      return false;
-    }
-    FinishFailure(slot, correlation_id, error_code, err_msg);
-    return true;
+    return ResolveTerminal(correlation_id, SlotResolution::Failed(error_code, err_msg), /*defer_while_arming=*/false);
   }
 
   // Fail every published call after a channel-level terminal event. The active
@@ -425,28 +423,72 @@ class SlotTable {
     return &slot;
   }
 
-  // Shared body of TimeoutSlot / CancelSlot. A failure during ARMING is
-  // retained as a pending state; a failure during IN_FLIGHT dispatches now.
-  bool ResolveFailure(uint64_t correlation_id, SlotState target_state, int error_code, const std::string& err_msg) {
+  static SlotState TerminalState(const SlotResolution& resolution) {
+    switch (resolution.kind) {
+      case SlotResolutionKind::kCanceled:
+        return SlotState::CANCELED;
+      case SlotResolutionKind::kTimedOut:
+        return SlotState::TIMED_OUT;
+      case SlotResolutionKind::kFailed:
+        return SlotState::FAILED;
+    }
+    std::terminate();
+  }
+
+  static std::optional<SlotState> PendingState(const SlotResolution& resolution) {
+    switch (resolution.kind) {
+      case SlotResolutionKind::kCanceled:
+        return SlotState::CANCEL_PENDING;
+      case SlotResolutionKind::kTimedOut:
+        return SlotState::TIMEOUT_PENDING;
+      case SlotResolutionKind::kFailed:
+        return std::nullopt;
+    }
+    std::terminate();
+  }
+
+  static std::optional<SlotResolution> PendingResolution(SlotState state) {
+    switch (state) {
+      case SlotState::CANCEL_PENDING:
+        return SlotResolution::Canceled();
+      case SlotState::TIMEOUT_PENDING:
+        return SlotResolution::TimedOut();
+      default:
+        return std::nullopt;
+    }
+  }
+
+  // The single terminal resolver for cancel, timeout, and local/transport
+  // failures. A cancel or timeout that arrives in ARMING records a pending
+  // event; only PublishSlot() may turn that into a dispatched terminal state.
+  bool ResolveTerminal(uint64_t correlation_id, const SlotResolution& resolution, bool defer_while_arming) {
     CallSlot* slot_ptr = LookupSlot(correlation_id);
     if (slot_ptr == nullptr) {
       return false;
     }
     CallSlot& slot = *slot_ptr;
 
-    uint32_t expected = static_cast<uint32_t>(SlotState::ARMING);
-    const SlotState pending_state =
-        target_state == SlotState::CANCELED ? SlotState::CANCEL_PENDING : SlotState::TIMEOUT_PENDING;
-    if (slot.state.compare_exchange_strong(expected, static_cast<uint32_t>(pending_state), std::memory_order_acq_rel)) {
-      return true;  // Accepted; PublishSlot() will dispatch after the safe handoff point.
+    if (defer_while_arming) {
+      const auto pending_state = PendingState(resolution);
+      uint32_t expected = static_cast<uint32_t>(SlotState::ARMING);
+      if (pending_state.has_value() &&
+          slot.state.compare_exchange_strong(expected, static_cast<uint32_t>(*pending_state),
+                                             std::memory_order_acq_rel)) {
+        return true;
+      }
     }
 
-    expected = static_cast<uint32_t>(SlotState::IN_FLIGHT);
-    if (!slot.state.compare_exchange_strong(expected, static_cast<uint32_t>(target_state), std::memory_order_acq_rel)) {
-      return false;  // Another resolver won, or this slot has already been recycled.
-    }
+    return TransitionAndFinalize(slot, correlation_id, SlotState::IN_FLIGHT, resolution);
+  }
 
-    FinishFailure(slot, correlation_id, error_code, err_msg);
+  bool TransitionAndFinalize(CallSlot& slot, uint64_t correlation_id, SlotState expected_state,
+                             const SlotResolution& resolution) {
+    uint32_t expected = static_cast<uint32_t>(expected_state);
+    if (!slot.state.compare_exchange_strong(expected, static_cast<uint32_t>(TerminalState(resolution)),
+                                            std::memory_order_acq_rel)) {
+      return false;
+    }
+    ApplyFailureAndFinalize(slot, correlation_id, resolution);
     return true;
   }
 
@@ -477,28 +519,29 @@ class SlotTable {
     active_calls_.erase(correlation_id);
   }
 
-  void FinishFailure(CallSlot& slot, uint64_t correlation_id, int error_code, std::string_view err_msg) {
+  void ApplyFailureAndFinalize(CallSlot& slot, uint64_t correlation_id, const SlotResolution& resolution) {
     if (slot.controller) {
       slot.controller->ClearActiveSlot(correlation_id);
-      slot.controller->SetFailed(error_code, err_msg);
+      slot.controller->SetFailed(resolution.error_code, resolution.error_message);
       slot.controller->set_latency_us(slot.controller->CalculateElapsedUs());
     }
-    UnregisterPublishedSlot(correlation_id);
-    ReleaseAndDispatch(slot, GetSlotId(correlation_id));
+    FinalizeSlotAndDispatch(slot, correlation_id, GetSlotId(correlation_id));
   }
 
   // Recycle the slot, then hand the continuation to its origin executor.
   // The slot MUST be released before dispatching: once the continuation runs, the coroutine frame
   // owning the TaskNode may already be destroyed, so nothing in `slot` may be read afterwards.
-  void ReleaseAndDispatch(CallSlot& slot, uint32_t slot_id) {
+  void FinalizeSlotAndDispatch(CallSlot& slot, uint64_t correlation_id, uint32_t slot_id) {
     TaskNode* task = slot.task;
     Executor* executor = slot.executor;
+    google::protobuf::Closure* notify = slot.controller ? slot.controller->TakeNotifyOnCompletion() : nullptr;
 
+    UnregisterPublishedSlot(correlation_id);
     CancelDeadlineTimer(slot);
 
     PushFreeSlot(slot_id);
 
-    if (task == nullptr) {
+    if (task == nullptr && notify == nullptr) {
       return;
     }
     // AllocateSlot rejects a null executor. Keep this guard defensive because
@@ -506,7 +549,11 @@ class SlotTable {
     if (executor == nullptr) {
       std::terminate();
     }
-    executor->schedule(task);
+    if (notify != nullptr) {
+      executor->schedule(new NotifyThenContinueTask(notify, task));
+    } else {
+      executor->schedule(task);
+    }
   }
 
   bool TryAcquireLiveSlot(std::size_t limit) {

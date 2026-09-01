@@ -6,7 +6,6 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <stop_token>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -72,9 +71,14 @@ class RpcController : public google::protobuf::RpcController {
     response_headers_.clear();
     request_attachment_.clear();
     response_attachment_.clear();
-    stop_token_ = std::stop_token();
     start_time_ = std::chrono::steady_clock::now();
     latency_us_ = 0;
+    {
+      std::lock_guard<std::mutex> lock(notify_on_cancel_mu_);
+      notify_on_cancel_ = nullptr;
+      notify_registered_ = false;
+      rpc_completed_ = false;
+    }
   }
 
   [[nodiscard]] bool Failed() const override { return failed_; }
@@ -91,17 +95,47 @@ class RpcController : public google::protobuf::RpcController {
       std::lock_guard<std::mutex> lock(active_slot_mu_);
       active_slot = active_slot_;
     }
+    google::protobuf::Closure* notify = TakeNotifyOnCancellation();
     RequestCancel(active_slot);
+    RunNotifyCallback(notify);
   }
 
   void SetFailed(const std::string& reason) override { SetFailed(RPC_EINTERNAL, reason); }
 
   [[nodiscard]] bool IsCanceled() const override {
-    return cancel_requested_.load(std::memory_order_acquire) || stop_token_.stop_requested() ||
-           (failed_ && error_code_ == RPC_ECANCELED);
+    return cancel_requested_.load(std::memory_order_acquire) || (failed_ && error_code_ == RPC_ECANCELED);
   }
 
-  void NotifyOnCancel(google::protobuf::Closure* callback) override { (void)callback; }
+  // Protobuf-compatible semantics: NotifyOnCancel() may be called no more
+  // than once per RPC. The first callback is registered for the current RPC.
+  // It runs exactly once: immediately if cancellation/completion already won,
+  // otherwise on the slot's completion executor before the user continuation.
+  void NotifyOnCancel(google::protobuf::Closure* callback) override {
+    if (callback == nullptr) {
+      return;
+    }
+    bool run_now = false;
+    {
+      std::lock_guard<std::mutex> lock(notify_on_cancel_mu_);
+      if (notify_registered_) {
+        // protobuf requires at most one registration. Run an invalid second
+        // callback immediately rather than silently leaking caller ownership.
+        run_now = true;
+      } else {
+        notify_registered_ = true;
+        if (cancel_requested_.load(std::memory_order_acquire) || rpc_completed_) {
+          run_now = true;
+        } else {
+          notify_on_cancel_ = callback;
+        }
+      }
+    }
+    // Do not invoke user code while holding notify_on_cancel_mu_: Run() may
+    // synchronously destroy or Reset() the controller.
+    if (run_now) {
+      RunNotifyCallback(callback);
+    }
+  }
 
   // --------------------------------------------------------------------------
   // 2. Enhanced Error Management & Codes
@@ -214,9 +248,6 @@ class RpcController : public google::protobuf::RpcController {
   void set_timeout_ms(int64_t timeout_ms) noexcept { timeout_ms_ = timeout_ms; }
   [[nodiscard]] int64_t timeout_ms() const noexcept { return timeout_ms_; }
 
-  void SetStopToken(std::stop_token token) noexcept { stop_token_ = std::move(token); }
-  [[nodiscard]] std::stop_token GetStopToken() const noexcept { return stop_token_; }
-
   // --------------------------------------------------------------------------
   // 9. Performance & Latency Metrics
   // --------------------------------------------------------------------------
@@ -282,6 +313,32 @@ class RpcController : public google::protobuf::RpcController {
     }
   }
 
+  // Called exactly once by SlotTable's winner before it dispatches the user's
+  // normal completion. The returned closure is owned by the caller and must
+  // run before that continuation.
+  google::protobuf::Closure* TakeNotifyOnCompletion() {
+    std::lock_guard<std::mutex> lock(notify_on_cancel_mu_);
+    rpc_completed_ = true;
+    if (notify_on_cancel_ == nullptr) {
+      return nullptr;
+    }
+    return std::exchange(notify_on_cancel_, nullptr);
+  }
+
+  google::protobuf::Closure* TakeNotifyOnCancellation() {
+    std::lock_guard<std::mutex> lock(notify_on_cancel_mu_);
+    if (notify_on_cancel_ == nullptr) {
+      return nullptr;
+    }
+    return std::exchange(notify_on_cancel_, nullptr);
+  }
+
+  static void RunNotifyCallback(google::protobuf::Closure* callback) {
+    if (callback != nullptr) {
+      callback->Run();
+    }
+  }
+
   bool failed_ {false};
   int error_code_ {RPC_SUCCESS};
   std::string error_text_;
@@ -299,11 +356,14 @@ class RpcController : public google::protobuf::RpcController {
   butil::IOBuf response_attachment_;
 
   int64_t timeout_ms_ {-1};
-  std::stop_token stop_token_;
-
   std::atomic<bool> cancel_requested_ {false};
   std::mutex active_slot_mu_;
   std::optional<ActiveSlot> active_slot_;
+
+  std::mutex notify_on_cancel_mu_;
+  google::protobuf::Closure* notify_on_cancel_ {nullptr};
+  bool notify_registered_ {false};
+  bool rpc_completed_ {false};
 
   int64_t latency_us_ {0};
   std::chrono::steady_clock::time_point start_time_ {std::chrono::steady_clock::now()};

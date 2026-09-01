@@ -1,3 +1,8 @@
+#include <atomic>
+#include <barrier>
+#include <cstdlib>
+#include <thread>
+
 #include <gtest/gtest.h>
 
 #include "ant_server/http/parser.hpp"
@@ -17,6 +22,42 @@ TEST(IOBufTest, BasicAppendAndCut) {
   EXPECT_EQ(head.to_string(), "Hello");
   EXPECT_EQ(buf.to_string(), ", butil::IOBuf!");
   EXPECT_EQ(buf.length(), 15);
+}
+
+// butil documents IOBuf as thread-compatible: separate IOBuf objects may
+// share a Block and be destroyed concurrently. Keep this small reproducer
+// separate from RPC so TSAN reports can distinguish an IOBuf implementation
+// issue from an IO-to-worker handoff bug.
+TEST(IOBufTest, SharedUserDataBlockCanBeReleasedFromDifferentThreads) {
+  std::atomic<int> deleter_calls {0};
+  auto* payload = static_cast<char*>(std::malloc(64));
+  ASSERT_NE(payload, nullptr);
+
+  butil::IOBuf source;
+  ASSERT_EQ(source.append_user_data(payload, 64,
+                                    [&deleter_calls](void* data) {
+                                      std::free(data);
+                                      deleter_calls.fetch_add(1, std::memory_order_relaxed);
+                                    }),
+            0);
+  butil::IOBuf first(source);
+  butil::IOBuf second(source);
+  source.clear();
+
+  std::barrier start {3};
+  std::thread first_thread([&] {
+    start.arrive_and_wait();
+    first.clear();
+  });
+  std::thread second_thread([&] {
+    start.arrive_and_wait();
+    second.clear();
+  });
+  start.arrive_and_wait();
+  first_thread.join();
+  second_thread.join();
+
+  EXPECT_EQ(deleter_calls.load(std::memory_order_acquire), 1);
 }
 
 TEST(HttpParserTest, ParseIOBufWithLlhttp) {

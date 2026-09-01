@@ -307,6 +307,42 @@ class RpcChannelTest : public ::testing::Test {
   }
 };
 
+TEST_F(RpcChannelTest, StartCancelAndWireResponseRaceCompletesExactlyOnce) {
+  ant_rpc::RpcChannel channel(client_ctx_);
+  ASSERT_EQ(channel.Init("127.0.0.1", port_), 0);
+  ant_rpc::EchoService_Stub stub(&channel);
+  constexpr int kIterations = 128;
+  for (int iteration = 0; iteration < kIterations; ++iteration) {
+    ant_rpc::EchoRequest request;
+    request.set_message("race-cancel-response");
+    ant_rpc::EchoResponse response;
+    ant_rpc::RpcController controller;
+    std::atomic<int> remaining {1};
+    absl::Notification done;
+    CountdownClosure closure(remaining, done);
+
+    stub.Echo(&controller, &request, &response, &closure);
+    // CallMethod has returned only after it installed the controller's active
+    // slot. The cancel thread now races the normal response arriving through
+    // the IO driver, without reading controller internals concurrently.
+    std::thread cancel_thread([&] { controller.StartCancel(); });
+
+    const bool completed = done.WaitForNotificationWithTimeout(absl::Seconds(3));
+    cancel_thread.join();
+    ASSERT_TRUE(completed);
+
+    EXPECT_TRUE(controller.IsCanceled());
+    EXPECT_EQ(remaining.load(), 0) << "the RPC completion callback must run once";
+    if (controller.Failed()) {
+      EXPECT_EQ(controller.ErrorCode(), ant_rpc::RPC_ECANCELED);
+    } else {
+      EXPECT_EQ(response.message(), "Echo: race-cancel-response");
+    }
+  }
+
+  channel.Close();
+}
+
 TEST_F(RpcChannelTest, ProtobufStubSyncCall) {
   ant_rpc::RpcChannel channel(client_ctx_);
   ASSERT_EQ(channel.Init("127.0.0.1", port_), 0);

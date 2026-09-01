@@ -82,14 +82,14 @@ class TimerKeeper {
     }
 
     TimerEntry* consume_tasks() {
-      TimerEntry* head = nullptr;
-      if (task_head_) {
-        absl::MutexLock lock(&mu_);
-        if (task_head_) {
-          head = task_head_;
-          task_head_ = nullptr;
-          nearest_run_time_ = std::chrono::steady_clock::time_point::max();
-        }
+      // task_head_ is written by producers under mu_. Even an optimistic
+      // pre-lock read races with schedule(), so consume unconditionally under
+      // the bucket lock. Timer registration is not a hot lock-free path.
+      absl::MutexLock lock(&mu_);
+      TimerEntry* head = task_head_;
+      if (head != nullptr) {
+        task_head_ = nullptr;
+        nearest_run_time_ = std::chrono::steady_clock::time_point::max();
       }
       return head;
     }
@@ -201,10 +201,14 @@ class TimerKeeper {
     entry->owns_task_node = owns_task_node;
     entry->canceled.store(false, std::memory_order_relaxed);
 
+    // schedule() publishes entry to the timer thread. It may therefore be
+    // consumed and destroyed before schedule() returns; retain every value
+    // needed below in locals before that publication.
+    const uint64_t timer_id = entry->id;
+    const auto expire_at = entry->expire_at;
     auto res = buckets_[bucket_idx].schedule(entry);
     if (res.earlier) {
-      int64_t expire_us =
-          std::chrono::duration_cast<std::chrono::microseconds>(entry->expire_at.time_since_epoch()).count();
+      int64_t expire_us = std::chrono::duration_cast<std::chrono::microseconds>(expire_at.time_since_epoch()).count();
 
       // Double-checked lock-free comparison against atomic global_nearest_run_time_us_
       // to avoid acquiring global_mu_ under normal ascending timer schedules.
@@ -214,7 +218,7 @@ class TimerKeeper {
           absl::MutexLock lock(&global_mu_);
           if (expire_us < global_nearest_run_time_us_.load(std::memory_order_relaxed)) {
             global_nearest_run_time_us_.store(expire_us, std::memory_order_relaxed);
-            global_nearest_run_time_ = entry->expire_at;
+            global_nearest_run_time_ = expire_at;
             need_signal = true;
           }
         }
@@ -223,7 +227,7 @@ class TimerKeeper {
         }
       }
     }
-    return entry->id;
+    return timer_id;
   }
 
   // --------------------------------------------------------------------------
