@@ -255,6 +255,15 @@ TEST_F(RpcServerTest, BasicEchoCall) {
   EXPECT_FALSE(cntl.Failed());
   EXPECT_EQ(cntl.ErrorCode(), RPC_SUCCESS);
   EXPECT_EQ(resp.message(), "Echo: Hello AntServer RPC!");
+
+  // These are framework metrics: EchoServiceImpl does not perform any manual
+  // instrumentation. HandleRequest and FinalizeInboundCall own the updates.
+  const auto& metrics = server_->metrics();
+  EXPECT_EQ(metrics.requests_total.Value(), 1);
+  EXPECT_EQ(metrics.requests_completed.Value(), 1);
+  EXPECT_EQ(metrics.request_errors.Value(), 0);
+  EXPECT_EQ(metrics.active_in_flight.Value(), 0);
+  EXPECT_EQ(metrics.request_latency.Snapshot().count, 1);
 }
 
 // 2. Custom Business Failure Propagation
@@ -294,6 +303,17 @@ TEST_F(RpcServerTest, MethodNotFound) {
 
   EXPECT_TRUE(cntl.Failed());
   EXPECT_EQ(cntl.ErrorCode(), RPC_ENOMETHOD);
+
+  // A method lookup failure is an RPC-level response, not a transport
+  // failure. The same multiplexed connection must remain usable.
+  ant_rpc::EchoService_Stub stub(&channel_);
+  RpcController echo_controller;
+  ant_rpc::EchoRequest echo_request;
+  ant_rpc::EchoResponse echo_response;
+  echo_request.set_message("after-method-error");
+  stub.Echo(&echo_controller, &echo_request, &echo_response, nullptr);
+  EXPECT_FALSE(echo_controller.Failed()) << echo_controller.ErrorText();
+  EXPECT_EQ(echo_response.message(), "Echo: after-method-error");
 }
 
 // 5. Headers and Attachments Transmission
@@ -541,5 +561,44 @@ TEST(RpcServerServiceTest, LateDoneAfterClientDisconnectIsSafelyDiscarded) {
 
   server.Stop();
   EXPECT_TRUE(server.Join());
+  scheduler.Stop();
+}
+
+TEST(RpcServerLifecycleTest, StopClosesConnectionsButWaitsForRunningService) {
+  RpcServerOptions options;
+  options.graceful_stop_timeout = std::chrono::milliseconds(20);
+  Scheduler scheduler {2, 2};
+  Context& server_context = scheduler.GetIOContext(0);
+  Context& client_context = scheduler.GetIOContext(1);
+  RpcServer server(server_context, 0, butil::IP_ANY, options);
+  auto service = std::make_shared<DeferredDoneEchoService>();
+  ASSERT_TRUE(server.AddService(service));
+  ASSERT_TRUE(server.Start());
+  scheduler.Start();
+
+  RpcChannel channel(client_context);
+  ASSERT_EQ(channel.Init("127.0.0.1", server.GetEndPoint().port), 0);
+  ant_rpc::EchoService_Stub stub(&channel);
+  RpcController controller;
+  ant_rpc::EchoRequest request;
+  ant_rpc::EchoResponse response;
+  request.set_message("finish-after-stop");
+  absl::Notification callback_done;
+  NotifyClosure closure(callback_done);
+  stub.Echo(&controller, &request, &response, &closure);
+  ASSERT_TRUE(service->entered.WaitForNotificationWithTimeout(absl::Seconds(2)));
+
+  server.Stop();
+  EXPECT_EQ(server.status(), RpcServer::Status::kStopping);
+
+  // The graceful deadline closes the transport and unblocks the client, but
+  // must not terminate user code. The service is still waiting on release.
+  ASSERT_TRUE(callback_done.WaitForNotificationWithTimeout(absl::Seconds(2)));
+  EXPECT_TRUE(controller.Failed());
+
+  service->release.Notify();
+  service->Join();
+  EXPECT_TRUE(server.Join());
+  channel.Close();
   scheduler.Stop();
 }

@@ -15,6 +15,7 @@
 #include "ant_server/context/context.hpp"
 #include "ant_server/handler/acceptor.hpp"
 #include "ant_server/rpc/server/server_connection.hpp"
+#include "ant_server/rpc/server/server_metrics.hpp"
 #include "butil/endpoint.h"
 
 namespace ant_server::rpc {
@@ -121,6 +122,7 @@ class RpcServer {
   [[nodiscard]] int GetSocketFd() const noexcept { return server_socket_; }
   [[nodiscard]] const butil::EndPoint& GetEndPoint() const noexcept { return endpoint_; }
   [[nodiscard]] const RpcServerOptions& options() const noexcept { return options_; }
+  [[nodiscard]] const ServerMetrics& metrics() const noexcept { return runtime_->metrics(); }
   [[nodiscard]] Status status() const noexcept {
     absl::MutexLock lock(&lifecycle_mu_);
     return status_;

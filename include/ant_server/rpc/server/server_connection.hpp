@@ -19,6 +19,7 @@
 #include "ant_server/context/context.hpp"
 #include "ant_server/rpc/controller.hpp"
 #include "ant_server/rpc/error_code.hpp"
+#include "ant_server/rpc/server/server_metrics.hpp"
 #include "ant_server/rpc/server/server_options.hpp"
 #include "ant_server/rpc/service_registry.hpp"
 #include "ant_server/type.hpp"
@@ -34,15 +35,19 @@ class ServerRuntime final : public std::enable_shared_from_this<ServerRuntime> {
       : timer_keeper_(context.GetTimerKeeper()), options_(std::move(options)) {}
   bool TryAcquireConnection() noexcept {
     if (!accepting_.load(std::memory_order_acquire)) {
+      metrics_.rejected_connections.Add();
       return false;
     }
     std::size_t current = active_connections_.load(std::memory_order_acquire);
     while (current < options_.max_connections) {
       if (active_connections_.compare_exchange_weak(current, current + 1, std::memory_order_acq_rel,
                                                     std::memory_order_acquire)) {
+        metrics_.accepted_connections.Add();
+        metrics_.active_connections.Add(1);
         return true;
       }
     }
+    metrics_.rejected_connections.Add();
     return false;
   }
   void TrackConnection(const std::shared_ptr<ServerConnection>& connection);
@@ -52,6 +57,7 @@ class ServerRuntime final : public std::enable_shared_from_this<ServerRuntime> {
     while (current < options_.max_in_flight) {
       if (in_flight_.compare_exchange_weak(current, current + 1, std::memory_order_acq_rel,
                                            std::memory_order_acquire)) {
+        metrics_.active_in_flight.Add(1);
         return true;
       }
     }
@@ -59,6 +65,7 @@ class ServerRuntime final : public std::enable_shared_from_this<ServerRuntime> {
   }
   void ReleaseInFlight() noexcept {
     in_flight_.fetch_sub(1, std::memory_order_acq_rel);
+    metrics_.active_in_flight.Add(-1);
     NotifyDrained();
   }
   [[nodiscard]] bool IsAccepting() const noexcept { return accepting_.load(std::memory_order_acquire); }
@@ -68,6 +75,8 @@ class ServerRuntime final : public std::enable_shared_from_this<ServerRuntime> {
     drain_mu_.Await(absl::Condition(this, &ServerRuntime::IsDrained));
   }
   const RpcServerOptions& options() const noexcept { return options_; }
+  [[nodiscard]] ServerMetrics& metrics() noexcept { return metrics_; }
+  [[nodiscard]] const ServerMetrics& metrics() const noexcept { return metrics_; }
 
  private:
   struct InboundDoneClosure;
@@ -86,6 +95,7 @@ class ServerRuntime final : public std::enable_shared_from_this<ServerRuntime> {
   std::atomic<std::size_t> active_connections_ {0};
   std::atomic<std::size_t> in_flight_ {0};
   std::atomic<uint64_t> graceful_stop_timer_id_ {0};
+  ServerMetrics metrics_;
   absl::Mutex connections_mu_;
   std::vector<std::shared_ptr<ServerConnection>> connections_;
   absl::Mutex drain_mu_;
@@ -201,6 +211,7 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
     Executor* executor;
     const std::size_t max_frame_bytes;
     std::atomic<CompletionState> completion {CompletionState::kPending};
+    const std::chrono::steady_clock::time_point received_at {std::chrono::steady_clock::now()};
   };
 
   // The callback is valid until its first successful completion has been
@@ -343,6 +354,7 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
           break;
         }
         if (frame.status != FrameParseStatus::SUCCESS) {
+          self->runtime_->metrics().protocol_errors.Add();
           // A protocol violation is terminal for this TCP connection. Do not
           // wait for another read CQE to make that visible to the peer.
           self->running_.store(false, std::memory_order_release);
@@ -352,6 +364,7 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
           break;
         }
         if (frame.meta.msg_type() != RPC_REQUEST) {
+          self->runtime_->metrics().protocol_errors.Add();
           // A peer may not send a response or an unspecified message type to
           // a server connection. Treat it as a terminal protocol violation.
           self->running_.store(false, std::memory_order_release);
@@ -361,7 +374,7 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
           break;
         }
         self->recv_buffer_.pop_front(frame.total_frame_bytes);
-        self->DispatchRequest(std::move(frame));
+        self->HandleRequest(std::move(frame));
       }
       if (!self->running_.load(std::memory_order_acquire)) {
         break;
@@ -377,8 +390,14 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
     self->outbound_.clear();
     self->TryFinishCloseOnIoThread();
   }
-  void DispatchRequest(FrameParseResult frame) {
+  // The framework's request entry point. It is called only after a complete,
+  // valid RPC_REQUEST frame has been decoded on the connection's IO owner.
+  // All generic server request accounting begins here; individual protobuf
+  // services do not need to add their own transport-level instrumentation.
+  void HandleRequest(FrameParseResult frame) {
+    runtime_->metrics().requests_total.Add();
     if (!runtime_->IsAccepting()) {
+      runtime_->metrics().overloaded_requests.Add();
       butil::IOBuf response;
       if (PackServerErrorResponse(frame, RPC_EOVERLOAD, "RPC server is stopping", response,
                                   runtime_->options().max_frame_bytes)) {
@@ -389,6 +408,7 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
       return;
     }
     if (!runtime_->TryAcquireInFlight()) {
+      runtime_->metrics().overloaded_requests.Add();
       butil::IOBuf response;
       if (PackServerErrorResponse(frame, RPC_EOVERLOAD, "RPC server max_in_flight limit reached", response,
                                   runtime_->options().max_frame_bytes)) {
@@ -525,6 +545,14 @@ inline void ServerConnection::FinalizeInboundCall(std::shared_ptr<InboundCallSta
     wire_response.clear();
   }
 
+  auto& metrics = call->runtime->metrics();
+  metrics.requests_completed.Add();
+  if (call->response_meta.error_code() != RPC_SUCCESS || close_after_completion) {
+    metrics.request_errors.Add();
+  }
+  metrics.request_latency.Record(
+      std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - call->received_at));
+
   call->completion.store(InboundCallState::CompletionState::kFinalized, std::memory_order_release);
   auto runtime = call->runtime;
   if (auto connection = call->connection.lock()) {
@@ -543,6 +571,8 @@ inline void ServerRuntime::ReleaseConnection(const std::shared_ptr<ServerConnect
     std::erase(connections_, connection);
   }
   active_connections_.fetch_sub(1, std::memory_order_acq_rel);
+  metrics_.active_connections.Add(-1);
+  metrics_.closed_connections.Add();
   if (active_connections_.load(std::memory_order_acquire) == 0) {
     CancelGracefulStopTimer();
   }

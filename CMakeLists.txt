@@ -131,6 +131,7 @@ set_tests_properties(rpc_process_e2e PROPERTIES TIMEOUT 20)
 add_executable(unit_tests 
     test/test_read_awaiter_cancel.cpp 
     test/test_iobuf.cpp 
+    test/test_metrics.cpp
     test/test_executor.cpp 
     test/test_resume_on.cpp 
     test/test_sleep.cpp
