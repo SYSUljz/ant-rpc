@@ -31,13 +31,17 @@ int ParsePort(const char* value) {
 
 int main(int argc, char** argv) {
   int requested_port = 0;
+  int requested_admin_port = 0;
   if (argc == 3 && std::string(argv[1]) == "--port") {
     requested_port = ParsePort(argv[2]);
+  } else if (argc == 5 && std::string(argv[1]) == "--port" && std::string(argv[3]) == "--admin-port") {
+    requested_port = ParsePort(argv[2]);
+    requested_admin_port = ParsePort(argv[4]);
   } else if (argc != 1) {
-    std::cerr << "usage: rpc_e2e_server [--port PORT]\n";
+    std::cerr << "usage: rpc_e2e_server [--port PORT --admin-port PORT]\n";
     return 2;
   }
-  if (requested_port < 0) {
+  if (requested_port < 0 || requested_admin_port < 0) {
     std::cerr << "invalid port\n";
     return 2;
   }
@@ -53,13 +57,22 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  ant_rpc::AdminServer admin_server(scheduler.GetIOContext(0), requested_admin_port);
+  if (!admin_server.AddServer("e2e", server) || !admin_server.Start()) {
+    std::cerr << "failed to start admin server: " << errno << '\n';
+    server.Stop();
+    server.Join();
+    return 1;
+  }
+
   scheduler.Start();
-  std::cout << "READY " << server.GetEndPoint().port << std::endl;
+  std::cout << "READY " << server.GetEndPoint().port << " " << admin_server.GetEndPoint().port << std::endl;
 
   // The Python harness owns this process and closes stdin to request orderly
   // shutdown. A production server would instead use its signal/admin path.
   std::string command;
   std::getline(std::cin, command);
+  admin_server.Stop();
   server.Stop();
   server.Join();
   scheduler.Stop();

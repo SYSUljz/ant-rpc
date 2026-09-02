@@ -12,10 +12,20 @@ struct ServerMetrics {
   ant_server::metrics::Counter accepted_connections;
   ant_server::metrics::Counter rejected_connections;
   ant_server::metrics::Counter closed_connections;
-  ant_server::metrics::Counter requests_total;
-  ant_server::metrics::Counter requests_completed;
-  ant_server::metrics::Counter request_errors;
-  ant_server::metrics::Counter overloaded_requests;
+  // A complete, valid RPC_REQUEST frame reached ServerConnection.
+  ant_server::metrics::Counter requests_received;
+  // An InboundCallState was admitted to the business-call lifecycle.
+  ant_server::metrics::Counter calls_started;
+  // An admitted call reached its unique terminal state. This is deliberately
+  // independent of whether its response is later written to the peer.
+  ant_server::metrics::Counter calls_completed;
+  ant_server::metrics::Counter call_errors;
+  // A valid request was rejected before it entered InboundCallState.
+  ant_server::metrics::Counter requests_rejected_overload;
+  // A response was accepted into ServerConnection's serialized write queue.
+  ant_server::metrics::Counter responses_enqueued;
+  // An asynchronous socket write failed after a response was queued.
+  ant_server::metrics::Counter write_errors;
   ant_server::metrics::Counter protocol_errors;
 
   ant_server::metrics::Gauge active_connections;

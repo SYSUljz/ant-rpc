@@ -123,6 +123,11 @@ class RpcServer {
   [[nodiscard]] const butil::EndPoint& GetEndPoint() const noexcept { return endpoint_; }
   [[nodiscard]] const RpcServerOptions& options() const noexcept { return options_; }
   [[nodiscard]] const ServerMetrics& metrics() const noexcept { return runtime_->metrics(); }
+  // Lets an AdminServer retain metrics safely even if this facade is later
+  // destroyed. The metrics remain a snapshot source, not a control channel.
+  [[nodiscard]] std::shared_ptr<const ServerMetrics> metrics_handle() const noexcept {
+    return runtime_->metrics_handle();
+  }
   [[nodiscard]] Status status() const noexcept {
     absl::MutexLock lock(&lifecycle_mu_);
     return status_;

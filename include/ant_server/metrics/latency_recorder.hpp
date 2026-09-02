@@ -61,7 +61,7 @@ class LatencyRecorder {
                                 ? std::numeric_limits<uint64_t>::max()
                                 : current + latency;
       if (total_microseconds_.compare_exchange_weak(current, next, std::memory_order_relaxed,
-                                                     std::memory_order_relaxed)) {
+                                                    std::memory_order_relaxed)) {
         return;
       }
     }
@@ -69,17 +69,15 @@ class LatencyRecorder {
 
   void UpdateMin(uint64_t latency) noexcept {
     uint64_t current = min_microseconds_.load(std::memory_order_relaxed);
-    while (latency < current &&
-           !min_microseconds_.compare_exchange_weak(current, latency, std::memory_order_relaxed,
-                                                    std::memory_order_relaxed)) {
+    while (latency < current && !min_microseconds_.compare_exchange_weak(current, latency, std::memory_order_relaxed,
+                                                                         std::memory_order_relaxed)) {
     }
   }
 
   void UpdateMax(uint64_t latency) noexcept {
     uint64_t current = max_microseconds_.load(std::memory_order_relaxed);
-    while (latency > current &&
-           !max_microseconds_.compare_exchange_weak(current, latency, std::memory_order_relaxed,
-                                                    std::memory_order_relaxed)) {
+    while (latency > current && !max_microseconds_.compare_exchange_weak(current, latency, std::memory_order_relaxed,
+                                                                         std::memory_order_relaxed)) {
     }
   }
 

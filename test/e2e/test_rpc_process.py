@@ -54,7 +54,7 @@ def non_request_frame() -> bytes:
     return wire_header(meta_len=len(meta)) + meta
 
 
-def read_ready(server: subprocess.Popen[str]) -> int:
+def read_ready(server: subprocess.Popen[str]) -> tuple[int, int]:
     if server.stdout is None:
         raise RuntimeError("server stdout is not piped")
     selector = selectors.DefaultSelector()
@@ -65,8 +65,8 @@ def read_ready(server: subprocess.Popen[str]) -> int:
             if not selector.select(max(0.0, deadline - time.monotonic())):
                 continue
             parts = server.stdout.readline().split()
-            if len(parts) == 2 and parts[0] == "READY" and parts[1].isdigit():
-                return int(parts[1])
+            if len(parts) == 3 and parts[0] == "READY" and parts[1].isdigit() and parts[2].isdigit():
+                return int(parts[1]), int(parts[2])
     finally:
         selector.close()
     raise RuntimeError("server did not announce READY")
@@ -171,6 +171,30 @@ def verify_client_rejects_bad_response(client_path: str, name: str, response: by
         raise RuntimeError(f"client accepted malformed {name} response")
 
 
+def read_metrics(admin_port: int) -> str:
+    with socket.create_connection(("127.0.0.1", admin_port), timeout=3) as connection:
+        connection.settimeout(3)
+        connection.sendall(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        response = bytearray()
+        while True:
+            chunk = connection.recv(4096)
+            if not chunk:
+                break
+            response.extend(chunk)
+    header, separator, body = bytes(response).partition(b"\r\n\r\n")
+    if not separator or not header.startswith(b"HTTP/1.1 200 OK"):
+        raise RuntimeError(f"admin server returned invalid /metrics response: {bytes(response)!r}")
+    return body.decode("utf-8")
+
+
+def metric_value(metrics: str, name: str) -> int:
+    prefix = f'{name}{{server="e2e"}} '
+    for line in metrics.splitlines():
+        if line.startswith(prefix):
+            return int(line[len(prefix):])
+    raise RuntimeError(f"missing metric {name} in /metrics output")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--server", required=True)
@@ -180,7 +204,22 @@ def main() -> int:
                               stderr=subprocess.PIPE, text=True)
     failure: str | None = None
     try:
-        port = read_ready(server)
+        port, admin_port = read_ready(server)
+        # Large enough to exercise connection reuse, concurrent channels and
+        # repeated slot allocation, while remaining suitable for normal CTest.
+        random_requests = 1000
+        random_client = subprocess.run(
+            [args.client, "127.0.0.1", str(port), "--requests", str(random_requests), "--threads", "4", "--seed", "20260902"],
+            text=True, capture_output=True, timeout=15)
+        if random_client.returncode != 0:
+            raise RuntimeError(f"random client failed:\nstdout:\n{random_client.stdout}\nstderr:\n{random_client.stderr}")
+        metrics = read_metrics(admin_port)
+        if metric_value(metrics, "ant_rpc_server_requests_received_total") != random_requests:
+            raise RuntimeError("/metrics request total does not match completed random client workload")
+        if metric_value(metrics, "ant_rpc_server_calls_completed_total") != random_requests:
+            raise RuntimeError("/metrics completed total does not match random client workload")
+        if metric_value(metrics, "ant_rpc_server_call_errors_total") != 0:
+            raise RuntimeError("/metrics reported an unexpected request error")
         malformed = {
             "magic": wire_header(magic=b"NOPE"),
             "version": wire_header(flags=0x02000000),

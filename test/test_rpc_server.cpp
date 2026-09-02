@@ -7,7 +7,10 @@
 #include <vector>
 
 #include <absl/synchronization/notification.h>
+#include <arpa/inet.h>
 #include <gtest/gtest.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 
 #include "ant_server/context/context.hpp"
 #include "ant_server/rpc/channel.hpp"
@@ -259,11 +262,71 @@ TEST_F(RpcServerTest, BasicEchoCall) {
   // These are framework metrics: EchoServiceImpl does not perform any manual
   // instrumentation. HandleRequest and FinalizeInboundCall own the updates.
   const auto& metrics = server_->metrics();
-  EXPECT_EQ(metrics.requests_total.Value(), 1);
-  EXPECT_EQ(metrics.requests_completed.Value(), 1);
-  EXPECT_EQ(metrics.request_errors.Value(), 0);
+  EXPECT_EQ(metrics.requests_received.Value(), 1);
+  EXPECT_EQ(metrics.calls_started.Value(), 1);
+  EXPECT_EQ(metrics.calls_completed.Value(), 1);
+  EXPECT_EQ(metrics.call_errors.Value(), 0);
+  EXPECT_EQ(metrics.responses_enqueued.Value(), 1);
   EXPECT_EQ(metrics.active_in_flight.Value(), 0);
   EXPECT_EQ(metrics.request_latency.Snapshot().count, 1);
+}
+
+TEST(AdminServerTest, ServesRpcMetricsOnTheSameContext) {
+  Scheduler scheduler {1, 2};
+  Context& rpc_context = scheduler.GetIOContext(0);
+  Context& client_context = scheduler.GetIOContext(1);
+  RpcServer rpc_server(rpc_context, 0);
+  auto service = std::make_shared<EchoServiceImpl>();
+  ASSERT_TRUE(rpc_server.AddService(service));
+  ASSERT_TRUE(rpc_server.Start());
+
+  // The admin listener is a separate protocol endpoint, but deliberately
+  // shares the RPC listener's Context and thus its IO thread.
+  AdminServer admin_server(rpc_context);
+  ASSERT_TRUE(admin_server.AddServer("echo", rpc_server));
+  ASSERT_TRUE(admin_server.Start());
+  scheduler.Start();
+
+  RpcChannel channel(client_context);
+  ASSERT_EQ(channel.Init("127.0.0.1", rpc_server.GetEndPoint().port), 0);
+  ant_rpc::EchoService_Stub stub(&channel);
+  RpcController controller;
+  ant_rpc::EchoRequest request;
+  ant_rpc::EchoResponse response;
+  request.set_message("metrics");
+  stub.Echo(&controller, &request, &response, nullptr);
+  ASSERT_FALSE(controller.Failed()) << controller.ErrorText();
+
+  const int metrics_fd = socket(AF_INET, SOCK_STREAM, 0);
+  ASSERT_GE(metrics_fd, 0);
+  struct sockaddr_in address {};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(admin_server.GetEndPoint().port);
+  ASSERT_EQ(inet_pton(AF_INET, "127.0.0.1", &address.sin_addr), 1);
+  ASSERT_EQ(connect(metrics_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
+  constexpr std::string_view kRequest = "GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n";
+  ASSERT_EQ(send(metrics_fd, kRequest.data(), kRequest.size(), 0), static_cast<ssize_t>(kRequest.size()));
+
+  std::string wire_response;
+  char buffer[1024];
+  while (true) {
+    const ssize_t bytes = recv(metrics_fd, buffer, sizeof(buffer), 0);
+    if (bytes <= 0) {
+      break;
+    }
+    wire_response.append(buffer, static_cast<std::size_t>(bytes));
+  }
+  close(metrics_fd);
+
+  EXPECT_NE(wire_response.find("HTTP/1.1 200 OK"), std::string::npos);
+  EXPECT_NE(wire_response.find("ant_rpc_server_requests_received_total{server=\"echo\"} 1"), std::string::npos);
+  EXPECT_NE(wire_response.find("ant_rpc_server_active_in_flight{server=\"echo\"} 0"), std::string::npos);
+
+  channel.Close();
+  admin_server.Stop();
+  rpc_server.Stop();
+  EXPECT_TRUE(rpc_server.Join());
+  scheduler.Stop();
 }
 
 // 2. Custom Business Failure Propagation
@@ -436,6 +499,14 @@ TEST(RpcServerOptionsTest, MaxInFlightReturnsOverloadWithoutBlockingReceiveLoop)
   ASSERT_TRUE(first_done.WaitForNotificationWithTimeout(absl::Seconds(2)));
   EXPECT_FALSE(first_controller.Failed()) << first_controller.ErrorText();
   EXPECT_EQ(first_response.message(), "Echo: first");
+
+  const auto& metrics = server.metrics();
+  EXPECT_EQ(metrics.requests_received.Value(), 2);
+  EXPECT_EQ(metrics.calls_started.Value(), 1);
+  EXPECT_EQ(metrics.calls_completed.Value(), 1);
+  EXPECT_EQ(metrics.requests_rejected_overload.Value(), 1);
+  EXPECT_EQ(metrics.responses_enqueued.Value(), 2);
+  EXPECT_EQ(metrics.call_errors.Value(), 0);
 
   channel.Close();
   server.Stop();
