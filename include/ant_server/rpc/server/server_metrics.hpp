@@ -30,6 +30,11 @@ struct ServerMetrics {
 
   ant_server::metrics::Gauge active_connections;
   ant_server::metrics::Gauge active_in_flight;
+  // Accepted service tasks which have not begun worker execution yet.
+  ant_server::metrics::Gauge pending_worker_tasks;
+  // Bytes retained in connection command mailboxes, outbound queues, or an
+  // active partial write. This is the aggregate of per-connection reserves.
+  ant_server::metrics::Gauge outbound_bytes;
 
   ant_server::metrics::LatencyRecorder request_latency;
 };

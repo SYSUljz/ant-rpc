@@ -70,6 +70,21 @@ class ServerRuntime final : public std::enable_shared_from_this<ServerRuntime> {
     metrics_->active_in_flight.Add(-1);
     NotifyDrained();
   }
+  bool TryAcquireWorkerTask() noexcept {
+    std::size_t current = pending_worker_tasks_.load(std::memory_order_acquire);
+    while (current < options_.max_pending_worker_tasks) {
+      if (pending_worker_tasks_.compare_exchange_weak(current, current + 1, std::memory_order_acq_rel,
+                                                      std::memory_order_acquire)) {
+        metrics_->pending_worker_tasks.Add(1);
+        return true;
+      }
+    }
+    return false;
+  }
+  void ReleaseWorkerTask() noexcept {
+    pending_worker_tasks_.fetch_sub(1, std::memory_order_acq_rel);
+    metrics_->pending_worker_tasks.Add(-1);
+  }
   [[nodiscard]] bool IsAccepting() const noexcept { return accepting_.load(std::memory_order_acquire); }
   void BeginGracefulStop();
   void WaitForDrained() {
@@ -97,6 +112,7 @@ class ServerRuntime final : public std::enable_shared_from_this<ServerRuntime> {
   std::atomic<bool> accepting_ {true};
   std::atomic<std::size_t> active_connections_ {0};
   std::atomic<std::size_t> in_flight_ {0};
+  std::atomic<std::size_t> pending_worker_tasks_ {0};
   std::atomic<uint64_t> graceful_stop_timer_id_ {0};
   std::shared_ptr<ServerMetrics> metrics_;
   absl::Mutex connections_mu_;
@@ -128,14 +144,13 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
     butil::IOBuf buffer;
   };
   struct ServerCommand {
-    enum class Type : uint8_t { kStart, kSendResponse, kCompleteInbound, kClose };
+    enum class Type : uint8_t { kStart, kCompleteInbound, kClose };
     Type type;
     OutboundFrame frame {};
     std::shared_ptr<InboundCallState> inbound_call {};
     bool close_after_completion {false};
 
     static ServerCommand Start() { return {Type::kStart, {}}; }
-    static ServerCommand SendResponse(OutboundFrame frame) { return {Type::kSendResponse, std::move(frame)}; }
     static ServerCommand CompleteInbound(std::shared_ptr<InboundCallState> call, OutboundFrame frame,
                                          bool close_after_completion) {
       return {Type::kCompleteInbound, std::move(frame), std::move(call), close_after_completion};
@@ -150,11 +165,6 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
         runtime_(std::move(runtime)),
         idle_timeout_(runtime_->options().idle_timeout) {}
   void Start() { PostCommand(ServerCommand::Start()); }
-  void EnqueueResponse(butil::IOBuf response) {
-    if (!response.empty()) {
-      PostCommand(ServerCommand::SendResponse({std::move(response)}));
-    }
-  }
   void RequestClose() {
     if (running_.exchange(false, std::memory_order_acq_rel)) {
       PostCommand(ServerCommand::Close());
@@ -167,13 +177,6 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
       switch (command.type) {
         case ServerCommand::Type::kStart:
           StartOnIoThread();
-          break;
-        case ServerCommand::Type::kSendResponse:
-          if (running_.load(std::memory_order_acquire) && !command.frame.buffer.empty()) {
-            outbound_.push_back(std::move(command.frame));
-            runtime_->metrics().responses_enqueued.Add();
-            StartNextWriteOnIoThread();
-          }
           break;
         case ServerCommand::Type::kCompleteInbound:
           CompleteInboundOnIoThread(std::move(command.inbound_call), std::move(command.frame),
@@ -255,8 +258,13 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
         : call(std::move(call)), registry(&registry) {
       execute = [](TaskNode* task) noexcept {
         auto* self = static_cast<ServerDispatchTask*>(task);
-        ServerConnection::RunInboundCall(std::move(self->call), *self->registry);
+        auto call = std::move(self->call);
+        auto* registry = self->registry;
         delete self;
+        // This task has left the executor queue. It is now represented by the
+        // in-flight call lifecycle until its done closure finalizes it.
+        call->runtime->ReleaseWorkerTask();
+        ServerConnection::RunInboundCall(std::move(call), *registry);
       };
     }
 
@@ -274,8 +282,10 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
                                  bool close_after_completion) {
     if (call) {
       std::erase(inbound_calls_, call);
+      --in_flight_calls_;
     }
     if (close_after_completion) {
+      ReleaseFrameReservation(response);
       running_.store(false, std::memory_order_release);
       BeginCloseOnIoThread();
       return;
@@ -284,8 +294,41 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
       outbound_.push_back(std::move(response));
       runtime_->metrics().responses_enqueued.Add();
       StartNextWriteOnIoThread();
+    } else {
+      ReleaseFrameReservation(response);
     }
     TryFinishCloseOnIoThread();
+  }
+  // HandleRequest already runs on the IO owner. Putting its immediately
+  // available overload response back through the MPSC mailbox would require
+  // a later CQE merely to begin the write, so append it directly instead.
+  void EnqueueResponseOnIoThread(butil::IOBuf response) {
+    if (response.empty()) {
+      return;
+    }
+    if (!TryReserveOutboundBytes(response.size())) {
+      RequestClose();
+      return;
+    }
+    if (!running_.load(std::memory_order_acquire)) {
+      OutboundFrame frame {std::move(response)};
+      ReleaseFrameReservation(frame);
+      return;
+    }
+    outbound_.push_back({std::move(response)});
+    runtime_->metrics().responses_enqueued.Add();
+    StartNextWriteOnIoThread();
+  }
+  // The request has already passed framing validation, so rejection remains a
+  // normal RPC response whenever it fits the configured wire limits. A
+  // packing failure means the connection cannot produce a safe reply.
+  void SendErrorResponseOnIoThread(const FrameParseResult& request, int error_code, const char* error_text) {
+    butil::IOBuf response;
+    if (!PackServerErrorResponse(request, error_code, error_text, response, runtime_->options().max_frame_bytes)) {
+      RequestClose();
+      return;
+    }
+    EnqueueResponseOnIoThread(std::move(response));
   }
   void StartOnIoThread() {
     if (!running_.load(std::memory_order_acquire)) {
@@ -301,7 +344,7 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
     if (const int socket = fd(); socket >= 0) {
       context_.UseService<IOuringSocketService>().SubmitShutdown(socket, SHUT_RDWR, /*is_fixed=*/true);
     }
-    outbound_.clear();
+    DiscardQueuedOutboundOnIoThread();
     if (!receiver_started_) {
       receiver_exited_ = true;
     }
@@ -330,6 +373,41 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
     OutboundFrame frame = std::move(outbound_.front());
     outbound_.pop_front();
     WriteFrame(shared_from_this(), std::move(frame));
+  }
+  bool TryReserveOutboundBytes(std::size_t bytes) noexcept {
+    if (bytes == 0 || !running_.load(std::memory_order_acquire)) {
+      return bytes == 0;
+    }
+    const std::size_t limit = runtime_->options().max_outbound_bytes_per_connection;
+    if (bytes > limit) {
+      return false;
+    }
+    std::size_t current = reserved_outbound_bytes_.load(std::memory_order_acquire);
+    while (current <= limit - bytes) {
+      if (reserved_outbound_bytes_.compare_exchange_weak(current, current + bytes, std::memory_order_acq_rel,
+                                                         std::memory_order_acquire)) {
+        runtime_->metrics().outbound_bytes.Add(static_cast<int64_t>(bytes));
+        return true;
+      }
+    }
+    return false;
+  }
+  void ReleaseOutboundBytes(std::size_t bytes) noexcept {
+    if (bytes == 0) {
+      return;
+    }
+    reserved_outbound_bytes_.fetch_sub(bytes, std::memory_order_acq_rel);
+    runtime_->metrics().outbound_bytes.Add(-static_cast<int64_t>(bytes));
+  }
+  void ReleaseFrameReservation(OutboundFrame& frame) noexcept {
+    ReleaseOutboundBytes(frame.buffer.size());
+    frame.buffer.clear();
+  }
+  void DiscardQueuedOutboundOnIoThread() noexcept {
+    while (!outbound_.empty()) {
+      ReleaseFrameReservation(outbound_.front());
+      outbound_.pop_front();
+    }
   }
   void ArmIdleTimerOnIoThread() {
     if (idle_timeout_.count() <= 0 || !running_.load(std::memory_order_acquire)) {
@@ -392,7 +470,7 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
     }
     self->running_.store(false, std::memory_order_release);
     self->receiver_exited_ = true;
-    self->outbound_.clear();
+    self->DiscardQueuedOutboundOnIoThread();
     self->TryFinishCloseOnIoThread();
   }
   // The framework's request entry point. It is called only after a complete,
@@ -403,29 +481,30 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
     runtime_->metrics().requests_received.Add();
     if (!runtime_->IsAccepting()) {
       runtime_->metrics().requests_rejected_overload.Add();
-      butil::IOBuf response;
-      if (PackServerErrorResponse(frame, RPC_EOVERLOAD, "RPC server is stopping", response,
-                                  runtime_->options().max_frame_bytes)) {
-        EnqueueResponse(std::move(response));
-      } else {
-        RequestClose();
-      }
+      SendErrorResponseOnIoThread(frame, RPC_EOVERLOAD, "RPC server is stopping");
+      return;
+    }
+    if (in_flight_calls_ >= runtime_->options().max_in_flight_per_connection) {
+      runtime_->metrics().requests_rejected_overload.Add();
+      SendErrorResponseOnIoThread(frame, RPC_EOVERLOAD, "RPC connection max_in_flight limit reached");
       return;
     }
     if (!runtime_->TryAcquireInFlight()) {
       runtime_->metrics().requests_rejected_overload.Add();
-      butil::IOBuf response;
-      if (PackServerErrorResponse(frame, RPC_EOVERLOAD, "RPC server max_in_flight limit reached", response,
-                                  runtime_->options().max_frame_bytes)) {
-        EnqueueResponse(std::move(response));
-      } else {
-        RequestClose();
-      }
+      SendErrorResponseOnIoThread(frame, RPC_EOVERLOAD, "RPC server max_in_flight limit reached");
+      return;
+    }
+
+    if (!runtime_->TryAcquireWorkerTask()) {
+      runtime_->ReleaseInFlight();
+      runtime_->metrics().requests_rejected_overload.Add();
+      SendErrorResponseOnIoThread(frame, RPC_EOVERLOAD, "RPC worker queue limit reached");
       return;
     }
 
     auto* executor = context_.GetExecutor();
     if (executor == nullptr) {
+      runtime_->ReleaseWorkerTask();
       runtime_->ReleaseInFlight();
       RequestClose();
       return;
@@ -434,6 +513,7 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
                                                    runtime_->options().max_frame_bytes);
     runtime_->metrics().calls_started.Add();
     inbound_calls_.push_back(call);
+    ++in_flight_calls_;
     executor->schedule(new ServerDispatchTask(std::move(call), registry_));
   }
 
@@ -495,7 +575,9 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
         break;
       }
       frame.buffer.pop_front(static_cast<std::size_t>(written));
+      self->ReleaseOutboundBytes(static_cast<std::size_t>(written));
     }
+    self->ReleaseFrameReservation(frame);
     self->writing_ = false;
     self->StartNextWriteOnIoThread();
     self->TryFinishCloseOnIoThread();
@@ -509,6 +591,8 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
   butil::IOBuf recv_buffer_;
   std::vector<std::shared_ptr<InboundCallState>> inbound_calls_;
   std::deque<OutboundFrame> outbound_;
+  std::size_t in_flight_calls_ {0};
+  std::atomic<std::size_t> reserved_outbound_bytes_ {0};
   std::atomic<bool> running_ {true};
   std::atomic<bool> released_ {false};
   std::atomic<uint64_t> idle_generation_ {0};
@@ -552,6 +636,21 @@ inline void ServerConnection::FinalizeInboundCall(std::shared_ptr<InboundCallSta
     wire_response.clear();
   }
 
+  // Reserve before publishing a completed frame into the MPSC mailbox. The
+  // reservation covers that mailbox, the IO-owner outbound queue and partial
+  // writes, so workers cannot collectively bypass a connection's byte limit.
+  auto connection = call->connection.lock();
+  if (connection && !close_after_completion && !wire_response.empty()) {
+    if (!connection->running_.load(std::memory_order_acquire)) {
+      // The peer has already gone away. The business call still completed; no
+      // response may be queued and no outbound reservation was made.
+      wire_response.clear();
+    } else if (!connection->TryReserveOutboundBytes(wire_response.size())) {
+      close_after_completion = true;
+      wire_response.clear();
+    }
+  }
+
   auto& metrics = call->runtime->metrics();
   metrics.calls_completed.Add();
   if (call->response_meta.error_code() != RPC_SUCCESS || close_after_completion) {
@@ -562,7 +661,7 @@ inline void ServerConnection::FinalizeInboundCall(std::shared_ptr<InboundCallSta
 
   call->completion.store(InboundCallState::CompletionState::kFinalized, std::memory_order_release);
   auto runtime = call->runtime;
-  if (auto connection = call->connection.lock()) {
+  if (connection) {
     connection->CompleteInbound(std::move(call), std::move(wire_response), close_after_completion);
   }
   runtime->ReleaseInFlight();

@@ -84,6 +84,8 @@ class AdminServerState final {
     output << "# TYPE ant_rpc_server_calls_completed_total counter\n";
     output << "# TYPE ant_rpc_server_responses_enqueued_total counter\n";
     output << "# TYPE ant_rpc_server_active_connections gauge\n";
+    output << "# TYPE ant_rpc_server_pending_worker_tasks gauge\n";
+    output << "# TYPE ant_rpc_server_outbound_bytes gauge\n";
     output << "# TYPE ant_rpc_server_request_latency_microseconds summary\n";
     for (const auto& source : snapshot) {
       const std::string label = EscapePrometheusLabel(source.name);
@@ -108,6 +110,8 @@ class AdminServerState final {
       write_counter("ant_rpc_server_protocol_errors_total", source.metrics->protocol_errors.Value());
       write_gauge("ant_rpc_server_active_connections", source.metrics->active_connections.Value());
       write_gauge("ant_rpc_server_active_in_flight", source.metrics->active_in_flight.Value());
+      write_gauge("ant_rpc_server_pending_worker_tasks", source.metrics->pending_worker_tasks.Value());
+      write_gauge("ant_rpc_server_outbound_bytes", source.metrics->outbound_bytes.Value());
       write_counter("ant_rpc_server_request_latency_microseconds_count", latency.count);
       write_counter("ant_rpc_server_request_latency_microseconds_sum", latency.total_microseconds);
       write_counter("ant_rpc_server_request_latency_microseconds_min", latency.min_microseconds);

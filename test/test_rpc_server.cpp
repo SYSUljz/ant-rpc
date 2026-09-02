@@ -62,6 +62,25 @@ class BlockingEchoService final : public ant_rpc::EchoService {
   absl::Notification release;
 };
 
+class QueueSaturatingEchoService final : public ant_rpc::EchoService {
+ public:
+  void Echo(google::protobuf::RpcController*, const ant_rpc::EchoRequest* request, ant_rpc::EchoResponse* response,
+            google::protobuf::Closure* done) override {
+    if (!first_call_started.exchange(true, std::memory_order_acq_rel)) {
+      entered.Notify();
+    }
+    release.WaitForNotification();
+    response->set_message("Echo: " + request->message());
+    if (done) {
+      done->Run();
+    }
+  }
+
+  std::atomic<bool> first_call_started {false};
+  absl::Notification entered;
+  absl::Notification release;
+};
+
 class OutOfOrderEchoService final : public ant_rpc::EchoService {
  public:
   void Echo(google::protobuf::RpcController*, const ant_rpc::EchoRequest* request, ant_rpc::EchoResponse* response,
@@ -198,7 +217,19 @@ TEST(RpcOptionsTest, RejectsInvalidChannelAndServerConfigurations) {
   server_options.max_in_flight = 0;
   EXPECT_FALSE(server_options.IsValid());
   server_options = {};
+  server_options.max_in_flight_per_connection = 0;
+  EXPECT_FALSE(server_options.IsValid());
+  server_options = {};
+  server_options.max_in_flight_per_connection = server_options.max_in_flight + 1;
+  EXPECT_FALSE(server_options.IsValid());
+  server_options = {};
+  server_options.max_pending_worker_tasks = 0;
+  EXPECT_FALSE(server_options.IsValid());
+  server_options = {};
   server_options.max_frame_bytes = kRpcHeaderBytes - 1;
+  EXPECT_FALSE(server_options.IsValid());
+  server_options = {};
+  server_options.max_outbound_bytes_per_connection = kRpcHeaderBytes - 1;
   EXPECT_FALSE(server_options.IsValid());
   server_options = {};
   server_options.graceful_stop_timeout = std::chrono::milliseconds {-1};
@@ -460,9 +491,10 @@ TEST(RpcServerLifecycleTest, ConstructionDoesNotListenAndLifecycleIsExplicit) {
   scheduler.Stop();
 }
 
-TEST(RpcServerOptionsTest, MaxInFlightReturnsOverloadWithoutBlockingReceiveLoop) {
+TEST(RpcServerOptionsTest, MaxInFlightPerConnectionReturnsOverloadWithoutBlockingReceiveLoop) {
   RpcServerOptions options;
-  options.max_in_flight = 1;
+  options.max_in_flight = 2;
+  options.max_in_flight_per_connection = 1;
   // One worker intentionally blocks in the first service. A second worker
   // keeps client completion independent from that server-side business work.
   Scheduler scheduler {2, 2};
@@ -507,6 +539,144 @@ TEST(RpcServerOptionsTest, MaxInFlightReturnsOverloadWithoutBlockingReceiveLoop)
   EXPECT_EQ(metrics.requests_rejected_overload.Value(), 1);
   EXPECT_EQ(metrics.responses_enqueued.Value(), 2);
   EXPECT_EQ(metrics.call_errors.Value(), 0);
+
+  channel.Close();
+  server.Stop();
+  EXPECT_TRUE(server.Join());
+  scheduler.Stop();
+}
+
+TEST(RpcServerOptionsTest, PendingWorkerLimitReturnsOverloadAndBoundsQueue) {
+  RpcServerOptions options;
+  options.max_in_flight = 3;
+  options.max_in_flight_per_connection = 3;
+  options.max_pending_worker_tasks = 1;
+  // The first service call occupies the only worker. The second is allowed to
+  // wait in its queue; the third must produce an overload response instead
+  // of growing that queue without bound.
+  Scheduler scheduler {1, 2};
+  Context& server_context = scheduler.GetIOContext(0);
+  Context& client_context = scheduler.GetIOContext(1);
+  RpcServer server(server_context, 0, butil::IP_ANY, options);
+  auto service = std::make_shared<QueueSaturatingEchoService>();
+  ASSERT_TRUE(server.AddService(service));
+  ASSERT_TRUE(server.Start());
+  scheduler.Start();
+
+  RpcChannel first_channel(client_context);
+  RpcChannel second_channel(client_context);
+  RpcChannel third_channel(client_context);
+  ASSERT_EQ(first_channel.Init("127.0.0.1", server.GetEndPoint().port), 0);
+  ASSERT_EQ(second_channel.Init("127.0.0.1", server.GetEndPoint().port), 0);
+  ASSERT_EQ(third_channel.Init("127.0.0.1", server.GetEndPoint().port), 0);
+  ant_rpc::EchoService_Stub first_stub(&first_channel);
+  ant_rpc::EchoService_Stub second_stub(&second_channel);
+  ant_rpc::EchoService_Stub third_stub(&third_channel);
+
+  ant_rpc::EchoRequest first_request;
+  first_request.set_message("first");
+  ant_rpc::EchoResponse first_response;
+  RpcController first_controller;
+  absl::Notification first_done;
+  NotifyClosure first_closure(first_done);
+  first_stub.Echo(&first_controller, &first_request, &first_response, &first_closure);
+  ASSERT_TRUE(service->entered.WaitForNotificationWithTimeout(absl::Seconds(2)));
+
+  ant_rpc::EchoRequest second_request;
+  second_request.set_message("second");
+  ant_rpc::EchoResponse second_response;
+  RpcController second_controller;
+  absl::Notification second_done;
+  NotifyClosure second_closure(second_done);
+  second_stub.Echo(&second_controller, &second_request, &second_response, &second_closure);
+
+  bool second_is_queued = false;
+  for (int attempt = 0; attempt != 200; ++attempt) {
+    if (server.metrics().pending_worker_tasks.Value() == 1) {
+      second_is_queued = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_TRUE(second_is_queued);
+
+  ant_rpc::EchoRequest third_request;
+  third_request.set_message("third");
+  ant_rpc::EchoResponse third_response;
+  RpcController third_controller;
+  absl::Notification third_done;
+  NotifyClosure third_closure(third_done);
+  third_stub.Echo(&third_controller, &third_request, &third_response, &third_closure);
+
+  // Client continuations share this test's sole worker with the intentionally
+  // blocked service, so the callback itself cannot run until release. The
+  // server must nevertheless reject and queue its wire response immediately.
+  bool overload_response_enqueued = false;
+  for (int attempt = 0; attempt != 200; ++attempt) {
+    if (server.metrics().requests_rejected_overload.Value() == 1 && server.metrics().responses_enqueued.Value() == 1) {
+      overload_response_enqueued = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_TRUE(overload_response_enqueued);
+  EXPECT_EQ(server.metrics().requests_received.Value(), 3);
+  EXPECT_EQ(server.metrics().requests_rejected_overload.Value(), 1);
+
+  service->release.Notify();
+  ASSERT_TRUE(first_done.WaitForNotificationWithTimeout(absl::Seconds(2)));
+  ASSERT_TRUE(second_done.WaitForNotificationWithTimeout(absl::Seconds(2)));
+  ASSERT_TRUE(third_done.WaitForNotificationWithTimeout(absl::Seconds(2)));
+  EXPECT_FALSE(first_controller.Failed()) << first_controller.ErrorText();
+  EXPECT_FALSE(second_controller.Failed()) << second_controller.ErrorText();
+  EXPECT_TRUE(third_controller.Failed());
+  EXPECT_EQ(third_controller.ErrorCode(), RPC_EOVERLOAD);
+  EXPECT_EQ(first_response.message(), "Echo: first");
+  EXPECT_EQ(second_response.message(), "Echo: second");
+  EXPECT_EQ(server.metrics().pending_worker_tasks.Value(), 0);
+  EXPECT_EQ(server.metrics().calls_started.Value(), 2);
+  EXPECT_EQ(server.metrics().calls_completed.Value(), 2);
+  EXPECT_EQ(server.metrics().requests_rejected_overload.Value(), 1);
+
+  first_channel.Close();
+  second_channel.Close();
+  third_channel.Close();
+  server.Stop();
+  EXPECT_TRUE(server.Join());
+  scheduler.Stop();
+}
+
+TEST(RpcServerOptionsTest, OversizedResponseForConnectionOutboundLimitClosesConnection) {
+  RpcServerOptions options;
+  options.max_outbound_bytes_per_connection = kRpcHeaderBytes;
+  Scheduler scheduler {1, 2};
+  Context& server_context = scheduler.GetIOContext(0);
+  Context& client_context = scheduler.GetIOContext(1);
+  RpcServer server(server_context, 0, butil::IP_ANY, options);
+  auto service = std::make_shared<EchoServiceImpl>();
+  ASSERT_TRUE(server.AddService(service));
+  ASSERT_TRUE(server.Start());
+  scheduler.Start();
+
+  RpcChannel channel(client_context);
+  ASSERT_EQ(channel.Init("127.0.0.1", server.GetEndPoint().port), 0);
+  ant_rpc::EchoService_Stub stub(&channel);
+  RpcController controller;
+  ant_rpc::EchoRequest request;
+  ant_rpc::EchoResponse response;
+  request.set_message(std::string(1024, 'x'));
+  stub.Echo(&controller, &request, &response, nullptr);
+
+  // The service can finish, but its complete response cannot be placed in the
+  // per-connection outbound budget. The server closes instead of retaining an
+  // unbounded frame or silently dropping the response.
+  EXPECT_TRUE(controller.Failed());
+  const auto& metrics = server.metrics();
+  EXPECT_EQ(metrics.calls_started.Value(), 1);
+  EXPECT_EQ(metrics.calls_completed.Value(), 1);
+  EXPECT_EQ(metrics.call_errors.Value(), 1);
+  EXPECT_EQ(metrics.responses_enqueued.Value(), 0);
+  EXPECT_EQ(metrics.outbound_bytes.Value(), 0);
 
   channel.Close();
   server.Stop();
