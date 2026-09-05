@@ -1,6 +1,8 @@
+#include <array>
 #include <atomic>
 #include <barrier>
 #include <thread>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -450,6 +452,117 @@ TEST(SlotTableConcurrencyTest, ResponseCancelAndTimeoutRaceCompletesExactlyOnce)
     EXPECT_EQ(winner_count, 1);
     EXPECT_EQ(ran.load(std::memory_order_acquire), 1);
   }
+}
+
+TEST(SlotTableConcurrencyTest, ConcurrentAllocationAndReuseNeverHandsOutOneCellTwice) {
+  constexpr std::size_t kCapacity = 32;
+  constexpr int kThreadCount = 8;
+  constexpr int kIterationsPerThread = 2000;
+
+  ant_server::rpc::SlotTable<kCapacity> slots;
+  std::array<std::atomic<int>, kCapacity> owners {};
+  std::atomic<int> failures {0};
+  std::atomic<int> completions {0};
+  std::barrier start {kThreadCount};
+  std::vector<std::thread> threads;
+  threads.reserve(kThreadCount);
+
+  for (int thread_index = 0; thread_index < kThreadCount; ++thread_index) {
+    threads.emplace_back([&] {
+      ant_server::rpc::RpcController controller;
+      CountingTask task(completions);
+      butil::IOBuf body;
+      start.arrive_and_wait();
+
+      for (int iteration = 0; iteration < kIterationsPerThread; ++iteration) {
+        const uint64_t cid = slots.AllocateSlot(&task, nullptr, &controller, TestContinuationTarget());
+        if (cid == 0) {
+          failures.fetch_add(1, std::memory_order_relaxed);
+          continue;
+        }
+
+        const uint32_t slot_id = ant_server::rpc::SlotTable<kCapacity>::GetSlotId(cid);
+        if (owners[slot_id].fetch_add(1, std::memory_order_acq_rel) != 0) {
+          failures.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (slots.PublishSlot(cid) != ant_server::rpc::PublishOutcome::kInFlight) {
+          failures.fetch_add(1, std::memory_order_relaxed);
+          owners[slot_id].fetch_sub(1, std::memory_order_acq_rel);
+          continue;
+        }
+
+        // CompleteSlot recycles the cell before it returns. Stop considering
+        // this thread its owner just before the terminal transition; the cell
+        // cannot be allocated by another thread until CompleteSlot pushes it
+        // back onto the mutex-protected free list.
+        if (owners[slot_id].fetch_sub(1, std::memory_order_acq_rel) != 1) {
+          failures.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (!slots.CompleteSlot(cid, body)) {
+          failures.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+    });
+  }
+
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  EXPECT_EQ(failures.load(std::memory_order_acquire), 0);
+  EXPECT_EQ(completions.load(std::memory_order_acquire), kThreadCount * kIterationsPerThread);
+  EXPECT_EQ(slots.active_slot_count(), 0U);
+}
+
+TEST(SlotTableTest, StaleTerminalEventsCannotChangeReusedSlotLifecycle) {
+  ant_server::rpc::SlotTable<1> slots;
+  ant_server::rpc::RpcController old_controller;
+  ant_server::rpc::RpcController new_controller;
+  std::atomic<int> old_completions {0};
+  std::atomic<int> new_completions {0};
+  CountingTask old_task(old_completions);
+  CountingTask new_task(new_completions);
+  butil::IOBuf body;
+
+  const uint64_t old_cid = slots.AllocateSlot(&old_task, nullptr, &old_controller, TestContinuationTarget());
+  ASSERT_NE(old_cid, 0);
+  ASSERT_EQ(slots.PublishSlot(old_cid), ant_server::rpc::PublishOutcome::kInFlight);
+  ASSERT_TRUE(slots.CompleteSlot(old_cid, body));
+
+  const uint64_t new_cid = slots.AllocateSlot(&new_task, nullptr, &new_controller, TestContinuationTarget());
+  ASSERT_NE(new_cid, 0);
+  ASSERT_NE(new_cid, old_cid);
+  ASSERT_EQ(ant_server::rpc::SlotTable<1>::GetSlotId(new_cid), ant_server::rpc::SlotTable<1>::GetSlotId(old_cid));
+  ASSERT_EQ(slots.PublishSlot(new_cid), ant_server::rpc::PublishOutcome::kInFlight);
+
+  std::barrier start {4};
+  std::thread stale_timeout([&] {
+    start.arrive_and_wait();
+    for (int i = 0; i < 2000; ++i) {
+      EXPECT_FALSE(slots.TimeoutSlot(old_cid));
+    }
+  });
+  std::thread stale_cancel([&] {
+    start.arrive_and_wait();
+    for (int i = 0; i < 2000; ++i) {
+      EXPECT_FALSE(slots.CancelSlot(old_cid));
+    }
+  });
+  std::thread stale_response([&] {
+    start.arrive_and_wait();
+    for (int i = 0; i < 2000; ++i) {
+      EXPECT_FALSE(slots.CompleteSlot(old_cid, body));
+    }
+  });
+  start.arrive_and_wait();
+  stale_timeout.join();
+  stale_cancel.join();
+  stale_response.join();
+
+  EXPECT_EQ(new_completions.load(std::memory_order_acquire), 0);
+  EXPECT_FALSE(new_controller.Failed());
+  EXPECT_TRUE(slots.CompleteSlot(new_cid, body));
+  EXPECT_EQ(new_completions.load(std::memory_order_acquire), 1);
 }
 
 TEST(SlotTableTest, ConfiguredMaxInFlightBoundsAllocatedSlots) {

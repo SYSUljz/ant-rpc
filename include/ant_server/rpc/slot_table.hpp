@@ -40,6 +40,20 @@ enum class SlotState : uint32_t {
   FAILED = 8,
 };
 
+// Version and state must be observed and changed as one indivisible value.
+// Checking version first and CASing state later leaves a reuse window in
+// which a stale resolver can change the state of a newer call in the same
+// slot.
+constexpr uint64_t PackSlotLifecycle(uint32_t version, SlotState state) noexcept {
+  return (static_cast<uint64_t>(version) << 32) | static_cast<uint32_t>(state);
+}
+
+constexpr uint32_t SlotLifecycleVersion(uint64_t lifecycle) noexcept { return static_cast<uint32_t>(lifecycle >> 32); }
+
+constexpr SlotState SlotLifecycleState(uint64_t lifecycle) noexcept {
+  return static_cast<SlotState>(static_cast<uint32_t>(lifecycle));
+}
+
 // Result of handing an ARMING slot to the resolver side. A pending failure is
 // delivered by PublishSlot itself, never by the thread that requested it.
 enum class PublishOutcome : uint8_t { kInFlight, kCanceled, kTimedOut, kFailed, kInvalid };
@@ -89,8 +103,7 @@ struct SlotResolution {
 
 // Align to 64 bytes (1 CPU Cache Line) to prevent false sharing under high concurrency
 struct alignas(ant_server::constants::kCacheLineSize) CallSlot {
-  std::atomic<uint32_t> version {0};
-  std::atomic<uint32_t> state {static_cast<uint32_t>(SlotState::FREE)};
+  std::atomic<uint64_t> lifecycle {PackSlotLifecycle(0, SlotState::FREE)};
   TaskNode* task {nullptr};
   google::protobuf::Message* response_msg {nullptr};
   RpcController* controller {nullptr};
@@ -139,7 +152,7 @@ class SlotTable {
       slots_[i].next_free = static_cast<uint32_t>(i + 1);
     }
     slots_[Capacity - 1].next_free = INVALID_SLOT;
-    free_head_.store(PackTaggedIndex(0, 0), std::memory_order_relaxed);
+    free_head_ = 0;
   }
 
   ~SlotTable() = default;
@@ -168,8 +181,10 @@ class SlotTable {
     }
 
     CallSlot& slot = slots_[slot_id];
-    // Increment version for ABA protection
-    uint32_t version = slot.version.fetch_add(1, std::memory_order_relaxed) + 1;
+    // PopFreeSlot gives this thread exclusive ownership of the cell. Advance
+    // the generation before publishing ARMING so stale terminal events cannot
+    // act on this reuse.
+    const uint32_t version = SlotLifecycleVersion(slot.lifecycle.load(std::memory_order_relaxed)) + 1;
 
     slot.task = task;
     slot.response_msg = response_msg;
@@ -177,7 +192,7 @@ class SlotTable {
     slot.raw_resp_body = raw_resp_body;
     slot.executor = target.executor;
     slot.deadline_timer_id.store(0, std::memory_order_relaxed);
-    slot.state.store(static_cast<uint32_t>(SlotState::ARMING), std::memory_order_release);
+    slot.lifecycle.store(PackSlotLifecycle(version, SlotState::ARMING), std::memory_order_release);
 
     return MakeCorrelationId(version, slot_id);
   }
@@ -186,7 +201,7 @@ class SlotTable {
   // preparing the frame is retained as *_PENDING and completed here, after the
   // sender's final read of request/controller.
   PublishOutcome PublishSlot(uint64_t correlation_id) {
-    CallSlot* slot = LookupSlot(correlation_id);
+    CallSlot* slot = SlotAt(correlation_id);
     if (slot == nullptr) {
       return PublishOutcome::kInvalid;
     }
@@ -194,22 +209,30 @@ class SlotTable {
     int failure_code = RPC_ECONN_FAILED;
     std::string failure_message;
     if (!RegisterPublishedSlot(correlation_id, &failure_code, &failure_message)) {
-      uint32_t expected = static_cast<uint32_t>(SlotState::ARMING);
-      if (slot->state.compare_exchange_strong(expected, static_cast<uint32_t>(SlotState::FAILED),
-                                              std::memory_order_acq_rel)) {
+      uint64_t expected = PackSlotLifecycle(GetVersion(correlation_id), SlotState::ARMING);
+      if (slot->lifecycle.compare_exchange_strong(
+              expected, PackSlotLifecycle(GetVersion(correlation_id), SlotState::FAILED), std::memory_order_acq_rel)) {
         ApplyFailureAndFinalize(*slot, correlation_id, SlotResolution::Failed(failure_code, failure_message));
         return PublishOutcome::kFailed;
+      }
+      if (SlotLifecycleVersion(expected) == GetVersion(correlation_id)) {
+        if (const auto pending = PendingResolution(SlotLifecycleState(expected));
+            pending.has_value() &&
+            TransitionAndFinalize(*slot, correlation_id, SlotLifecycleState(expected), *pending)) {
+          return pending->kind == SlotResolutionKind::kCanceled ? PublishOutcome::kCanceled : PublishOutcome::kTimedOut;
+        }
       }
       return PublishOutcome::kInvalid;
     }
 
-    uint32_t expected = static_cast<uint32_t>(SlotState::ARMING);
-    if (slot->state.compare_exchange_strong(expected, static_cast<uint32_t>(SlotState::IN_FLIGHT),
-                                            std::memory_order_acq_rel)) {
+    uint64_t expected = PackSlotLifecycle(GetVersion(correlation_id), SlotState::ARMING);
+    if (slot->lifecycle.compare_exchange_strong(
+            expected, PackSlotLifecycle(GetVersion(correlation_id), SlotState::IN_FLIGHT), std::memory_order_acq_rel)) {
       if (TakeConnectionFailure(correlation_id, &failure_code, &failure_message)) {
-        expected = static_cast<uint32_t>(SlotState::IN_FLIGHT);
-        if (slot->state.compare_exchange_strong(expected, static_cast<uint32_t>(SlotState::FAILED),
-                                                std::memory_order_acq_rel)) {
+        expected = PackSlotLifecycle(GetVersion(correlation_id), SlotState::IN_FLIGHT);
+        if (slot->lifecycle.compare_exchange_strong(expected,
+                                                    PackSlotLifecycle(GetVersion(correlation_id), SlotState::FAILED),
+                                                    std::memory_order_acq_rel)) {
           ApplyFailureAndFinalize(*slot, correlation_id, SlotResolution::Failed(failure_code, failure_message));
           return PublishOutcome::kFailed;
         }
@@ -219,8 +242,10 @@ class SlotTable {
     }
 
     UnregisterPublishedSlot(correlation_id);
-    if (const auto pending = PendingResolution(static_cast<SlotState>(expected)); pending.has_value()) {
-      if (TransitionAndFinalize(*slot, correlation_id, static_cast<SlotState>(expected), *pending)) {
+    if (SlotLifecycleVersion(expected) == GetVersion(correlation_id)) {
+      const SlotState observed_state = SlotLifecycleState(expected);
+      if (const auto pending = PendingResolution(observed_state);
+          pending.has_value() && TransitionAndFinalize(*slot, correlation_id, observed_state, *pending)) {
         return pending->kind == SlotResolutionKind::kCanceled ? PublishOutcome::kCanceled : PublishOutcome::kTimedOut;
       }
     }
@@ -231,20 +256,20 @@ class SlotTable {
   // continuation: StartUnaryCall's caller owns that decision for inline
   // failures.
   bool DiscardArmingSlot(uint64_t correlation_id) {
-    CallSlot* slot = LookupSlot(correlation_id);
+    CallSlot* slot = SlotAt(correlation_id);
     if (slot == nullptr) {
       return false;
     }
-    uint32_t expected = static_cast<uint32_t>(SlotState::ARMING);
-    if (!slot->state.compare_exchange_strong(expected, static_cast<uint32_t>(SlotState::TIMED_OUT),
-                                             std::memory_order_acq_rel)) {
+    uint64_t expected = PackSlotLifecycle(GetVersion(correlation_id), SlotState::ARMING);
+    if (!slot->lifecycle.compare_exchange_strong(
+            expected, PackSlotLifecycle(GetVersion(correlation_id), SlotState::TIMED_OUT), std::memory_order_acq_rel)) {
       return false;
     }
     CancelDeadlineTimer(*slot);
     if (slot->controller) {
       slot->controller->ClearActiveSlot(correlation_id);
     }
-    PushFreeSlot(GetSlotId(correlation_id));
+    PushFreeSlot(correlation_id);
     return true;
   }
 
@@ -255,11 +280,15 @@ class SlotTable {
     if (timer_id == 0) {
       return false;
     }
-    CallSlot* slot = LookupSlot(correlation_id);
+    CallSlot* slot = SlotAt(correlation_id);
     if (slot == nullptr) {
       return false;
     }
-    const SlotState state = static_cast<SlotState>(slot->state.load(std::memory_order_acquire));
+    const uint64_t lifecycle = slot->lifecycle.load(std::memory_order_acquire);
+    if (SlotLifecycleVersion(lifecycle) != GetVersion(correlation_id)) {
+      return false;
+    }
+    const SlotState state = SlotLifecycleState(lifecycle);
     if (state != SlotState::ARMING && state != SlotState::CANCEL_PENDING && state != SlotState::TIMEOUT_PENDING) {
       return false;
     }
@@ -278,15 +307,11 @@ class SlotTable {
       return ResponseCompletionOutcome::kUnknownCorrelationId;
     }
     CallSlot& slot = slots_[slot_id];
-    if (slot.version.load(std::memory_order_acquire) != GetVersion(correlation_id)) {
-      late_response_.fetch_add(1, std::memory_order_relaxed);
-      return ResponseCompletionOutcome::kLateResponse;
-    }
-
-    // Atomic CAS transition: IN_FLIGHT -> COMPLETED
-    uint32_t expected = static_cast<uint32_t>(SlotState::IN_FLIGHT);
-    if (!slot.state.compare_exchange_strong(expected, static_cast<uint32_t>(SlotState::COMPLETED),
-                                            std::memory_order_acq_rel)) {
+    // Version and state participate in the same CAS. A delayed response that
+    // observed an older generation can never complete a reused slot.
+    uint64_t expected = PackSlotLifecycle(GetVersion(correlation_id), SlotState::IN_FLIGHT);
+    if (!slot.lifecycle.compare_exchange_strong(
+            expected, PackSlotLifecycle(GetVersion(correlation_id), SlotState::COMPLETED), std::memory_order_acq_rel)) {
       late_response_.fetch_add(1, std::memory_order_relaxed);
       return ResponseCompletionOutcome::kLateResponse;
     }
@@ -320,7 +345,7 @@ class SlotTable {
     }
 
     completed_responses_.fetch_add(1, std::memory_order_relaxed);
-    FinalizeSlotAndDispatch(slot, correlation_id, slot_id);
+    FinalizeSlotAndDispatch(slot, correlation_id);
     return ResponseCompletionOutcome::kCompleted;
   }
 
@@ -402,25 +427,12 @@ class SlotTable {
   }
 
  private:
-  static constexpr uint64_t PackTaggedIndex(uint32_t index, uint32_t tag) {
-    return (static_cast<uint64_t>(tag) << 32) | static_cast<uint64_t>(index);
-  }
-
-  static constexpr uint32_t ExtractIndex(uint64_t tagged) { return static_cast<uint32_t>(tagged & 0xFFFFFFFF); }
-
-  static constexpr uint32_t ExtractTag(uint64_t tagged) { return static_cast<uint32_t>(tagged >> 32); }
-
-  // Bounds + ABA check. Returns nullptr if the correlation_id is stale or out of range.
-  CallSlot* LookupSlot(uint64_t correlation_id) {
+  CallSlot* SlotAt(uint64_t correlation_id) {
     uint32_t slot_id = GetSlotId(correlation_id);
     if (slot_id >= Capacity) {
       return nullptr;
     }
-    CallSlot& slot = slots_[slot_id];
-    if (slot.version.load(std::memory_order_acquire) != GetVersion(correlation_id)) {
-      return nullptr;
-    }
-    return &slot;
+    return &slots_[slot_id];
   }
 
   static SlotState TerminalState(const SlotResolution& resolution) {
@@ -462,7 +474,7 @@ class SlotTable {
   // failures. A cancel or timeout that arrives in ARMING records a pending
   // event; only PublishSlot() may turn that into a dispatched terminal state.
   bool ResolveTerminal(uint64_t correlation_id, const SlotResolution& resolution, bool defer_while_arming) {
-    CallSlot* slot_ptr = LookupSlot(correlation_id);
+    CallSlot* slot_ptr = SlotAt(correlation_id);
     if (slot_ptr == nullptr) {
       return false;
     }
@@ -470,10 +482,10 @@ class SlotTable {
 
     if (defer_while_arming) {
       const auto pending_state = PendingState(resolution);
-      uint32_t expected = static_cast<uint32_t>(SlotState::ARMING);
+      uint64_t expected = PackSlotLifecycle(GetVersion(correlation_id), SlotState::ARMING);
       if (pending_state.has_value() &&
-          slot.state.compare_exchange_strong(expected, static_cast<uint32_t>(*pending_state),
-                                             std::memory_order_acq_rel)) {
+          slot.lifecycle.compare_exchange_strong(
+              expected, PackSlotLifecycle(GetVersion(correlation_id), *pending_state), std::memory_order_acq_rel)) {
         return true;
       }
     }
@@ -483,9 +495,10 @@ class SlotTable {
 
   bool TransitionAndFinalize(CallSlot& slot, uint64_t correlation_id, SlotState expected_state,
                              const SlotResolution& resolution) {
-    uint32_t expected = static_cast<uint32_t>(expected_state);
-    if (!slot.state.compare_exchange_strong(expected, static_cast<uint32_t>(TerminalState(resolution)),
-                                            std::memory_order_acq_rel)) {
+    uint64_t expected = PackSlotLifecycle(GetVersion(correlation_id), expected_state);
+    if (!slot.lifecycle.compare_exchange_strong(
+            expected, PackSlotLifecycle(GetVersion(correlation_id), TerminalState(resolution)),
+            std::memory_order_acq_rel)) {
       return false;
     }
     ApplyFailureAndFinalize(slot, correlation_id, resolution);
@@ -525,13 +538,13 @@ class SlotTable {
       slot.controller->SetFailed(resolution.error_code, resolution.error_message);
       slot.controller->set_latency_us(slot.controller->CalculateElapsedUs());
     }
-    FinalizeSlotAndDispatch(slot, correlation_id, GetSlotId(correlation_id));
+    FinalizeSlotAndDispatch(slot, correlation_id);
   }
 
   // Recycle the slot, then hand the continuation to its origin executor.
   // The slot MUST be released before dispatching: once the continuation runs, the coroutine frame
   // owning the TaskNode may already be destroyed, so nothing in `slot` may be read afterwards.
-  void FinalizeSlotAndDispatch(CallSlot& slot, uint64_t correlation_id, uint32_t slot_id) {
+  void FinalizeSlotAndDispatch(CallSlot& slot, uint64_t correlation_id) {
     TaskNode* task = slot.task;
     Executor* executor = slot.executor;
     google::protobuf::Closure* notify = slot.controller ? slot.controller->TakeNotifyOnCompletion() : nullptr;
@@ -539,7 +552,7 @@ class SlotTable {
     UnregisterPublishedSlot(correlation_id);
     CancelDeadlineTimer(slot);
 
-    PushFreeSlot(slot_id);
+    PushFreeSlot(correlation_id);
 
     if (task == nullptr && notify == nullptr) {
       return;
@@ -570,43 +583,30 @@ class SlotTable {
   void ReleaseLiveSlot() { active_slots_.fetch_sub(1, std::memory_order_acq_rel); }
 
   uint32_t PopFreeSlot() {
-    uint64_t current = free_head_.load(std::memory_order_acquire);
-    while (true) {
-      uint32_t index = ExtractIndex(current);
-      if (index == INVALID_SLOT) {
-        return INVALID_SLOT;
-      }
-      uint32_t tag = ExtractTag(current);
-      uint32_t next = slots_[index].next_free;
-      uint64_t desired = PackTaggedIndex(next, tag + 1);
-
-      if (free_head_.compare_exchange_weak(current, desired, std::memory_order_acq_rel, std::memory_order_acquire)) {
-        return index;
-      }
+    absl::MutexLock lock(&free_list_mu_);
+    if (free_head_ == INVALID_SLOT) {
+      return INVALID_SLOT;
     }
+    const uint32_t index = free_head_;
+    free_head_ = slots_[index].next_free;
+    return index;
   }
 
-  void PushFreeSlot(uint32_t slot_id) {
-    slot_id = slot_id % Capacity;
+  void PushFreeSlot(uint64_t correlation_id) {
+    const uint32_t slot_id = GetSlotId(correlation_id);
     slots_[slot_id].task = nullptr;
     slots_[slot_id].response_msg = nullptr;
     slots_[slot_id].controller = nullptr;
     slots_[slot_id].raw_resp_body = nullptr;
     slots_[slot_id].executor = nullptr;
     slots_[slot_id].deadline_timer_id.store(0, std::memory_order_relaxed);
-    slots_[slot_id].state.store(static_cast<uint32_t>(SlotState::FREE), std::memory_order_release);
+    slots_[slot_id].lifecycle.store(PackSlotLifecycle(GetVersion(correlation_id), SlotState::FREE),
+                                    std::memory_order_release);
     ReleaseLiveSlot();
 
-    uint64_t current = free_head_.load(std::memory_order_acquire);
-    while (true) {
-      uint32_t tag = ExtractTag(current);
-      slots_[slot_id].next_free = ExtractIndex(current);
-      uint64_t desired = PackTaggedIndex(slot_id, tag + 1);
-
-      if (free_head_.compare_exchange_weak(current, desired, std::memory_order_acq_rel, std::memory_order_acquire)) {
-        return;
-      }
-    }
+    absl::MutexLock lock(&free_list_mu_);
+    slots_[slot_id].next_free = free_head_;
+    free_head_ = slot_id;
   }
 
   void CancelDeadlineTimer(CallSlot& slot) {
@@ -617,7 +617,8 @@ class SlotTable {
   }
 
   std::unique_ptr<CallSlot[]> slots_;
-  std::atomic<uint64_t> free_head_ {0};
+  absl::Mutex free_list_mu_;
+  uint32_t free_head_ {0};
   std::atomic<std::size_t> active_slots_ {0};
   TimerKeeper* deadline_timer_keeper_ {nullptr};
   std::atomic<uint64_t> completed_responses_ {0};
