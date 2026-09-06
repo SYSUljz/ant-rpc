@@ -14,6 +14,7 @@
 
 #include <sys/socket.h>
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/synchronization/mutex.h"
 #include "ant_server/awaiter/socket_awaiter.hpp"
 #include "ant_server/context/context.hpp"
@@ -95,6 +96,19 @@ class ServerRuntime final : public std::enable_shared_from_this<ServerRuntime> {
   [[nodiscard]] ServerMetrics& metrics() noexcept { return *metrics_; }
   [[nodiscard]] const ServerMetrics& metrics() const noexcept { return *metrics_; }
   [[nodiscard]] std::shared_ptr<const ServerMetrics> metrics_handle() const noexcept { return metrics_; }
+  // RpcServer calls this only during its kCreated phase. Once Start() makes
+  // requests visible, the map is immutable and worker lookups are lock-free.
+  void RegisterServiceMetrics(const google::protobuf::ServiceDescriptor& service) {
+    for (int index = 0; index < service.method_count(); ++index) {
+      const auto* method = service.method(index);
+      method_metrics_.try_emplace(method, &metrics_->GetOrCreateMethod(*method));
+    }
+  }
+  [[nodiscard]] ServerMethodMetrics* FindMethodMetrics(
+      const google::protobuf::MethodDescriptor& method) const noexcept {
+    const auto iterator = method_metrics_.find(&method);
+    return iterator == method_metrics_.end() ? nullptr : iterator->second;
+  }
 
  private:
   struct InboundDoneClosure;
@@ -115,6 +129,7 @@ class ServerRuntime final : public std::enable_shared_from_this<ServerRuntime> {
   std::atomic<std::size_t> pending_worker_tasks_ {0};
   std::atomic<uint64_t> graceful_stop_timer_id_ {0};
   std::shared_ptr<ServerMetrics> metrics_;
+  absl::flat_hash_map<const google::protobuf::MethodDescriptor*, ServerMethodMetrics*> method_metrics_;
   absl::Mutex connections_mu_;
   std::vector<std::shared_ptr<ServerConnection>> connections_;
   absl::Mutex drain_mu_;
@@ -215,6 +230,7 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
     std::unique_ptr<google::protobuf::Message> response;
     std::unique_ptr<RpcController> controller;
     std::unique_ptr<InboundDoneClosure> done;
+    ServerMethodMetrics* method_metrics {nullptr};
     Executor* executor;
     const std::size_t max_frame_bytes;
     std::atomic<CompletionState> completion {CompletionState::kPending};
@@ -533,6 +549,15 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
     } else {
       call->service = lookup.service;
       call->method = lookup.method;
+      call->method_metrics = call->runtime->FindMethodMetrics(*call->method);
+      // Compatibility helpers may construct ServerRuntime directly without
+      // RpcServer's registration phase. They lazily create the same bounded
+      // descriptor entry; the public RpcServer path never takes this branch.
+      if (call->method_metrics == nullptr) {
+        call->method_metrics = &call->runtime->metrics().GetOrCreateMethod(*call->method);
+      }
+      call->method_metrics->calls_started.Add();
+      call->method_metrics->active_in_flight.Add(1);
       call->request.reset(call->service->GetRequestPrototype(call->method).New());
       call->response.reset(call->service->GetResponsePrototype(call->method).New());
       if (!call->frame.body_iobuf.empty()) {
@@ -652,12 +677,22 @@ inline void ServerConnection::FinalizeInboundCall(std::shared_ptr<InboundCallSta
   }
 
   auto& metrics = call->runtime->metrics();
+  const bool failed = call->response_meta.error_code() != RPC_SUCCESS || close_after_completion;
+  const auto latency =
+      std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - call->received_at);
   metrics.calls_completed.Add();
-  if (call->response_meta.error_code() != RPC_SUCCESS || close_after_completion) {
+  if (failed) {
     metrics.call_errors.Add();
   }
-  metrics.request_latency.Record(
-      std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - call->received_at));
+  metrics.request_latency.Record(latency);
+  if (call->method_metrics != nullptr) {
+    call->method_metrics->calls_completed.Add();
+    if (failed) {
+      call->method_metrics->call_errors.Add();
+    }
+    call->method_metrics->call_latency.Record(latency);
+    call->method_metrics->active_in_flight.Add(-1);
+  }
 
   call->completion.store(InboundCallState::CompletionState::kFinalized, std::memory_order_release);
   auto runtime = call->runtime;

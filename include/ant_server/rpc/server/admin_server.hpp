@@ -87,6 +87,11 @@ class AdminServerState final {
     output << "# TYPE ant_rpc_server_pending_worker_tasks gauge\n";
     output << "# TYPE ant_rpc_server_outbound_bytes gauge\n";
     output << "# TYPE ant_rpc_server_request_latency_microseconds summary\n";
+    output << "# TYPE ant_rpc_server_method_calls_started_total counter\n";
+    output << "# TYPE ant_rpc_server_method_calls_completed_total counter\n";
+    output << "# TYPE ant_rpc_server_method_call_errors_total counter\n";
+    output << "# TYPE ant_rpc_server_method_active_in_flight gauge\n";
+    output << "# TYPE ant_rpc_server_method_call_latency_microseconds summary\n";
     for (const auto& source : snapshot) {
       const std::string label = EscapePrometheusLabel(source.name);
       const auto latency = source.metrics->request_latency.Snapshot();
@@ -116,6 +121,24 @@ class AdminServerState final {
       write_counter("ant_rpc_server_request_latency_microseconds_sum", latency.total_microseconds);
       write_counter("ant_rpc_server_request_latency_microseconds_min", latency.min_microseconds);
       write_counter("ant_rpc_server_request_latency_microseconds_max", latency.max_microseconds);
+      for (const ServerMethodMetrics* method : source.metrics->MethodSnapshot()) {
+        const std::string service_label = EscapePrometheusLabel(method->service_name);
+        const std::string method_label = EscapePrometheusLabel(method->method_name);
+        const std::string labels =
+            "{server=\"" + label + "\",service=\"" + service_label + "\",method=\"" + method_label + "\"} ";
+        const auto method_latency = method->call_latency.Snapshot();
+        output << "ant_rpc_server_method_calls_started_total" << labels << method->calls_started.Value() << '\n';
+        output << "ant_rpc_server_method_calls_completed_total" << labels << method->calls_completed.Value() << '\n';
+        output << "ant_rpc_server_method_call_errors_total" << labels << method->call_errors.Value() << '\n';
+        output << "ant_rpc_server_method_active_in_flight" << labels << method->active_in_flight.Value() << '\n';
+        output << "ant_rpc_server_method_call_latency_microseconds_count" << labels << method_latency.count << '\n';
+        output << "ant_rpc_server_method_call_latency_microseconds_sum" << labels << method_latency.total_microseconds
+               << '\n';
+        output << "ant_rpc_server_method_call_latency_microseconds_min" << labels << method_latency.min_microseconds
+               << '\n';
+        output << "ant_rpc_server_method_call_latency_microseconds_max" << labels << method_latency.max_microseconds
+               << '\n';
+      }
     }
     return output.str();
   }

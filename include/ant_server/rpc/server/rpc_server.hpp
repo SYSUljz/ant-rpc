@@ -42,15 +42,23 @@ class RpcServer {
 
   bool AddService(google::protobuf::Service* service) {
     absl::MutexLock lock(&lifecycle_mu_);
-    return status_ == Status::kCreated && registry_.RegisterService(service);
+    if (status_ != Status::kCreated || !registry_.RegisterService(service)) {
+      return false;
+    }
+    runtime_->RegisterServiceMetrics(*service->GetDescriptor());
+    return true;
   }
   bool AddService(std::shared_ptr<google::protobuf::Service> service) {
     absl::MutexLock lock(&lifecycle_mu_);
     if (status_ != Status::kCreated || !service) {
       return false;
     }
-    owned_services_.push_back(service);
-    return registry_.RegisterService(service.get());
+    if (!registry_.RegisterService(service.get())) {
+      return false;
+    }
+    runtime_->RegisterServiceMetrics(*service->GetDescriptor());
+    owned_services_.push_back(std::move(service));
+    return true;
   }
 
   // Bind/listen and arm accept only after services and options are final.

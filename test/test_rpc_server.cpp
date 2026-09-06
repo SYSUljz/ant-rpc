@@ -302,6 +302,15 @@ TEST_F(RpcServerTest, BasicEchoCall) {
   EXPECT_EQ(metrics.responses_enqueued.Value(), 1);
   EXPECT_EQ(metrics.active_in_flight.Value(), 0);
   EXPECT_EQ(metrics.request_latency.Snapshot().count, 1);
+  const auto method_metrics = metrics.MethodSnapshot();
+  ASSERT_EQ(method_metrics.size(), 1);
+  EXPECT_EQ(method_metrics[0]->service_name, "ant_rpc.EchoService");
+  EXPECT_EQ(method_metrics[0]->method_name, "Echo");
+  EXPECT_EQ(method_metrics[0]->calls_started.Value(), 1);
+  EXPECT_EQ(method_metrics[0]->calls_completed.Value(), 1);
+  EXPECT_EQ(method_metrics[0]->call_errors.Value(), 0);
+  EXPECT_EQ(method_metrics[0]->active_in_flight.Value(), 0);
+  EXPECT_EQ(method_metrics[0]->call_latency.Snapshot().count, 1);
 }
 
 TEST(AdminServerTest, ServesRpcMetricsOnTheSameContext) {
@@ -354,6 +363,9 @@ TEST(AdminServerTest, ServesRpcMetricsOnTheSameContext) {
   EXPECT_NE(wire_response.find("HTTP/1.1 200 OK"), std::string::npos);
   EXPECT_NE(wire_response.find("ant_rpc_server_requests_received_total{server=\"echo\"} 1"), std::string::npos);
   EXPECT_NE(wire_response.find("ant_rpc_server_active_in_flight{server=\"echo\"} 0"), std::string::npos);
+  EXPECT_NE(wire_response.find("ant_rpc_server_method_calls_completed_total{server=\"echo\",service=\"ant_rpc."
+                               "EchoService\",method=\"Echo\"} 1"),
+            std::string::npos);
 
   channel.Close();
   admin_server.Stop();
@@ -375,6 +387,12 @@ TEST_F(RpcServerTest, CustomBusinessError) {
   EXPECT_TRUE(cntl.Failed());
   EXPECT_EQ(cntl.ErrorCode(), RPC_EINTERNAL);
   EXPECT_EQ(cntl.ErrorText(), "Custom business failure");
+  const auto method_metrics = server_->metrics().MethodSnapshot();
+  ASSERT_EQ(method_metrics.size(), 1);
+  EXPECT_EQ(method_metrics[0]->calls_started.Value(), 1);
+  EXPECT_EQ(method_metrics[0]->calls_completed.Value(), 1);
+  EXPECT_EQ(method_metrics[0]->call_errors.Value(), 1);
+  EXPECT_EQ(method_metrics[0]->active_in_flight.Value(), 0);
 }
 
 // 3. Service Not Found (RPC_ENOSERVICE)
@@ -410,6 +428,13 @@ TEST_F(RpcServerTest, MethodNotFound) {
   stub.Echo(&echo_controller, &echo_request, &echo_response, nullptr);
   EXPECT_FALSE(echo_controller.Failed()) << echo_controller.ErrorText();
   EXPECT_EQ(echo_response.message(), "Echo: after-method-error");
+
+  // Arbitrary method names from the wire must not create unbounded metric
+  // labels. Only the successfully resolved Echo descriptor is registered.
+  const auto method_metrics = server_->metrics().MethodSnapshot();
+  ASSERT_EQ(method_metrics.size(), 1);
+  EXPECT_EQ(method_metrics[0]->method_name, "Echo");
+  EXPECT_EQ(method_metrics[0]->calls_completed.Value(), 1);
 }
 
 // 5. Headers and Attachments Transmission

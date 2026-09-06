@@ -1,9 +1,31 @@
 #pragma once
 
+#include <algorithm>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <absl/container/flat_hash_map.h>
+#include <absl/synchronization/mutex.h>
+#include <google/protobuf/descriptor.h>
+
 #include "ant_server/metrics/latency_recorder.hpp"
 #include "ant_server/metrics/metric.hpp"
 
 namespace ant_server::rpc {
+
+// Metrics for one registered protobuf method. Instances are allocated once
+// and never moved or removed, so an InboundCallState may safely retain a raw
+// pointer while ServerRuntime keeps the owning ServerMetrics alive.
+struct ServerMethodMetrics {
+  std::string service_name;
+  std::string method_name;
+  ant_server::metrics::Counter calls_started;
+  ant_server::metrics::Counter calls_completed;
+  ant_server::metrics::Counter call_errors;
+  ant_server::metrics::Gauge active_in_flight;
+  ant_server::metrics::LatencyRecorder call_latency;
+};
 
 // Framework-owned metrics for one RpcServer instance. Service implementations
 // do not update these; ServerRuntime and ServerConnection update them at their
@@ -37,6 +59,43 @@ struct ServerMetrics {
   ant_server::metrics::Gauge outbound_bytes;
 
   ant_server::metrics::LatencyRecorder request_latency;
+
+  // Called only after ServiceRegistry has resolved a real descriptor. This
+  // bounds metric cardinality to methods compiled into registered services,
+  // rather than trusting arbitrary service/method strings from the wire.
+  ServerMethodMetrics& GetOrCreateMethod(const google::protobuf::MethodDescriptor& method) {
+    absl::MutexLock lock(&method_metrics_mu_);
+    auto [iterator, inserted] = method_metrics_.try_emplace(&method);
+    if (inserted) {
+      auto entry = std::make_unique<ServerMethodMetrics>();
+      entry->service_name = method.service()->full_name();
+      entry->method_name = method.name();
+      iterator->second = std::move(entry);
+    }
+    return *iterator->second;
+  }
+
+  // The returned pointers remain valid for the lifetime of ServerMetrics.
+  // Counter values remain weakly consistent, as expected for observability.
+  [[nodiscard]] std::vector<const ServerMethodMetrics*> MethodSnapshot() const {
+    absl::MutexLock lock(&method_metrics_mu_);
+    std::vector<const ServerMethodMetrics*> snapshot;
+    snapshot.reserve(method_metrics_.size());
+    for (const auto& [descriptor, metrics] : method_metrics_) {
+      (void)descriptor;
+      snapshot.push_back(metrics.get());
+    }
+    std::sort(snapshot.begin(), snapshot.end(), [](const ServerMethodMetrics* lhs, const ServerMethodMetrics* rhs) {
+      return lhs->service_name < rhs->service_name ||
+             (lhs->service_name == rhs->service_name && lhs->method_name < rhs->method_name);
+    });
+    return snapshot;
+  }
+
+ private:
+  mutable absl::Mutex method_metrics_mu_;
+  absl::flat_hash_map<const google::protobuf::MethodDescriptor*, std::unique_ptr<ServerMethodMetrics>> method_metrics_
+      ABSL_GUARDED_BY(method_metrics_mu_);
 };
 
 }  // namespace ant_server::rpc
