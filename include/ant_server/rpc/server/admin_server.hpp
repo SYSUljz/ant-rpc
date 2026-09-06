@@ -19,6 +19,7 @@
 #include "ant_server/context/context.hpp"
 #include "ant_server/handler/acceptor.hpp"
 #include "ant_server/http/parser.hpp"
+#include "ant_server/metrics/metric_registry.hpp"
 #include "ant_server/rpc/server/rpc_server.hpp"
 #include "ant_server/rpc/server/server_metrics.hpp"
 #include "butil/endpoint.h"
@@ -86,6 +87,8 @@ class AdminServerState final {
     output << "# TYPE ant_rpc_server_active_connections gauge\n";
     output << "# TYPE ant_rpc_server_pending_worker_tasks gauge\n";
     output << "# TYPE ant_rpc_server_outbound_bytes gauge\n";
+    output << "# TYPE ant_rpc_server_io_command_backlog gauge\n";
+    output << "# TYPE ant_rpc_server_connection_closes_total counter\n";
     output << "# TYPE ant_rpc_server_request_latency_microseconds summary\n";
     output << "# TYPE ant_rpc_server_method_calls_started_total counter\n";
     output << "# TYPE ant_rpc_server_method_calls_completed_total counter\n";
@@ -117,6 +120,13 @@ class AdminServerState final {
       write_gauge("ant_rpc_server_active_in_flight", source.metrics->active_in_flight.Value());
       write_gauge("ant_rpc_server_pending_worker_tasks", source.metrics->pending_worker_tasks.Value());
       write_gauge("ant_rpc_server_outbound_bytes", source.metrics->outbound_bytes.Value());
+      write_gauge("ant_rpc_server_io_command_backlog", source.metrics->io_command_backlog.Value());
+      for (std::size_t reason_index = static_cast<std::size_t>(ConnectionCloseReason::kLocalRequest);
+           reason_index < static_cast<std::size_t>(ConnectionCloseReason::kCount); ++reason_index) {
+        const auto reason = static_cast<ConnectionCloseReason>(reason_index);
+        output << "ant_rpc_server_connection_closes_total{server=\"" << label << "\",reason=\""
+               << ConnectionCloseReasonName(reason) << "\"} " << source.metrics->ConnectionCloses(reason) << '\n';
+      }
       write_counter("ant_rpc_server_request_latency_microseconds_count", latency.count);
       write_counter("ant_rpc_server_request_latency_microseconds_sum", latency.total_microseconds);
       write_counter("ant_rpc_server_request_latency_microseconds_min", latency.min_microseconds);
@@ -140,6 +150,7 @@ class AdminServerState final {
                << '\n';
       }
     }
+    output << registry.PrometheusText();
     return output.str();
   }
 
@@ -149,6 +160,9 @@ class AdminServerState final {
 
   Context& context;
   std::atomic<bool> accepting {true};
+  // Reserve a separate namespace so custom series cannot collide with the
+  // framework's ant_rpc_* families. Callers register unprefixed names.
+  ant_server::metrics::MetricRegistry registry {"ant_custom_"};
 
  private:
   mutable absl::Mutex sources_mu;
@@ -281,6 +295,8 @@ class AdminServer {
   bool AddServer(std::string name, const RpcServer& server) {
     return state_->AddSource(std::move(name), server.metrics_handle());
   }
+
+  [[nodiscard]] ant_server::metrics::MetricRegistry& Registry() noexcept { return state_->registry; }
 
   bool Start() {
     bool expected = false;

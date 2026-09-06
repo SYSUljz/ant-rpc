@@ -180,15 +180,20 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
         runtime_(std::move(runtime)),
         idle_timeout_(runtime_->options().idle_timeout) {}
   void Start() { PostCommand(ServerCommand::Start()); }
-  void RequestClose() {
+  void RequestClose(ConnectionCloseReason reason = ConnectionCloseReason::kLocalRequest) {
+    RecordCloseReason(reason);
     if (running_.exchange(false, std::memory_order_acq_rel)) {
       PostCommand(ServerCommand::Close());
     }
   }
   int fd() const noexcept { return fd_.load(std::memory_order_acquire); }
+  [[nodiscard]] ConnectionCloseReason close_reason() const noexcept {
+    return close_reason_.load(std::memory_order_acquire);
+  }
 
   void DrainCommandsOnIoThread() override {
     commands_.Drain([this](ServerCommand&& command) {
+      runtime_->metrics().io_command_backlog.Add(-1);
       switch (command.type) {
         case ServerCommand::Type::kStart:
           StartOnIoThread();
@@ -288,8 +293,13 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
     ServiceRegistry* registry;
   };
   void PostCommand(ServerCommand command) {
+    runtime_->metrics().io_command_backlog.Add(1);
     commands_.Push(std::move(command));
     context_.Notify(shared_from_this());
+  }
+  void RecordCloseReason(ConnectionCloseReason reason) noexcept {
+    ConnectionCloseReason expected = ConnectionCloseReason::kNone;
+    close_reason_.compare_exchange_strong(expected, reason, std::memory_order_acq_rel, std::memory_order_acquire);
   }
   void CompleteInbound(std::shared_ptr<InboundCallState> call, butil::IOBuf response, bool close_after_completion) {
     PostCommand(ServerCommand::CompleteInbound(std::move(call), {std::move(response)}, close_after_completion));
@@ -302,6 +312,7 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
     }
     if (close_after_completion) {
       ReleaseFrameReservation(response);
+      RecordCloseReason(ConnectionCloseReason::kResourceLimit);
       running_.store(false, std::memory_order_release);
       BeginCloseOnIoThread();
       return;
@@ -323,7 +334,7 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
       return;
     }
     if (!TryReserveOutboundBytes(response.size())) {
-      RequestClose();
+      RequestClose(ConnectionCloseReason::kResourceLimit);
       return;
     }
     if (!running_.load(std::memory_order_acquire)) {
@@ -341,7 +352,7 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
   void SendErrorResponseOnIoThread(const FrameParseResult& request, int error_code, const char* error_text) {
     butil::IOBuf response;
     if (!PackServerErrorResponse(request, error_code, error_text, response, runtime_->options().max_frame_bytes)) {
-      RequestClose();
+      RequestClose(ConnectionCloseReason::kResourceLimit);
       return;
     }
     EnqueueResponseOnIoThread(std::move(response));
@@ -434,7 +445,7 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
     auto self = shared_from_this();
     const uint64_t timer = context_.GetTimerKeeper().AddTimer(idle_timeout_, [self, generation] {
       if (self->idle_generation_.load(std::memory_order_acquire) == generation) {
-        self->RequestClose();
+        self->RequestClose(ConnectionCloseReason::kIdleTimeout);
       }
     });
     idle_timer_id_.store(timer, std::memory_order_release);
@@ -454,6 +465,7 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
         }
         if (frame.status != FrameParseStatus::SUCCESS) {
           self->runtime_->metrics().protocol_errors.Add();
+          self->RecordCloseReason(ConnectionCloseReason::kProtocolError);
           // A protocol violation is terminal for this TCP connection. Do not
           // wait for another read CQE to make that visible to the peer.
           self->running_.store(false, std::memory_order_release);
@@ -464,6 +476,7 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
         }
         if (frame.meta.msg_type() != RPC_REQUEST) {
           self->runtime_->metrics().protocol_errors.Add();
+          self->RecordCloseReason(ConnectionCloseReason::kProtocolError);
           // A peer may not send a response or an unspecified message type to
           // a server connection. Treat it as a terminal protocol violation.
           self->running_.store(false, std::memory_order_release);
@@ -480,6 +493,7 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
       }
       const int bytes = co_await ReadAwaiter(self->context_, self->fd(), self->recv_buffer_, /*is_fixed=*/true);
       if (bytes <= 0) {
+        self->RecordCloseReason(bytes == 0 ? ConnectionCloseReason::kPeerEof : ConnectionCloseReason::kReadError);
         break;
       }
       self->ArmIdleTimerOnIoThread();
@@ -522,7 +536,7 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
     if (executor == nullptr) {
       runtime_->ReleaseWorkerTask();
       runtime_->ReleaseInFlight();
-      RequestClose();
+      RequestClose(ConnectionCloseReason::kInternalError);
       return;
     }
     auto call = std::make_shared<InboundCallState>(weak_from_this(), runtime_, std::move(frame), *executor,
@@ -593,6 +607,7 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
       const int written = co_await IOBufWriteAwaiter(self->context_, self->fd(), frame.buffer, /*is_fixed=*/true);
       if (!self->running_.load(std::memory_order_acquire) || written <= 0) {
         self->runtime_->metrics().write_errors.Add();
+        self->RecordCloseReason(ConnectionCloseReason::kWriteError);
         self->running_.store(false, std::memory_order_release);
         if (const int socket = self->fd(); socket >= 0) {
           self->context_.UseService<IOuringSocketService>().SubmitShutdown(socket, SHUT_RDWR, /*is_fixed=*/true);
@@ -622,6 +637,7 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
   std::atomic<bool> released_ {false};
   std::atomic<uint64_t> idle_generation_ {0};
   std::atomic<uint64_t> idle_timer_id_ {0};
+  std::atomic<ConnectionCloseReason> close_reason_ {ConnectionCloseReason::kNone};
   bool receiver_started_ {false};
   bool receiver_exited_ {false};
   bool writing_ {false};
@@ -713,6 +729,7 @@ inline void ServerRuntime::ReleaseConnection(const std::shared_ptr<ServerConnect
   }
   active_connections_.fetch_sub(1, std::memory_order_acq_rel);
   metrics_->active_connections.Add(-1);
+  metrics_->RecordConnectionClose(connection->close_reason());
   metrics_->closed_connections.Add();
   if (active_connections_.load(std::memory_order_acquire) == 0) {
     CancelGracefulStopTimer();
@@ -743,7 +760,7 @@ inline void ServerRuntime::ForceCloseLiveConnections() {
     snapshot = connections_;
   }
   for (const auto& connection : snapshot) {
-    connection->RequestClose();
+    connection->RequestClose(ConnectionCloseReason::kServerStop);
   }
 }
 inline void ServerRuntime::CancelGracefulStopTimer() {

@@ -326,6 +326,9 @@ TEST(AdminServerTest, ServesRpcMetricsOnTheSameContext) {
   // shares the RPC listener's Context and thus its IO thread.
   AdminServer admin_server(rpc_context);
   ASSERT_TRUE(admin_server.AddServer("echo", rpc_server));
+  auto business_requests = std::make_shared<ant_server::metrics::Counter>();
+  ASSERT_TRUE(admin_server.Registry().Register("business_requests_total", business_requests));
+  business_requests->Add(3);
   ASSERT_TRUE(admin_server.Start());
   scheduler.Start();
 
@@ -338,6 +341,17 @@ TEST(AdminServerTest, ServesRpcMetricsOnTheSameContext) {
   request.set_message("metrics");
   stub.Echo(&controller, &request, &response, nullptr);
   ASSERT_FALSE(controller.Failed()) << controller.ErrorText();
+
+  channel.Close();
+  bool peer_close_recorded = false;
+  for (int attempt = 0; attempt != 200; ++attempt) {
+    if (rpc_server.metrics().closed_connections.Value() == 1) {
+      peer_close_recorded = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(peer_close_recorded);
 
   const int metrics_fd = socket(AF_INET, SOCK_STREAM, 0);
   ASSERT_GE(metrics_fd, 0);
@@ -361,13 +375,16 @@ TEST(AdminServerTest, ServesRpcMetricsOnTheSameContext) {
   close(metrics_fd);
 
   EXPECT_NE(wire_response.find("HTTP/1.1 200 OK"), std::string::npos);
+  EXPECT_NE(wire_response.find("ant_custom_business_requests_total 3\n"), std::string::npos);
   EXPECT_NE(wire_response.find("ant_rpc_server_requests_received_total{server=\"echo\"} 1"), std::string::npos);
   EXPECT_NE(wire_response.find("ant_rpc_server_active_in_flight{server=\"echo\"} 0"), std::string::npos);
+  EXPECT_NE(wire_response.find("ant_rpc_server_io_command_backlog{server=\"echo\"} 0"), std::string::npos);
+  EXPECT_NE(wire_response.find("ant_rpc_server_connection_closes_total{server=\"echo\",reason=\"peer_eof\"} 1"),
+            std::string::npos);
   EXPECT_NE(wire_response.find("ant_rpc_server_method_calls_completed_total{server=\"echo\",service=\"ant_rpc."
                                "EchoService\",method=\"Echo\"} 1"),
             std::string::npos);
 
-  channel.Close();
   admin_server.Stop();
   rpc_server.Stop();
   EXPECT_TRUE(rpc_server.Join());
@@ -1025,6 +1042,9 @@ TEST(RpcServerLifecycleTest, StopClosesConnectionsButWaitsForRunningService) {
   service->release.Notify();
   service->Join();
   EXPECT_TRUE(server.Join());
+  EXPECT_EQ(server.metrics().closed_connections.Value(), 1);
+  EXPECT_EQ(server.metrics().ConnectionCloses(ConnectionCloseReason::kServerStop), 1);
+  EXPECT_EQ(server.metrics().io_command_backlog.Value(), 0);
   channel.Close();
   scheduler.Stop();
 }
