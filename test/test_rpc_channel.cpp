@@ -153,6 +153,11 @@ void ExpectActiveCallsFailAfterPeerTerminalEvent(RawTerminalPeer::Action action)
     EXPECT_TRUE(controller.Failed());
     EXPECT_EQ(controller.ErrorCode(), ant_rpc::RPC_ECONN_FAILED);
   }
+  EXPECT_EQ(channel.metrics().calls_started.Value(), kCallCount);
+  EXPECT_EQ(channel.metrics().calls_completed.Value(), kCallCount);
+  EXPECT_EQ(channel.metrics().calls_succeeded.Value(), 0);
+  EXPECT_EQ(channel.metrics().call_errors.Value(), kCallCount);
+  EXPECT_EQ(channel.metrics().active_in_flight.Value(), 0);
 
   channel.Close();
   scheduler.Stop();
@@ -191,6 +196,10 @@ TEST(RpcChannelCancellationTest, StartCancelResolvesAnActiveSlot) {
   EXPECT_TRUE(controller.Failed());
   EXPECT_EQ(controller.ErrorCode(), ant_rpc::RPC_ECANCELED);
   EXPECT_EQ(remaining.load(), 0);
+  EXPECT_EQ(channel.metrics().calls_completed.Value(), 1);
+  EXPECT_EQ(channel.metrics().call_errors.Value(), 1);
+  EXPECT_EQ(channel.metrics().calls_canceled.Value(), 1);
+  EXPECT_EQ(channel.metrics().active_in_flight.Value(), 0);
 
   channel.Close();
   scheduler.Stop();
@@ -221,6 +230,10 @@ TEST(RpcChannelDeadlineTest, CallbackCallTimesOutWithoutPeerResponse) {
   EXPECT_TRUE(controller.Failed());
   EXPECT_EQ(controller.ErrorCode(), ant_rpc::RPC_ETIMEOUT);
   EXPECT_EQ(remaining.load(), 0);
+  EXPECT_EQ(channel.metrics().calls_completed.Value(), 1);
+  EXPECT_EQ(channel.metrics().call_errors.Value(), 1);
+  EXPECT_EQ(channel.metrics().calls_timed_out.Value(), 1);
+  EXPECT_EQ(channel.metrics().active_in_flight.Value(), 0);
 
   channel.Close();
   scheduler.Stop();
@@ -361,8 +374,33 @@ TEST_F(RpcChannelTest, ProtobufStubSyncCall) {
   ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
   EXPECT_EQ(resp.message(), "Echo: Hello Protobuf Stub!");
   EXPECT_GT(cntl.latency_us(), 0);
+  EXPECT_EQ(channel.metrics().calls_started.Value(), 1);
+  EXPECT_EQ(channel.metrics().calls_completed.Value(), 1);
+  EXPECT_EQ(channel.metrics().calls_succeeded.Value(), 1);
+  EXPECT_EQ(channel.metrics().call_errors.Value(), 0);
+  EXPECT_EQ(channel.metrics().active_in_flight.Value(), 0);
+  EXPECT_EQ(channel.metrics().outbound_bytes.Value(), 0);
+  EXPECT_EQ(channel.metrics().call_latency.Snapshot().count, 1);
 
   channel.Close();
+}
+
+TEST(RpcChannelMetricsTest, CallRejectedBeforeSlotAllocationIsRecordedInline) {
+  ant_rpc::RpcChannel channel;
+  ant_rpc::EchoService_Stub stub(&channel);
+  ant_rpc::EchoRequest request;
+  ant_rpc::EchoResponse response;
+  ant_rpc::RpcController controller;
+
+  stub.Echo(&controller, &request, &response, nullptr);
+
+  EXPECT_TRUE(controller.Failed());
+  EXPECT_EQ(controller.ErrorCode(), ant_rpc::RPC_ECONN_FAILED);
+  EXPECT_EQ(channel.metrics().calls_started.Value(), 1);
+  EXPECT_EQ(channel.metrics().calls_completed.Value(), 1);
+  EXPECT_EQ(channel.metrics().calls_succeeded.Value(), 0);
+  EXPECT_EQ(channel.metrics().call_errors.Value(), 1);
+  EXPECT_EQ(channel.metrics().active_in_flight.Value(), 0);
 }
 
 TEST_F(RpcChannelTest, DefaultChannelUsesProcessRuntime) {

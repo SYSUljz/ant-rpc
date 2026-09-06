@@ -5,12 +5,18 @@
 #include <memory>
 #include <mutex>
 
+#include "ant_server/rpc/core/client_metrics.hpp"
 #include "ant_server/rpc/slot_table.hpp"
 
 namespace ant_server::rpc::detail {
 
 // State shared by the public channel facade and its IO-thread driver.
 struct ChannelState final : RpcCallCancellationTarget {
+  explicit ChannelState(std::shared_ptr<ClientMetrics> client_metrics) : metrics(std::move(client_metrics)) {
+    slots.SetClientMetrics(*metrics);
+  }
+
+  std::shared_ptr<ClientMetrics> metrics;
   SlotTable<65536> slots;
   std::atomic<bool> running {false};
 

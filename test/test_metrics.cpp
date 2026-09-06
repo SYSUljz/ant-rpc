@@ -7,6 +7,7 @@
 
 #include "ant_server/metrics/latency_recorder.hpp"
 #include "ant_server/metrics/metric.hpp"
+#include "ant_server/rpc/core/client_metrics.hpp"
 
 namespace {
 
@@ -82,6 +83,24 @@ TEST(MetricsTest, LatencyRecorderRecordsConcurrently) {
   EXPECT_EQ(snapshot.min_microseconds, 1);
   EXPECT_EQ(snapshot.max_microseconds, 4);
   EXPECT_EQ(snapshot.average_microseconds, 2);
+}
+
+TEST(MetricsTest, ClientMetricsClassifiesUniqueTerminalOutcomes) {
+  ant_server::rpc::ClientMetrics metrics;
+  metrics.calls_started.Add(4);
+  metrics.RecordCompletion(ant_server::rpc::RPC_SUCCESS, 10);
+  metrics.RecordCompletion(ant_server::rpc::RPC_EINTERNAL, 20);
+  metrics.RecordCompletion(ant_server::rpc::RPC_ETIMEOUT, 30);
+  metrics.RecordCompletion(ant_server::rpc::RPC_ECANCELED, 40);
+
+  EXPECT_EQ(metrics.calls_started.Value(), 4);
+  EXPECT_EQ(metrics.calls_completed.Value(), 4);
+  EXPECT_EQ(metrics.calls_succeeded.Value(), 1);
+  EXPECT_EQ(metrics.call_errors.Value(), 3);
+  EXPECT_EQ(metrics.calls_timed_out.Value(), 1);
+  EXPECT_EQ(metrics.calls_canceled.Value(), 1);
+  EXPECT_EQ(metrics.call_latency.Snapshot().count, 4);
+  EXPECT_EQ(metrics.call_latency.Snapshot().total_microseconds, 100);
 }
 
 }  // namespace

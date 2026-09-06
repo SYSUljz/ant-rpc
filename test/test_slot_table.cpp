@@ -460,6 +460,8 @@ TEST(SlotTableConcurrencyTest, ConcurrentAllocationAndReuseNeverHandsOutOneCellT
   constexpr int kIterationsPerThread = 2000;
 
   ant_server::rpc::SlotTable<kCapacity> slots;
+  ant_server::rpc::ClientMetrics metrics;
+  slots.SetClientMetrics(metrics);
   std::array<std::atomic<int>, kCapacity> owners {};
   std::atomic<int> failures {0};
   std::atomic<int> completions {0};
@@ -475,6 +477,7 @@ TEST(SlotTableConcurrencyTest, ConcurrentAllocationAndReuseNeverHandsOutOneCellT
       start.arrive_and_wait();
 
       for (int iteration = 0; iteration < kIterationsPerThread; ++iteration) {
+        controller.RecordStart();
         const uint64_t cid = slots.AllocateSlot(&task, nullptr, &controller, TestContinuationTarget());
         if (cid == 0) {
           failures.fetch_add(1, std::memory_order_relaxed);
@@ -512,6 +515,10 @@ TEST(SlotTableConcurrencyTest, ConcurrentAllocationAndReuseNeverHandsOutOneCellT
   EXPECT_EQ(failures.load(std::memory_order_acquire), 0);
   EXPECT_EQ(completions.load(std::memory_order_acquire), kThreadCount * kIterationsPerThread);
   EXPECT_EQ(slots.active_slot_count(), 0U);
+  EXPECT_EQ(metrics.calls_completed.Value(), kThreadCount * kIterationsPerThread);
+  EXPECT_EQ(metrics.calls_succeeded.Value(), kThreadCount * kIterationsPerThread);
+  EXPECT_EQ(metrics.call_errors.Value(), 0);
+  EXPECT_EQ(metrics.active_in_flight.Value(), 0);
 }
 
 TEST(SlotTableTest, StaleTerminalEventsCannotChangeReusedSlotLifecycle) {

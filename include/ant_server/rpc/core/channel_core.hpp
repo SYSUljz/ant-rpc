@@ -25,6 +25,7 @@
 #include "ant_server/context/context.hpp"
 #include "ant_server/coroutine/task.hpp"
 #include "ant_server/rpc/controller.hpp"
+#include "ant_server/rpc/core/client_metrics.hpp"
 #include "ant_server/rpc/error_code.hpp"
 #include "ant_server/rpc/io_driver/channel_io_driver.hpp"
 #include "ant_server/rpc/protocol.hpp"
@@ -102,12 +103,16 @@ class RpcChannel : public google::protobuf::RpcChannel {
   // The normal application-facing API. Init() binds this channel to one IO
   // Context selected by the process Runtime; Context is never exposed to the
   // caller.
-  RpcChannel() : state_(std::make_shared<detail::ChannelState>()) {}
+  RpcChannel()
+      : metrics_(std::make_shared<ClientMetrics>()), state_(std::make_shared<detail::ChannelState>(metrics_)) {}
 
   // Advanced/testing API. The caller owns the Context and must keep its
   // Scheduler alive until this channel has been closed or destroyed.
   explicit RpcChannel(Context& context)
-      : ctx_(&context), timer_keeper_(&context.GetTimerKeeper()), state_(std::make_shared<detail::ChannelState>()) {
+      : ctx_(&context),
+        metrics_(std::make_shared<ClientMetrics>()),
+        state_(std::make_shared<detail::ChannelState>(metrics_)),
+        timer_keeper_(&context.GetTimerKeeper()) {
     state_->slots.SetDeadlineTimerKeeper(*timer_keeper_);
   }
   ~RpcChannel() override { Close(); }
@@ -157,7 +162,7 @@ class RpcChannel : public google::protobuf::RpcChannel {
     address.sin_family = AF_INET;
     address.sin_port = htons(endpoint_.port);
     address.sin_addr = endpoint_.ip;
-    auto state = std::make_shared<detail::ChannelState>();
+    auto state = std::make_shared<detail::ChannelState>(metrics_);
     state->slots.SetDeadlineTimerKeeper(*timer_keeper_);
     {
       std::lock_guard<std::mutex> lock(state->close_mu);
@@ -207,6 +212,8 @@ class RpcChannel : public google::protobuf::RpcChannel {
     return driver_ ? driver_->fd() : -1;
   }
   SlotTable<65536>& slot_table() { return state_->slots; }
+  [[nodiscard]] const ClientMetrics& metrics() const noexcept { return *metrics_; }
+  [[nodiscard]] std::shared_ptr<const ClientMetrics> metrics_handle() const noexcept { return metrics_; }
 
   void CallMethod(const google::protobuf::MethodDescriptor* method, google::protobuf::RpcController* controller,
                   const google::protobuf::Message* request, google::protobuf::Message* response,
@@ -293,6 +300,7 @@ class RpcChannel : public google::protobuf::RpcChannel {
       state = state_;
       driver = driver_;
     }
+    metrics_->calls_started.Add();
     if (controller) {
       controller->RecordStart();
     }
@@ -394,12 +402,15 @@ class RpcChannel : public google::protobuf::RpcChannel {
     return {correlation_id, StartOutcome::kResolvedBySlot};
   }
 
-  static void SetInlineFailure(RpcController* controller, const std::string& message,
-                               int error_code = RPC_ECONN_FAILED) {
+  void SetInlineFailure(RpcController* controller, const std::string& message, int error_code = RPC_ECONN_FAILED) {
+    uint64_t latency_us = 0;
     if (controller) {
       controller->SetFailed(error_code, message);
+      controller->set_latency_us(controller->CalculateElapsedUs());
+      latency_us = static_cast<uint64_t>(controller->latency_us());
       RpcController::RunNotifyCallback(controller->TakeNotifyOnCompletion());
     }
+    metrics_->RecordCompletion(error_code, latency_us);
   }
 
   // Every unary call, including a blocking protobuf call, now owns the same
@@ -434,6 +445,7 @@ class RpcChannel : public google::protobuf::RpcChannel {
   butil::EndPoint endpoint_;
   RpcChannelOptions options_;
   mutable std::mutex channel_mu_;
+  std::shared_ptr<ClientMetrics> metrics_;
   std::shared_ptr<detail::ChannelState> state_;
   std::shared_ptr<detail::RpcChannelIoDriver> driver_;
   TimerKeeper* timer_keeper_ {nullptr};

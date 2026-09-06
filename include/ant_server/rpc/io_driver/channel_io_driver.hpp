@@ -71,6 +71,7 @@ class RpcChannelIoDriver : public IoCommandMailbox, public std::enable_shared_fr
     while (current <= max_outbound_bytes_ - bytes) {
       if (outbound_bytes_.compare_exchange_weak(current, current + bytes, std::memory_order_acq_rel,
                                                 std::memory_order_acquire)) {
+        state_->metrics->outbound_bytes.Add(static_cast<int64_t>(bytes));
         return true;
       }
     }
@@ -78,6 +79,7 @@ class RpcChannelIoDriver : public IoCommandMailbox, public std::enable_shared_fr
   }
   void ReleaseReservedOutboundBytes(std::size_t bytes) noexcept {
     outbound_bytes_.fetch_sub(bytes, std::memory_order_acq_rel);
+    state_->metrics->outbound_bytes.Add(-static_cast<int64_t>(bytes));
   }
   // Requires a successful TryReserveOutboundBytes() for frame.buffer->size().
   void EnqueueReserved(OutboundFrame frame) { PostCommand(ChannelCommand::SendFrame(std::move(frame))); }

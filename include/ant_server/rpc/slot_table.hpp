@@ -15,6 +15,7 @@
 #include "absl/synchronization/mutex.h"
 #include "ant_server/constants.hpp"
 #include "ant_server/rpc/controller.hpp"
+#include "ant_server/rpc/core/client_metrics.hpp"
 #include "ant_server/rpc/error_code.hpp"
 #include "ant_server/rpc/protocol.hpp"
 #include "ant_server/scheduler/timer_keeper.hpp"
@@ -164,6 +165,7 @@ class SlotTable {
   // keeper itself is thread-safe; terminal resolution may cancel a timer from
   // an IO, worker, or timer thread.
   void SetDeadlineTimerKeeper(TimerKeeper& timer_keeper) noexcept { deadline_timer_keeper_ = &timer_keeper; }
+  void SetClientMetrics(ClientMetrics& metrics) noexcept { client_metrics_ = &metrics; }
 
   // Allocate a slot in ARMING state and generate a 64-bit correlation_id.
   // The slot is not resolvable until PublishSlot() moves it to IN_FLIGHT.
@@ -176,7 +178,7 @@ class SlotTable {
     }
     uint32_t slot_id = PopFreeSlot();
     if (slot_id == INVALID_SLOT) {
-      ReleaseLiveSlot();
+      active_slots_.fetch_sub(1, std::memory_order_acq_rel);
       return 0;  // Capacity exhausted
     }
 
@@ -193,6 +195,9 @@ class SlotTable {
     slot.executor = target.executor;
     slot.deadline_timer_id.store(0, std::memory_order_relaxed);
     slot.lifecycle.store(PackSlotLifecycle(version, SlotState::ARMING), std::memory_order_release);
+    if (client_metrics_ != nullptr) {
+      client_metrics_->active_in_flight.Add(1);
+    }
 
     return MakeCorrelationId(version, slot_id);
   }
@@ -316,6 +321,7 @@ class SlotTable {
       return ResponseCompletionOutcome::kLateResponse;
     }
 
+    int completion_error_code = meta.error_code();
     if (slot.controller) {
       slot.controller->ClearActiveSlot(correlation_id);
       if (meta.error_code() != RPC_SUCCESS) {
@@ -334,6 +340,7 @@ class SlotTable {
     if (slot.response_msg && !body_iobuf.empty() && (!slot.controller || !slot.controller->Failed())) {
       butil::IOBufAsZeroCopyInputStream zc_in(body_iobuf);
       if (!slot.response_msg->ParseFromZeroCopyStream(&zc_in)) {
+        completion_error_code = RPC_EINVALID_DATA;
         if (slot.controller) {
           slot.controller->SetFailed(RPC_EINVALID_DATA, "Failed to deserialize response protobuf");
         }
@@ -343,9 +350,12 @@ class SlotTable {
     if (slot.raw_resp_body) {
       *slot.raw_resp_body = body_iobuf;
     }
+    if (slot.controller && slot.controller->Failed()) {
+      completion_error_code = slot.controller->ErrorCode();
+    }
 
     completed_responses_.fetch_add(1, std::memory_order_relaxed);
-    FinalizeSlotAndDispatch(slot, correlation_id);
+    FinalizeSlotAndDispatch(slot, correlation_id, completion_error_code);
     return ResponseCompletionOutcome::kCompleted;
   }
 
@@ -538,16 +548,21 @@ class SlotTable {
       slot.controller->SetFailed(resolution.error_code, resolution.error_message);
       slot.controller->set_latency_us(slot.controller->CalculateElapsedUs());
     }
-    FinalizeSlotAndDispatch(slot, correlation_id);
+    FinalizeSlotAndDispatch(slot, correlation_id, resolution.error_code);
   }
 
   // Recycle the slot, then hand the continuation to its origin executor.
   // The slot MUST be released before dispatching: once the continuation runs, the coroutine frame
   // owning the TaskNode may already be destroyed, so nothing in `slot` may be read afterwards.
-  void FinalizeSlotAndDispatch(CallSlot& slot, uint64_t correlation_id) {
+  void FinalizeSlotAndDispatch(CallSlot& slot, uint64_t correlation_id, int error_code) {
     TaskNode* task = slot.task;
     Executor* executor = slot.executor;
     google::protobuf::Closure* notify = slot.controller ? slot.controller->TakeNotifyOnCompletion() : nullptr;
+    const uint64_t latency_us = slot.controller ? static_cast<uint64_t>(slot.controller->latency_us()) : 0;
+
+    if (client_metrics_ != nullptr) {
+      client_metrics_->RecordCompletion(error_code, latency_us);
+    }
 
     UnregisterPublishedSlot(correlation_id);
     CancelDeadlineTimer(slot);
@@ -580,7 +595,12 @@ class SlotTable {
     return false;
   }
 
-  void ReleaseLiveSlot() { active_slots_.fetch_sub(1, std::memory_order_acq_rel); }
+  void ReleaseLiveSlot() {
+    active_slots_.fetch_sub(1, std::memory_order_acq_rel);
+    if (client_metrics_ != nullptr) {
+      client_metrics_->active_in_flight.Add(-1);
+    }
+  }
 
   uint32_t PopFreeSlot() {
     absl::MutexLock lock(&free_list_mu_);
@@ -621,6 +641,7 @@ class SlotTable {
   uint32_t free_head_ {0};
   std::atomic<std::size_t> active_slots_ {0};
   TimerKeeper* deadline_timer_keeper_ {nullptr};
+  ClientMetrics* client_metrics_ {nullptr};
   std::atomic<uint64_t> completed_responses_ {0};
   std::atomic<uint64_t> unknown_correlation_id_ {0};
   std::atomic<uint64_t> late_response_ {0};
