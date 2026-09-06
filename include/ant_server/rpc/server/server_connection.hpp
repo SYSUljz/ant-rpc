@@ -719,7 +719,7 @@ inline void ServerRuntime::CancelGracefulStopTimer() {
 inline DetachedTask handle_rpc_client(Context& ctx, int client_fd, ServiceRegistry& registry) {
   auto runtime = std::make_shared<ServerRuntime>(ctx, RpcServerOptions {});
   if (!runtime->TryAcquireConnection()) {
-    close(client_fd);
+    ctx.UseService<IOuringSocketService>().SubmitClose(client_fd, nullptr, /*is_fixed=*/true);
     co_return;
   }
   auto connection = std::make_shared<ServerConnection>(ctx, client_fd, registry, runtime);

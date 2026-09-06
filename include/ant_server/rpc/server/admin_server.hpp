@@ -274,7 +274,7 @@ class AdminServer {
     }
     acceptor_ = std::make_unique<Acceptor>(state_->context, listen_fd_, [state = state_](int client_fd) {
       if (!state->accepting.load(std::memory_order_acquire)) {
-        close(client_fd);
+        state->context.UseService<IOuringSocketService>().SubmitClose(client_fd, nullptr, /*is_fixed=*/true);
         return;
       }
       auto connection = std::make_shared<detail::AdminConnection>(state, client_fd);

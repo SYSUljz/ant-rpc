@@ -1,3 +1,5 @@
+#include <poll.h>
+
 #include <atomic>
 #include <chrono>
 #include <memory>
@@ -487,6 +489,164 @@ TEST(RpcServerLifecycleTest, ConstructionDoesNotListenAndLifecycleIsExplicit) {
   EXPECT_EQ(server.status(), RpcServer::Status::kStopping);
   EXPECT_TRUE(server.Join());
   EXPECT_EQ(server.status(), RpcServer::Status::kStopped);
+  EXPECT_TRUE(server.Join());
+  scheduler.Stop();
+}
+
+TEST(RpcServerOptionsTest, MaxConnectionsRejectsAdditionalConnectionWithoutDisturbingExistingOne) {
+  RpcServerOptions options;
+  options.max_connections = 1;
+  Scheduler scheduler {2, 2};
+  Context& server_context = scheduler.GetIOContext(0);
+  Context& client_context = scheduler.GetIOContext(1);
+  RpcServer server(server_context, 0, butil::IP_ANY, options);
+  auto service = std::make_shared<EchoServiceImpl>();
+  ASSERT_TRUE(server.AddService(service));
+  ASSERT_TRUE(server.Start());
+  scheduler.Start();
+
+  RpcChannel admitted_channel(client_context);
+  ASSERT_EQ(admitted_channel.Init("127.0.0.1", server.GetEndPoint().port), 0);
+  bool first_connection_tracked = false;
+  for (int attempt = 0; attempt != 200; ++attempt) {
+    if (server.metrics().active_connections.Value() == 1) {
+      first_connection_tracked = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(first_connection_tracked);
+
+  // Use a raw socket for the rejected peer: TCP connect may complete before
+  // the server accepts and closes the over-limit fd, so successful connect()
+  // does not mean the RPC connection was admitted.
+  const int rejected_fd = socket(AF_INET, SOCK_STREAM, 0);
+  ASSERT_GE(rejected_fd, 0);
+  sockaddr_in address {};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(server.GetEndPoint().port);
+  ASSERT_EQ(inet_pton(AF_INET, "127.0.0.1", &address.sin_addr), 1);
+  ASSERT_EQ(connect(rejected_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
+
+  bool rejection_recorded = false;
+  for (int attempt = 0; attempt != 200; ++attempt) {
+    if (server.metrics().rejected_connections.Value() == 1) {
+      rejection_recorded = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(rejection_recorded);
+  pollfd rejected_poll {rejected_fd, POLLIN, 0};
+  ASSERT_GT(poll(&rejected_poll, 1, 2000), 0);
+  char byte = 0;
+  EXPECT_LE(recv(rejected_fd, &byte, sizeof(byte), 0), 0);
+  close(rejected_fd);
+
+  // Rejecting the second connection must not evict or poison the admitted
+  // connection.
+  ant_rpc::EchoService_Stub admitted_stub(&admitted_channel);
+  RpcController admitted_controller;
+  ant_rpc::EchoRequest admitted_request;
+  ant_rpc::EchoResponse admitted_response;
+  admitted_request.set_message("still-admitted");
+  admitted_stub.Echo(&admitted_controller, &admitted_request, &admitted_response, nullptr);
+  EXPECT_FALSE(admitted_controller.Failed()) << admitted_controller.ErrorText();
+  EXPECT_EQ(admitted_response.message(), "Echo: still-admitted");
+  EXPECT_EQ(server.metrics().accepted_connections.Value(), 1);
+  EXPECT_EQ(server.metrics().active_connections.Value(), 1);
+
+  admitted_channel.Close();
+  server.Stop();
+  EXPECT_TRUE(server.Join());
+  scheduler.Stop();
+}
+
+TEST(RpcServerOptionsTest, GlobalMaxInFlightRejectsCallFromAnotherConnection) {
+  RpcServerOptions options;
+  options.max_in_flight = 1;
+  options.max_in_flight_per_connection = 1;
+  Scheduler scheduler {2, 2};
+  Context& server_context = scheduler.GetIOContext(0);
+  Context& client_context = scheduler.GetIOContext(1);
+  RpcServer server(server_context, 0, butil::IP_ANY, options);
+  auto service = std::make_shared<BlockingEchoService>();
+  ASSERT_TRUE(server.AddService(service));
+  ASSERT_TRUE(server.Start());
+  scheduler.Start();
+
+  RpcChannel first_channel(client_context);
+  RpcChannel second_channel(client_context);
+  ASSERT_EQ(first_channel.Init("127.0.0.1", server.GetEndPoint().port), 0);
+  ASSERT_EQ(second_channel.Init("127.0.0.1", server.GetEndPoint().port), 0);
+  ant_rpc::EchoService_Stub first_stub(&first_channel);
+  ant_rpc::EchoService_Stub second_stub(&second_channel);
+
+  RpcController first_controller;
+  ant_rpc::EchoRequest first_request;
+  ant_rpc::EchoResponse first_response;
+  first_request.set_message("occupies-global-slot");
+  absl::Notification first_done;
+  NotifyClosure first_closure(first_done);
+  first_stub.Echo(&first_controller, &first_request, &first_response, &first_closure);
+  ASSERT_TRUE(service->entered.WaitForNotificationWithTimeout(absl::Seconds(2)));
+  ASSERT_EQ(server.metrics().active_in_flight.Value(), 1);
+
+  RpcController second_controller;
+  ant_rpc::EchoRequest second_request;
+  ant_rpc::EchoResponse second_response;
+  second_request.set_message("different-connection");
+  second_stub.Echo(&second_controller, &second_request, &second_response, nullptr);
+  EXPECT_TRUE(second_controller.Failed());
+  EXPECT_EQ(second_controller.ErrorCode(), RPC_EOVERLOAD);
+
+  service->release.Notify();
+  ASSERT_TRUE(first_done.WaitForNotificationWithTimeout(absl::Seconds(2)));
+  EXPECT_FALSE(first_controller.Failed()) << first_controller.ErrorText();
+  EXPECT_EQ(first_response.message(), "Echo: occupies-global-slot");
+  EXPECT_EQ(server.metrics().requests_received.Value(), 2);
+  EXPECT_EQ(server.metrics().calls_started.Value(), 1);
+  EXPECT_EQ(server.metrics().calls_completed.Value(), 1);
+  EXPECT_EQ(server.metrics().requests_rejected_overload.Value(), 1);
+  EXPECT_EQ(server.metrics().active_in_flight.Value(), 0);
+
+  first_channel.Close();
+  second_channel.Close();
+  server.Stop();
+  EXPECT_TRUE(server.Join());
+  scheduler.Stop();
+}
+
+TEST(RpcChannelOptionsTest, FrameLargerThanClientOutboundBudgetFailsInline) {
+  Scheduler scheduler {1, 2};
+  Context& server_context = scheduler.GetIOContext(0);
+  Context& client_context = scheduler.GetIOContext(1);
+  RpcServer server(server_context, 0);
+  auto service = std::make_shared<EchoServiceImpl>();
+  ASSERT_TRUE(server.AddService(service));
+  ASSERT_TRUE(server.Start());
+  scheduler.Start();
+
+  RpcChannelOptions channel_options;
+  channel_options.max_outbound_bytes = kRpcHeaderBytes;
+  RpcChannel channel(client_context);
+  ASSERT_EQ(channel.Init("127.0.0.1", server.GetEndPoint().port, &channel_options), 0);
+  ant_rpc::EchoService_Stub stub(&channel);
+
+  RpcController controller;
+  ant_rpc::EchoRequest request;
+  ant_rpc::EchoResponse response;
+  request.set_message("larger-than-header-only-budget");
+  stub.Echo(&controller, &request, &response, nullptr);
+
+  EXPECT_TRUE(controller.Failed());
+  EXPECT_EQ(controller.ErrorCode(), RPC_EOVERLOAD);
+  EXPECT_NE(controller.ErrorText().find("max_outbound_bytes"), std::string::npos);
+  EXPECT_EQ(channel.slot_table().active_slot_count(), 0U);
+  EXPECT_EQ(server.metrics().requests_received.Value(), 0);
+
+  channel.Close();
+  server.Stop();
   EXPECT_TRUE(server.Join());
   scheduler.Stop();
 }

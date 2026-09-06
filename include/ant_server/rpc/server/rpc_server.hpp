@@ -69,7 +69,7 @@ class RpcServer {
     }
     acceptor_ = std::make_unique<Acceptor>(ctx_, server_socket_, [this](int client_fd) {
       if (!runtime_->TryAcquireConnection()) {
-        close(client_fd);
+        ctx_.UseService<IOuringSocketService>().SubmitClose(client_fd, nullptr, /*is_fixed=*/true);
         return;
       }
       auto connection = std::make_shared<detail::ServerConnection>(ctx_, client_fd, registry_, runtime_);
