@@ -97,7 +97,8 @@ target_include_directories(ant_server INTERFACE
     ${CMAKE_SOURCE_DIR}/3rd_party
     ${PROTO_GEN_DIR}
 )
-target_link_libraries(ant_server INTERFACE butil llhttp echo_proto protobuf::libprotobuf absl::flat_hash_map)
+target_link_libraries(ant_server INTERFACE butil llhttp echo_proto protobuf::libprotobuf absl::flat_hash_map
+    absl::log absl::log_initialize absl::log_globals)
 
 # Executables for demo / server testing
 add_executable(test_server test/main.cpp)
@@ -132,6 +133,7 @@ add_executable(unit_tests
     test/test_read_awaiter_cancel.cpp 
     test/test_iobuf.cpp 
     test/test_metrics.cpp
+    test/test_logging.cpp
     test/test_executor.cpp 
     test/test_resume_on.cpp 
     test/test_sleep.cpp

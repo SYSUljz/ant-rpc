@@ -1,5 +1,4 @@
 #pragma once
-
 #include <unistd.h>
 
 #include <algorithm>
@@ -18,6 +17,7 @@
 #include "absl/synchronization/mutex.h"
 #include "ant_server/awaiter/socket_awaiter.hpp"
 #include "ant_server/context/context.hpp"
+#include "ant_server/logging/logging.hpp"
 #include "ant_server/rpc/controller.hpp"
 #include "ant_server/rpc/error_code.hpp"
 #include "ant_server/rpc/server/server_metrics.hpp"
@@ -152,9 +152,11 @@ inline bool PackServerErrorResponse(const FrameParseResult& request, int error_c
 // return completion through a typed ServerCommand.
 class ServerConnection final : public IoCommandMailbox, public std::enable_shared_from_this<ServerConnection> {
  private:
+  const uint64_t connection_id_ {ant_server::logging::NextConnectionId()};
   struct InboundCallState;
 
  public:
+  uint64_t connection_id() const noexcept { return connection_id_; }
   struct OutboundFrame {
     butil::IOBuf buffer;
   };
@@ -350,6 +352,12 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
   // normal RPC response whenever it fits the configured wire limits. A
   // packing failure means the connection cannot produce a safe reply.
   void SendErrorResponseOnIoThread(const FrameParseResult& request, int error_code, const char* error_text) {
+    if (error_code == RPC_EOVERLOAD) {
+      ant_server::logging::Write(ant_server::logging::Event::kOverload, [&](auto& out) {
+        out << " side=server connection_id=" << connection_id_ << " correlation_id=" << request.meta.correlation_id()
+            << " reason=" << ant_server::logging::Quote(error_text);
+      });
+    }
     butil::IOBuf response;
     if (!PackServerErrorResponse(request, error_code, error_text, response, runtime_->options().max_frame_bytes)) {
       RequestClose(ConnectionCloseReason::kResourceLimit);
@@ -701,6 +709,14 @@ inline void ServerConnection::FinalizeInboundCall(std::shared_ptr<InboundCallSta
     metrics.call_errors.Add();
   }
   metrics.request_latency.Record(latency);
+  if (static_cast<uint64_t>(latency.count()) >= ant_server::logging::slow_rpc_us.load()) {
+    ant_server::logging::Write(ant_server::logging::Event::kSlowRpc, [&](auto& out) {
+      out << " side=server correlation_id=" << call->frame.meta.correlation_id()
+          << " service=" << ant_server::logging::Quote(call->frame.meta.service_name())
+          << " method=" << ant_server::logging::Quote(call->frame.meta.method_name())
+          << " elapsed_us=" << latency.count() << " error_code=" << call->response_meta.error_code();
+    });
+  }
   if (call->method_metrics != nullptr) {
     call->method_metrics->calls_completed.Add();
     if (failed) {
@@ -730,6 +746,14 @@ inline void ServerRuntime::ReleaseConnection(const std::shared_ptr<ServerConnect
   active_connections_.fetch_sub(1, std::memory_order_acq_rel);
   metrics_->active_connections.Add(-1);
   metrics_->RecordConnectionClose(connection->close_reason());
+  const auto reason = connection->close_reason();
+  if (reason != ConnectionCloseReason::kPeerEof && reason != ConnectionCloseReason::kLocalRequest &&
+      reason != ConnectionCloseReason::kServerStop && reason != ConnectionCloseReason::kIdleTimeout) {
+    ant_server::logging::Write(ant_server::logging::Event::kConnectionFailed, [&](auto& out) {
+      out << " side=server connection_id=" << connection->connection_id()
+          << " reason=" << ConnectionCloseReasonName(reason);
+    });
+  }
   metrics_->closed_connections.Add();
   if (active_connections_.load(std::memory_order_acquire) == 0) {
     CancelGracefulStopTimer();

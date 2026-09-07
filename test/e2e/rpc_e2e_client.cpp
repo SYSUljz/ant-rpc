@@ -46,6 +46,7 @@ std::string RandomMessage(std::mt19937_64& generator, int request_index) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  ant_server::logging::Initialize();
   if (argc != 3 && argc != 9) {
     std::cerr << "usage: rpc_e2e_client HOST PORT [--requests N --threads N --seed N]\n";
     return 2;

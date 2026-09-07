@@ -14,6 +14,7 @@
 #include "absl/synchronization/mutex.h"
 #include "ant_server/context/context.hpp"
 #include "ant_server/handler/acceptor.hpp"
+#include "ant_server/logging/logging.hpp"
 #include "ant_server/rpc/server/server_connection.hpp"
 #include "ant_server/rpc/server/server_metrics.hpp"
 #include "butil/endpoint.h"
@@ -91,6 +92,9 @@ class RpcServer {
     }
     server_socket_ = butil::tcp_listen(endpoint_);
     if (server_socket_ < 0) {
+      const int error = errno;
+      ant_server::logging::Write(ant_server::logging::Event::kServerStartFailed,
+                                 [&](auto& out) { out << " port=" << endpoint_.port << " errno=" << error; });
       status_ = Status::kFailed;
       return false;
     }
@@ -108,6 +112,8 @@ class RpcServer {
     });
     acceptor_->Start();
     status_ = Status::kRunning;
+    ant_server::logging::Write(ant_server::logging::Event::kServerStarted,
+                               [&](auto& out) { out << " port=" << endpoint_.port; });
     return true;
   }
 
@@ -145,6 +151,8 @@ class RpcServer {
     runtime_->WaitForDrained();
     absl::MutexLock lock(&lifecycle_mu_);
     status_ = Status::kStopped;
+    ant_server::logging::Write(ant_server::logging::Event::kServerStopped,
+                               [&](auto& out) { out << " port=" << endpoint_.port; });
     return true;
   }
 

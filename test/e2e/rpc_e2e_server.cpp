@@ -30,6 +30,7 @@ int ParsePort(const char* value) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  ant_server::logging::Initialize();
   int requested_port = 0;
   int requested_admin_port = 0;
   if (argc == 3 && std::string(argv[1]) == "--port") {

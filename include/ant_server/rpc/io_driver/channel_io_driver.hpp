@@ -1,5 +1,4 @@
 #pragma once
-
 #include <unistd.h>
 
 #include <atomic>
@@ -16,6 +15,7 @@
 #include "ant_server/awaiter/socket_awaiter.hpp"
 #include "ant_server/context/context.hpp"
 #include "ant_server/coroutine/task.hpp"
+#include "ant_server/logging/logging.hpp"
 #include "ant_server/rpc/core/channel_state.hpp"
 #include "ant_server/rpc/error_code.hpp"
 #include "ant_server/scheduler/timer_keeper.hpp"
@@ -28,6 +28,8 @@ namespace ant_server::rpc::detail {
 // operations live in their own headers below so each state machine can be
 // reviewed independently.
 class RpcChannelIoDriver : public IoCommandMailbox, public std::enable_shared_from_this<RpcChannelIoDriver> {
+  const uint64_t connection_id_ {ant_server::logging::NextConnectionId()};
+
  public:
   struct OutboundFrame {
     uint64_t correlation_id;
@@ -95,7 +97,7 @@ class RpcChannelIoDriver : public IoCommandMailbox, public std::enable_shared_fr
   // IO-thread-only terminal transition shared by connect, read, write and
   // protocol failures. It is idempotent because multiple CQEs may report the
   // same broken socket while close is already in progress.
-  void HandleTerminalFailureOnIoThread(int error_code, const char* error_message);
+  void HandleTerminalFailureOnIoThread(int error_code, const char* error_message, bool log_failure = true);
   void FailAndClearOutboundOnIoThread(int error_code, const char* error_message);
   void TryFinishCloseOnIoThread();
   void FinishConnectOnIoThread(int result);
@@ -172,11 +174,18 @@ inline void RpcChannelIoDriver::DrainCommandsOnIoThread() {
 }
 
 inline void RpcChannelIoDriver::BeginCloseOnIoThread() {
-  HandleTerminalFailureOnIoThread(RPC_ECONN_FAILED, "Connection closed");
+  HandleTerminalFailureOnIoThread(RPC_ECONN_FAILED, "Connection closed", false);
 }
 
-inline void RpcChannelIoDriver::HandleTerminalFailureOnIoThread(int error_code, const char* error_message) {
-  state_->running.store(false, std::memory_order_release);
+inline void RpcChannelIoDriver::HandleTerminalFailureOnIoThread(int error_code, const char* error_message,
+                                                                bool log_failure) {
+  const bool was_running = state_->running.exchange(false, std::memory_order_acq_rel);
+  if (was_running && log_failure) {
+    ant_server::logging::Write(ant_server::logging::Event::kConnectionFailed, [&](auto& out) {
+      out << " side=client connection_id=" << connection_id_ << " error_code=" << error_code
+          << " reason=" << ant_server::logging::Quote(error_message);
+    });
+  }
   CancelPendingConnectOnIoThread();
   if (const int current_fd = fd(); current_fd >= 0) {
     shutdown(current_fd, SHUT_RDWR);
