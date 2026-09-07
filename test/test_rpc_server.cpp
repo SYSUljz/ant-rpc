@@ -313,6 +313,159 @@ TEST_F(RpcServerTest, BasicEchoCall) {
   EXPECT_EQ(method_metrics[0]->call_latency.Snapshot().count, 1);
 }
 
+// A fresh TCP connection per request, with bounded IO even if the admin loop
+// regresses. The response is deliberately checked over the HTTP wire.
+std::string FetchAdmin(const AdminServer& admin, std::string_view path) {
+  const int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) {
+    ADD_FAILURE() << "socket errno=" << errno;
+    return {};
+  }
+  timeval timeout {2, 0};
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+  sockaddr_in address {};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(admin.GetEndPoint().port);
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  int connected = connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address));
+  if (connected != 0 && (errno == EINTR || errno == EINPROGRESS)) {
+    pollfd writable {fd, POLLOUT, 0};
+    int polled;
+    do {
+      polled = poll(&writable, 1, 2000);
+    } while (polled < 0 && errno == EINTR);
+    int error = 0;
+    socklen_t size = sizeof(error);
+    if (polled > 0 && getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size) == 0 && error == 0) {
+      connected = 0;
+    }
+  }
+  if (connected != 0) {
+    ADD_FAILURE() << "connect failed errno=" << errno;
+    close(fd);
+    return {};
+  }
+  const std::string request = "GET " + std::string(path) + " HTTP/1.1\r\nHost: localhost\r\n\r\n";
+  if (send(fd, request.data(), request.size(), MSG_NOSIGNAL) != static_cast<ssize_t>(request.size())) {
+    ADD_FAILURE() << "send errno=" << errno;
+    close(fd);
+    return {};
+  }
+  std::string response;
+  char buffer[2048];
+  ssize_t bytes;
+  while ((bytes = recv(fd, buffer, sizeof(buffer), 0)) > 0) {
+    response.append(buffer, static_cast<std::size_t>(bytes));
+  }
+  if (bytes < 0) {
+    ADD_FAILURE() << "recv errno=" << errno;
+  }
+  close(fd);
+  return response;
+}
+
+TEST(AdminServerTest, HealthAndStatusFollowLifecycleAndUnregisterOnDestruction) {
+  Scheduler scheduler {1, 1};
+  Context& context = scheduler.GetIOContext(0);
+  AdminServer admin(context);
+  ASSERT_TRUE(admin.Start());
+  scheduler.Start();
+  EXPECT_TRUE(FetchAdmin(admin, "/health").starts_with("HTTP/1.1 503"));
+  EXPECT_NE(FetchAdmin(admin, "/status").find("{\"ready\":false,\"servers\":[]}"), std::string::npos);
+
+  auto server = std::make_unique<RpcServer>(context, 0);
+  ASSERT_TRUE(admin.AddServer("echo\"\\\n", *server));
+  EXPECT_TRUE(FetchAdmin(admin, "/health").starts_with("HTTP/1.1 503"));
+  EXPECT_NE(FetchAdmin(admin, "/status").find("\"state\":\"created\""), std::string::npos);
+  ASSERT_TRUE(server->Start());
+  EXPECT_TRUE(FetchAdmin(admin, "/health").starts_with("HTTP/1.1 200"));
+  const auto status = FetchAdmin(admin, "/status/");
+  EXPECT_TRUE(status.starts_with("HTTP/1.1 200"));
+  EXPECT_NE(status.find("Content-Type: application/json"), std::string::npos);
+  EXPECT_NE(status.find("\"ready\":true"), std::string::npos);
+  EXPECT_NE(status.find("\"name\":\"echo\\\"\\\\\\u000a\""), std::string::npos);
+  EXPECT_NE(status.find("\"state\":\"running\""), std::string::npos);
+  EXPECT_NE(status.find("\"active_connections\":0"), std::string::npos);
+  EXPECT_NE(status.find("\"io_command_backlog\":0"), std::string::npos);
+
+  server->Stop();
+  EXPECT_TRUE(FetchAdmin(admin, "/health").starts_with("HTTP/1.1 503"));
+  EXPECT_NE(FetchAdmin(admin, "/status").find("\"state\":\"stopping\""), std::string::npos);
+  EXPECT_TRUE(server->Join());
+  EXPECT_NE(FetchAdmin(admin, "/status").find("\"state\":\"stopped\""), std::string::npos);
+  server.reset();
+  EXPECT_TRUE(FetchAdmin(admin, "/health").starts_with("HTTP/1.1 503"));
+  EXPECT_NE(FetchAdmin(admin, "/status").find("\"servers\":[]"), std::string::npos);
+  EXPECT_EQ(FetchAdmin(admin, "/metrics").find("{server="), std::string::npos);
+  auto replacement = std::make_unique<RpcServer>(context, 0);
+  EXPECT_TRUE(admin.AddServer("echo\"\\\n", *replacement));
+  replacement.reset();
+  EXPECT_TRUE(FetchAdmin(admin, "/missing").starts_with("HTTP/1.1 404"));
+  admin.Stop();
+  scheduler.Stop();
+}
+
+TEST(AdminServerTest, ConcurrentQueriesAndDestructionRemoveAllAliasesAndObservers) {
+  Scheduler scheduler {1, 1};
+  auto first = std::make_shared<detail::AdminServerState>(scheduler.GetIOContext(0));
+  auto second = std::make_shared<detail::AdminServerState>(scheduler.GetIOContext(0));
+  auto server = std::make_unique<RpcServer>(scheduler.GetIOContext(0), 0);
+  ASSERT_TRUE(first->AddSource("one", *server));
+  ASSERT_TRUE(first->AddSource("alias", *server));
+  ASSERT_TRUE(second->AddSource("two", *server));
+  std::atomic<bool> stop {false};
+  absl::Notification entered;
+  std::thread reader([&] {
+    entered.Notify();
+    while (!stop.load(std::memory_order_acquire)) {
+      (void)first->StatusText();
+      (void)first->Healthy();
+      (void)first->MetricsText();
+      (void)second->StatusText();
+    }
+  });
+  entered.WaitForNotification();
+  server.reset();
+  EXPECT_EQ(first->StatusText(), "{\"ready\":false,\"servers\":[]}\n");
+  EXPECT_EQ(second->StatusText(), "{\"ready\":false,\"servers\":[]}\n");
+  EXPECT_EQ(first->MetricsText().find("{server="), std::string::npos);
+  stop.store(true, std::memory_order_release);
+  reader.join();
+  // Reverse lifetime order: expired observers do not retain or dereference admin state.
+  auto another = std::make_unique<RpcServer>(scheduler.GetIOContext(0), 0);
+  ASSERT_TRUE(first->AddSource("one", *another));
+  first.reset();
+  another.reset();
+}
+
+TEST(AdminServerTest, HealthRequiresAllRegisteredServersRunning) {
+  Scheduler scheduler {1, 1};
+  Context& context = scheduler.GetIOContext(0);
+  RpcServer running(context, 0);
+  ASSERT_TRUE(running.Start());
+  // Binding the same endpoint produces a real startup failure.
+  RpcServer failed(context, running.GetEndPoint());
+  EXPECT_FALSE(failed.Start());
+  ASSERT_EQ(failed.status(), RpcServer::Status::kFailed);
+  AdminServer admin(context);
+  ASSERT_TRUE(admin.AddServer("running", running));
+  ASSERT_TRUE(admin.AddServer("failed", failed));
+  ASSERT_TRUE(admin.Start());
+  scheduler.Start();
+  EXPECT_TRUE(FetchAdmin(admin, "/health").starts_with("HTTP/1.1 503"));
+  const auto status = FetchAdmin(admin, "/status");
+  EXPECT_TRUE(status.starts_with("HTTP/1.1 200"));
+  EXPECT_NE(status.find("\"state\":\"failed\""), std::string::npos);
+  EXPECT_NE(status.find("\"state\":\"running\""), std::string::npos);
+  admin.Stop();
+  running.Stop();
+  EXPECT_TRUE(running.Join());
+  failed.Stop();
+  EXPECT_TRUE(failed.Join());
+  scheduler.Stop();
+}
+
 TEST(AdminServerTest, ServesRpcMetricsOnTheSameContext) {
   Scheduler scheduler {1, 2};
   Context& rpc_context = scheduler.GetIOContext(0);

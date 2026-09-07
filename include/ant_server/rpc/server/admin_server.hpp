@@ -2,6 +2,7 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <memory>
@@ -32,7 +33,42 @@ class AdminConnection;
 struct AdminMetricSource {
   std::string name;
   std::shared_ptr<const ServerMetrics> metrics;
+  const RpcServer* server;
 };
+
+inline std::string_view ServerStatusName(RpcServer::Status status) {
+  switch (status) {
+    case RpcServer::Status::kCreated:
+      return "created";
+    case RpcServer::Status::kRunning:
+      return "running";
+    case RpcServer::Status::kStopping:
+      return "stopping";
+    case RpcServer::Status::kStopped:
+      return "stopped";
+    case RpcServer::Status::kFailed:
+      return "failed";
+  }
+  return "unknown";
+}
+
+inline std::string EscapeJson(std::string_view value) {
+  std::string result;
+  constexpr char kHex[] = "0123456789abcdef";
+  for (unsigned char c : value) {
+    if (c == '"' || c == '\\') {
+      result += '\\';
+      result += static_cast<char>(c);
+    } else if (c < 0x20) {
+      result += "\\u00";
+      result += kHex[c >> 4];
+      result += kHex[c & 15];
+    } else {
+      result += static_cast<char>(c);
+    }
+  }
+  return result;
+}
 
 inline std::string EscapePrometheusLabel(std::string_view value) {
   std::string result;
@@ -55,12 +91,12 @@ inline std::string EscapePrometheusLabel(std::string_view value) {
   return result;
 }
 
-class AdminServerState final {
+class AdminServerState final : public ServerObserver, public std::enable_shared_from_this<AdminServerState> {
  public:
   explicit AdminServerState(Context& context) : context(context) {}
 
-  bool AddSource(std::string name, std::shared_ptr<const ServerMetrics> metrics) {
-    if (name.empty() || !metrics) {
+  bool AddSource(std::string name, const RpcServer& server) {
+    if (name.empty()) {
       return false;
     }
     absl::MutexLock lock(&sources_mu);
@@ -69,16 +105,52 @@ class AdminServerState final {
         return false;
       }
     }
-    sources.push_back({std::move(name), std::move(metrics)});
+    server.RegisterObserver(shared_from_this());
+    sources.push_back({std::move(name), server.metrics_handle(), &server});
     return true;
   }
 
-  std::string MetricsText() const {
-    std::vector<AdminMetricSource> snapshot;
-    {
-      absl::MutexLock lock(&sources_mu);
-      snapshot = sources;
+  void RemoveServer(const RpcServer* server) override {
+    absl::MutexLock lock(&sources_mu);
+    std::erase_if(sources, [server](const auto& source) { return source.server == server; });
+  }
+
+  // Readiness, not a proof that workers are making progress or dependencies
+  // are healthy. Metrics/status are independently sampled observations.
+  bool Healthy() const {
+    absl::MutexLock lock(&sources_mu);
+    return accepting.load(std::memory_order_acquire) && !sources.empty() &&
+           std::all_of(sources.begin(), sources.end(),
+                       [](const auto& source) { return source.server->status() == RpcServer::Status::kRunning; });
+  }
+
+  std::string StatusText() const {
+    // Keep the registration lock until all accesses to server/metrics finish.
+    // RpcServer destruction removes its entries under the same lock.
+    absl::MutexLock lock(&sources_mu);
+    const auto& snapshot = sources;
+    bool ready = accepting.load(std::memory_order_acquire) && !snapshot.empty();
+    std::ostringstream servers;
+    bool first = true;
+    for (const auto& source : snapshot) {
+      const auto status = source.server->status();
+      ready = ready && status == RpcServer::Status::kRunning;
+      if (!std::exchange(first, false)) {
+        servers << ',';
+      }
+      servers << "{\"name\":\"" << EscapeJson(source.name) << "\",\"state\":\"" << ServerStatusName(status)
+              << "\",\"active_connections\":" << source.metrics->active_connections.Value()
+              << ",\"active_in_flight\":" << source.metrics->active_in_flight.Value()
+              << ",\"pending_worker_tasks\":" << source.metrics->pending_worker_tasks.Value()
+              << ",\"io_command_backlog\":" << source.metrics->io_command_backlog.Value()
+              << ",\"outbound_bytes\":" << source.metrics->outbound_bytes.Value() << '}';
     }
+    return std::string("{\"ready\":") + (ready ? "true" : "false") + ",\"servers\":[" + servers.str() + "]}\n";
+  }
+
+  std::string MetricsText() const {
+    absl::MutexLock lock(&sources_mu);
+    const auto& snapshot = sources;
 
     std::ostringstream output;
     output << "# TYPE ant_rpc_server_requests_received_total counter\n";
@@ -188,11 +260,11 @@ class AdminConnection final : public IoCommandMailbox, public std::enable_shared
   }
 
  private:
-  static void AppendResponse(butil::IOBuf& output, int status, std::string_view reason, std::string_view body) {
-    const std::string headers =
-        "HTTP/1.1 " + std::to_string(status) + " " + std::string(reason) +
-        "\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: " + std::to_string(body.size()) +
-        "\r\nConnection: close\r\n\r\n";
+  static void AppendResponse(butil::IOBuf& output, int status, std::string_view reason, std::string_view body,
+                             std::string_view content_type = "text/plain; charset=utf-8") {
+    const std::string headers = "HTTP/1.1 " + std::to_string(status) + " " + std::string(reason) +
+                                "\r\nContent-Type: " + std::string(content_type) +
+                                "\r\nContent-Length: " + std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n";
     output.append(headers);
     output.append(body.data(), body.size());
   }
@@ -208,9 +280,13 @@ class AdminConnection final : public IoCommandMailbox, public std::enable_shared
         if (request.method != "GET") {
           AppendResponse(output, 405, "Method Not Allowed", "only GET is supported\n");
         } else if (request.url == "/metrics") {
-          AppendResponse(output, 200, "OK", self->state_->MetricsText());
+          AppendResponse(output, 200, "OK", self->state_->MetricsText(), "text/plain; version=0.0.4");
         } else if (request.url == "/health") {
-          AppendResponse(output, 200, "OK", "ok\n");
+          const bool healthy = self->state_->Healthy();
+          AppendResponse(output, healthy ? 200 : 503, healthy ? "OK" : "Service Unavailable",
+                         healthy ? "ok\n" : "not ready\n");
+        } else if (request.url == "/status" || request.url == "/status/") {
+          AppendResponse(output, 200, "OK", self->state_->StatusText(), "application/json; charset=utf-8");
         } else {
           AppendResponse(output, 404, "Not Found", "not found\n");
         }
@@ -292,9 +368,7 @@ class AdminServer {
   AdminServer(const AdminServer&) = delete;
   AdminServer& operator=(const AdminServer&) = delete;
 
-  bool AddServer(std::string name, const RpcServer& server) {
-    return state_->AddSource(std::move(name), server.metrics_handle());
-  }
+  bool AddServer(std::string name, const RpcServer& server) { return state_->AddSource(std::move(name), server); }
 
   [[nodiscard]] ant_server::metrics::MetricRegistry& Registry() noexcept { return state_->registry; }
 

@@ -2,7 +2,7 @@
 
 #include <unistd.h>
 
-#include <atomic>
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <utility>
@@ -20,6 +20,17 @@
 
 namespace ant_server::rpc {
 
+class RpcServer;
+namespace detail {
+// Removal must wait for ongoing queries before returning. Observers are weakly
+// held so an admin endpoint may be destroyed before its registered servers.
+class ServerObserver {
+ public:
+  virtual ~ServerObserver() = default;
+  virtual void RemoveServer(const RpcServer* server) = 0;
+};
+}  // namespace detail
+
 // Public listen/accept/service facade. Per-connection IO lives in
 // server_connection.hpp and is not mixed into this lifecycle API.
 class RpcServer {
@@ -34,6 +45,17 @@ class RpcServer {
   explicit RpcServer(Context& ctx, int port, butil::ip_t ip = butil::IP_ANY, RpcServerOptions options = {})
       : RpcServer(ctx, butil::EndPoint(ip, port), std::move(options)) {}
   ~RpcServer() {
+    std::vector<std::weak_ptr<detail::ServerObserver>> observers;
+    {
+      absl::MutexLock lock(&observers_mu_);
+      observers.swap(observers_);
+    }
+    // No lifecycle lock is held: an ongoing admin query may need status().
+    for (const auto& observer : observers) {
+      if (auto live = observer.lock()) {
+        live->RemoveServer(this);
+      }
+    }
     Stop();
     Join();
   }
@@ -97,7 +119,7 @@ class RpcServer {
       if (status_ == Status::kStopped || status_ == Status::kStopping) {
         return;
       }
-      status_ = (status_ == Status::kRunning) ? Status::kStopping : Status::kStopped;
+      status_ = status_ == Status::kRunning ? Status::kStopping : Status::kStopped;
     }
     if (server_socket_ >= 0) {
       shutdown(server_socket_, SHUT_RDWR);
@@ -141,13 +163,27 @@ class RpcServer {
     return status_;
   }
 
+  // Registration, like other facade API calls, must not race destruction.
+  void RegisterObserver(const std::shared_ptr<detail::ServerObserver>& observer) const {
+    absl::MutexLock lock(&observers_mu_);
+    std::erase_if(observers_, [](const auto& entry) { return entry.expired(); });
+    for (const auto& entry : observers_) {
+      if (entry.lock() == observer) {
+        return;
+      }
+    }
+    observers_.push_back(observer);
+  }
+
  private:
   Context& ctx_;
   butil::EndPoint endpoint_;
   const RpcServerOptions options_;
   std::shared_ptr<detail::ServerRuntime> runtime_;
   mutable absl::Mutex lifecycle_mu_;
-  Status status_ {Status::kCreated};
+  Status status_ ABSL_GUARDED_BY(lifecycle_mu_) {Status::kCreated};
+  mutable absl::Mutex observers_mu_;
+  mutable std::vector<std::weak_ptr<detail::ServerObserver>> observers_ ABSL_GUARDED_BY(observers_mu_);
   int server_socket_ {-1};
   ServiceRegistry registry_;
   std::vector<std::shared_ptr<google::protobuf::Service>> owned_services_;
