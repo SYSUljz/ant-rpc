@@ -127,7 +127,7 @@ class RpcChannelIoDriver : public IoCommandMailbox, public std::enable_shared_fr
   bool writing_ {false};
   bool connect_started_ {false};
   bool connect_operation_exited_ {false};
-  BaseAwaiter* active_connect_ {nullptr};
+  IOHandler* active_connect_ {nullptr};
 };
 
 inline void RpcChannelIoDriver::RequestClose() {

@@ -7,6 +7,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(ANT_SERVER_ENABLE_TSAN "Build every target with ThreadSanitizer" OFF)
+set(ANT_SERVER_IO_BACKEND "epoll" CACHE STRING "Socket runtime: epoll or io_uring")
+set_property(CACHE ANT_SERVER_IO_BACKEND PROPERTY STRINGS epoll io_uring)
 if(ANT_SERVER_ENABLE_TSAN)
     if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         message(FATAL_ERROR "ANT_SERVER_ENABLE_TSAN requires Clang or GCC")
@@ -15,8 +17,15 @@ if(ANT_SERVER_ENABLE_TSAN)
     add_link_options(-fsanitize=thread)
 endif()
 
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(URING REQUIRED liburing)
+if(ANT_SERVER_IO_BACKEND STREQUAL "io_uring")
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(URING REQUIRED liburing)
+    set(ANT_SERVER_IO_BACKEND_DEFINE ANT_SERVER_USE_IO_URING=1)
+elseif(ANT_SERVER_IO_BACKEND STREQUAL "epoll")
+    set(ANT_SERVER_IO_BACKEND_DEFINE ANT_SERVER_USE_EPOLL=1)
+else()
+    message(FATAL_ERROR "ANT_SERVER_IO_BACKEND must be epoll or io_uring")
+endif()
 
 # --- FetchContent Dependencies ---
 include(FetchContent)
@@ -99,6 +108,7 @@ target_include_directories(ant_server INTERFACE
 )
 target_link_libraries(ant_server INTERFACE butil llhttp echo_proto protobuf::libprotobuf absl::flat_hash_map
     absl::log absl::log_initialize absl::log_globals)
+target_compile_definitions(ant_server INTERFACE ${ANT_SERVER_IO_BACKEND_DEFINE})
 
 # Executables for demo / server testing
 add_executable(test_server test/main.cpp)

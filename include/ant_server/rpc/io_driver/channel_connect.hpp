@@ -20,7 +20,8 @@ inline void RpcChannelIoDriver::StartOnIoThread() {
 }
 
 inline Task<int> RpcChannelIoDriver::AwaitConnectCompletion(std::shared_ptr<RpcChannelIoDriver> self) {
-  ConnectAwaiter connect_awaiter(self->context_, self->fd(), reinterpret_cast<const sockaddr*>(&self->connect_address_),
+  ConnectAwaiter connect_awaiter(self->context_, SocketHandle::Native(self->fd()),
+                                 reinterpret_cast<const sockaddr*>(&self->connect_address_),
                                  self->connect_address_len_);
   self->active_connect_ = &connect_awaiter;
   const int result = co_await connect_awaiter;
@@ -56,7 +57,7 @@ inline DetachedTask RpcChannelIoDriver::ConnectOnIoThread(std::shared_ptr<RpcCha
 
 inline void RpcChannelIoDriver::CancelPendingConnectOnIoThread() {
   if (active_connect_) {
-    context_.UseService<IOuringSocketService>().SubmitCancel(active_connect_);
+    CancelSocketOperation(context_, active_connect_);
   }
 }
 

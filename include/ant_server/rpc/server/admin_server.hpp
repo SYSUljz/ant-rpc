@@ -255,7 +255,7 @@ class AdminConnection final : public IoCommandMailbox, public std::enable_shared
   }
   void DrainCommandsOnIoThread() override {
     if (close_requested_.load(std::memory_order_acquire) && fd_ >= 0) {
-      state_->context.UseService<IOuringSocketService>().SubmitShutdown(fd_, SHUT_RDWR, /*is_fixed=*/true);
+      ShutdownSocket(state_->context, AcceptedSocket(fd_), SHUT_RDWR);
     }
   }
 
@@ -315,7 +315,7 @@ class AdminConnection final : public IoCommandMailbox, public std::enable_shared
 
   void CloseOnIoThread() {
     if (const int fd = std::exchange(fd_, -1); fd >= 0) {
-      state_->context.UseService<IOuringSocketService>().SubmitClose(fd, nullptr, /*is_fixed=*/true);
+      CloseSocket(state_->context, AcceptedSocket(fd));
     }
     state_->ReleaseConnection(shared_from_this());
   }
@@ -387,7 +387,7 @@ class AdminServer {
     }
     acceptor_ = std::make_unique<Acceptor>(state_->context, listen_fd_, [state = state_](int client_fd) {
       if (!state->accepting.load(std::memory_order_acquire)) {
-        state->context.UseService<IOuringSocketService>().SubmitClose(client_fd, nullptr, /*is_fixed=*/true);
+        CloseSocket(state->context, AcceptedSocket(client_fd));
         return;
       }
       auto connection = std::make_shared<detail::AdminConnection>(state, client_fd);

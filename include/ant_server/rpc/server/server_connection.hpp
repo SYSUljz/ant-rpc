@@ -377,7 +377,7 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
   void BeginCloseOnIoThread() {
     CancelIdleTimer();
     if (const int socket = fd(); socket >= 0) {
-      context_.UseService<IOuringSocketService>().SubmitShutdown(socket, SHUT_RDWR, /*is_fixed=*/true);
+      ShutdownSocket(context_, AcceptedSocket(socket), SHUT_RDWR);
     }
     DiscardQueuedOutboundOnIoThread();
     if (!receiver_started_) {
@@ -391,7 +391,7 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
     }
     CancelIdleTimer();
     if (const int socket = fd_.exchange(-1, std::memory_order_acq_rel); socket >= 0) {
-      context_.UseService<IOuringSocketService>().SubmitClose(socket, nullptr, /*is_fixed=*/true);
+      CloseSocket(context_, AcceptedSocket(socket));
     }
     if (!inbound_calls_.empty()) {
       return;
@@ -478,7 +478,7 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
           // wait for another read CQE to make that visible to the peer.
           self->running_.store(false, std::memory_order_release);
           if (const int socket = self->fd(); socket >= 0) {
-            self->context_.UseService<IOuringSocketService>().SubmitShutdown(socket, SHUT_RDWR, /*is_fixed=*/true);
+            ShutdownSocket(self->context_, AcceptedSocket(socket), SHUT_RDWR);
           }
           break;
         }
@@ -489,7 +489,7 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
           // a server connection. Treat it as a terminal protocol violation.
           self->running_.store(false, std::memory_order_release);
           if (const int socket = self->fd(); socket >= 0) {
-            self->context_.UseService<IOuringSocketService>().SubmitShutdown(socket, SHUT_RDWR, /*is_fixed=*/true);
+            ShutdownSocket(self->context_, AcceptedSocket(socket), SHUT_RDWR);
           }
           break;
         }
@@ -618,7 +618,7 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
         self->RecordCloseReason(ConnectionCloseReason::kWriteError);
         self->running_.store(false, std::memory_order_release);
         if (const int socket = self->fd(); socket >= 0) {
-          self->context_.UseService<IOuringSocketService>().SubmitShutdown(socket, SHUT_RDWR, /*is_fixed=*/true);
+          ShutdownSocket(self->context_, AcceptedSocket(socket), SHUT_RDWR);
         }
         break;
       }
@@ -795,7 +795,7 @@ inline void ServerRuntime::CancelGracefulStopTimer() {
 inline DetachedTask handle_rpc_client(Context& ctx, int client_fd, ServiceRegistry& registry) {
   auto runtime = std::make_shared<ServerRuntime>(ctx, RpcServerOptions {});
   if (!runtime->TryAcquireConnection()) {
-    ctx.UseService<IOuringSocketService>().SubmitClose(client_fd, nullptr, /*is_fixed=*/true);
+    CloseSocket(ctx, AcceptedSocket(client_fd));
     co_return;
   }
   auto connection = std::make_shared<ServerConnection>(ctx, client_fd, registry, runtime);
