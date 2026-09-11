@@ -98,6 +98,8 @@ struct ServerMetrics {
   ant_server::metrics::Counter responses_enqueued;
   // An asynchronous socket write failed after a response was queued.
   ant_server::metrics::Counter write_errors;
+  // A write completion made forward progress but left bytes in the same frame.
+  ant_server::metrics::Counter partial_write_completions;
   ant_server::metrics::Counter protocol_errors;
 
   ant_server::metrics::Gauge active_connections;

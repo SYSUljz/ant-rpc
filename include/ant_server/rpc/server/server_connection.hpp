@@ -615,6 +615,7 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
   }
   DetachedTask WriteFrame(std::shared_ptr<ServerConnection> self, OutboundFrame frame) {
     while (!frame.buffer.empty() && self->running_.load(std::memory_order_acquire)) {
+      const std::size_t offered = frame.buffer.size();
       const int written = co_await IOBufWriteAwaiter(self->context_, self->fd(), frame.buffer, self->is_fixed_file_);
       if (!self->running_.load(std::memory_order_acquire) || written <= 0) {
         self->runtime_->metrics().write_errors.Add();
@@ -624,6 +625,9 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
           ShutdownSocket(self->context_, SocketHandle::Native(socket), SHUT_RDWR);
         }
         break;
+      }
+      if (static_cast<std::size_t>(written) < offered) {
+        self->runtime_->metrics().partial_write_completions.Add();
       }
       frame.buffer.pop_front(static_cast<std::size_t>(written));
       self->ReleaseOutboundBytes(static_cast<std::size_t>(written));

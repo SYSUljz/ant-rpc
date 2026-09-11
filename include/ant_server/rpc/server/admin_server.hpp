@@ -156,6 +156,7 @@ class AdminServerState final : public ServerObserver, public std::enable_shared_
     output << "# TYPE ant_rpc_server_requests_received_total counter\n";
     output << "# TYPE ant_rpc_server_calls_completed_total counter\n";
     output << "# TYPE ant_rpc_server_responses_enqueued_total counter\n";
+    output << "# TYPE ant_rpc_server_partial_write_completions_total counter\n";
     output << "# TYPE ant_rpc_server_active_connections gauge\n";
     output << "# TYPE ant_rpc_server_pending_worker_tasks gauge\n";
     output << "# TYPE ant_rpc_server_outbound_bytes gauge\n";
@@ -187,6 +188,8 @@ class AdminServerState final : public ServerObserver, public std::enable_shared_
                     source.metrics->requests_rejected_overload.Value());
       write_counter("ant_rpc_server_responses_enqueued_total", source.metrics->responses_enqueued.Value());
       write_counter("ant_rpc_server_write_errors_total", source.metrics->write_errors.Value());
+      write_counter("ant_rpc_server_partial_write_completions_total",
+                    source.metrics->partial_write_completions.Value());
       write_counter("ant_rpc_server_protocol_errors_total", source.metrics->protocol_errors.Value());
       write_gauge("ant_rpc_server_active_connections", source.metrics->active_connections.Value());
       write_gauge("ant_rpc_server_active_in_flight", source.metrics->active_in_flight.Value());

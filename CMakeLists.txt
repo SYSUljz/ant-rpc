@@ -127,6 +127,7 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 add_executable(rpc_e2e_server test/e2e/rpc_e2e_server.cpp)
 target_link_libraries(rpc_e2e_server PRIVATE ant_server ${URING_LIBRARIES} absl::synchronization absl::base)
+target_compile_definitions(rpc_e2e_server PRIVATE ANT_SERVER_ENABLE_TEST_SOCKET_FAULT_INJECTION=1)
 
 add_executable(rpc_e2e_client test/e2e/rpc_e2e_client.cpp)
 target_link_libraries(rpc_e2e_client PRIVATE ant_server ${URING_LIBRARIES} absl::synchronization absl::base)

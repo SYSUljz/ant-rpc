@@ -72,6 +72,34 @@ def read_ready(server: subprocess.Popen[str]) -> tuple[int, int]:
     raise RuntimeError("server did not announce READY")
 
 
+def start_server(server_path: str, *options: str) -> tuple[subprocess.Popen[str], int, int]:
+    server = subprocess.Popen([server_path, "--port", "0", *options], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True)
+    try:
+        port, admin_port = read_ready(server)
+        return server, port, admin_port
+    except BaseException:
+        stop_server(server)
+        raise
+
+
+def wait_for_server_line(server: subprocess.Popen[str], expected: str) -> None:
+    if server.stdout is None:
+        raise RuntimeError("server stdout is not piped")
+    selector = selectors.DefaultSelector()
+    selector.register(server.stdout, selectors.EVENT_READ)
+    deadline = time.monotonic() + 3
+    try:
+        while time.monotonic() < deadline and server.poll() is None:
+            if not selector.select(max(0.0, deadline - time.monotonic())):
+                continue
+            if server.stdout.readline().strip() == expected:
+                return
+    finally:
+        selector.close()
+    raise RuntimeError(f"server did not announce {expected}")
+
+
 def stop_server(server: subprocess.Popen[str]) -> tuple[str, str]:
     if server.poll() is None and server.stdin is not None:
         try:
@@ -200,6 +228,14 @@ def metric_value(metrics: str, name: str) -> int:
     raise RuntimeError(f"missing metric {name} in /metrics output")
 
 
+def connection_close_metric(metrics: str, reason: str) -> int:
+    prefix = f'ant_rpc_server_connection_closes_total{{server="e2e",reason="{reason}"}} '
+    for line in metrics.splitlines():
+        if line.startswith(prefix):
+            return int(line[len(prefix):])
+    raise RuntimeError(f"missing connection close reason {reason} in /metrics output")
+
+
 def verify_admin_endpoints(admin_port: int) -> None:
     health_header, health_body = admin_get(admin_port, "/health")
     if not health_header.startswith("HTTP/1.1 200 OK") or health_body != "ok\n":
@@ -223,6 +259,69 @@ def verify_large_pipelined_requests(port: int) -> None:
     for message in messages:
         if not any(("Echo: " + message).encode() in response for response in responses):
             raise RuntimeError(f"pipelined response missing message with length {len(message)}")
+
+
+def verify_worker_queue_overload(server_path: str) -> None:
+    # One worker runs the blocker, the next request occupies the bounded worker
+    # queue, and the third must receive a normal overload response rather than
+    # being silently dropped or hanging.
+    server, port, admin_port = start_server(server_path, "--worker-threads", "1", "--max-pending-worker-tasks", "1")
+    failure: BaseException | None = None
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
+            connection.settimeout(4)
+            connection.sendall(request_frame(4001, "queue-blocker"))
+            wait_for_server_line(server, "QUEUE_BLOCKER_STARTED")
+            connection.sendall(request_frame(4002, "queued-after-blocker") + request_frame(4003, "must-overload"))
+            responses = {recv_frame(connection), recv_frame(connection), recv_frame(connection)}
+        if not any(b"Echo: queue-blocker" in response for response in responses):
+            raise RuntimeError("worker queue test lost its running request")
+        if not any(b"Echo: queued-after-blocker" in response for response in responses):
+            raise RuntimeError("worker queue test lost its queued request")
+        if not any(b"RPC worker queue limit reached" in response for response in responses):
+            raise RuntimeError("worker queue saturation did not return an overload response")
+        if metric_value(read_metrics(admin_port), "ant_rpc_server_requests_rejected_overload_total") < 1:
+            raise RuntimeError("worker queue overload was not counted")
+    except BaseException as error:
+        failure = error
+    finally:
+        stdout, stderr = stop_server(server)
+    if failure:
+        raise RuntimeError(f"worker queue overload test failed: {failure}\nserver stdout:\n{stdout}\nserver stderr:\n{stderr}")
+    if server.returncode != 0:
+        raise RuntimeError(f"worker queue server exited {server.returncode}\nstdout:\n{stdout}\nstderr:\n{stderr}")
+
+
+def verify_outbound_queue_overload(server_path: str) -> None:
+    # A wire-valid response larger than the connection's outbound budget
+    # cannot be safely replied to. The documented outcome is a close, not a
+    # truncated response or an unbounded queue.
+    server, port, admin_port = start_server(server_path, "--max-outbound-bytes", "512")
+    failure: BaseException | None = None
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
+            connection.settimeout(3)
+            connection.sendall(request_frame(5001, "outbound-" + "x" * 4096))
+            try:
+                if connection.recv(1):
+                    raise RuntimeError("outbound budget overflow produced a partial response")
+            except ConnectionResetError:
+                pass
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if connection_close_metric(read_metrics(admin_port), "resource_limit") >= 1:
+                break
+            time.sleep(0.02)
+        else:
+            raise RuntimeError("outbound budget overflow did not close with resource_limit")
+    except BaseException as error:
+        failure = error
+    finally:
+        stdout, stderr = stop_server(server)
+    if failure:
+        raise RuntimeError(f"outbound queue overload test failed: {failure}\nserver stdout:\n{stdout}\nserver stderr:\n{stderr}")
+    if server.returncode != 0:
+        raise RuntimeError(f"outbound queue server exited {server.returncode}\nstdout:\n{stdout}\nstderr:\n{stderr}")
 
 
 def verify_out_of_order_completion(port: int) -> None:
@@ -282,16 +381,36 @@ def verify_peer_disconnect_releases_connection(port: int, admin_port: int) -> No
     raise RuntimeError("partial-frame peer disconnect leaked an active connection")
 
 
+def verify_graceful_stop_allows_in_flight_slow_call(server: subprocess.Popen[str], port: int) -> None:
+    # Stop only after the service has definitely begun. The server's 500ms
+    # graceful deadline must admit the existing 120ms call, while refusing a
+    # subsequent request carried by that same keep-alive connection.
+    if server.stdin is None:
+        raise RuntimeError("server stdin is not piped")
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
+        connection.settimeout(3)
+        connection.sendall(request_frame(3501, "graceful-slow"))
+        wait_for_server_line(server, "CALL_STARTED")
+        server.stdin.write("stop\n")
+        server.stdin.flush()
+        wait_for_server_line(server, "STOPPING")
+        connection.sendall(request_frame(3502, "after-stop"))
+        responses = {recv_frame(connection), recv_frame(connection)}
+
+    if not any(b"Echo: graceful-slow" in response for response in responses):
+        raise RuntimeError("graceful stop discarded a slow call before its deadline")
+    if not any(b"RPC server is stopping" in response for response in responses):
+        raise RuntimeError("server accepted a new request after graceful stop began")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--server", required=True)
     parser.add_argument("--client", required=True)
     args = parser.parse_args()
-    server = subprocess.Popen([args.server, "--port", "0"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, text=True)
+    server, port, admin_port = start_server(args.server, "--max-write-bytes", "1024")
     failure: str | None = None
     try:
-        port, admin_port = read_ready(server)
         verify_admin_endpoints(admin_port)
         # Large enough to exercise connection reuse, concurrent channels and
         # repeated slot allocation, while remaining suitable for normal CTest.
@@ -309,6 +428,8 @@ def main() -> int:
         if metric_value(metrics, "ant_rpc_server_call_errors_total") != 0:
             raise RuntimeError("/metrics reported an unexpected request error")
         verify_large_pipelined_requests(port)
+        if metric_value(read_metrics(admin_port), "ant_rpc_server_partial_write_completions_total") < 1:
+            raise RuntimeError("configured write quantum did not produce a partial write completion")
         verify_out_of_order_completion(port)
         verify_async_done_from_foreign_thread(port)
         verify_peer_disconnect_releases_connection(port, admin_port)
@@ -329,6 +450,9 @@ def main() -> int:
         verify_client_rejects_bad_response(args.client, "oversized-length",
                                             wire_header(body_len=0xFFFFFFFF, meta_len=0xFFFFFFFF))
         verify_client_rejects_bad_response(args.client, "message-type", non_response_frame())
+        # This intentionally stops the server, so it must be the last server
+        # interaction in the process scenario.
+        verify_graceful_stop_allows_in_flight_slow_call(server, port)
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
         failure = str(error)
     finally:
@@ -338,6 +462,12 @@ def main() -> int:
         return 1
     if server.returncode != 0:
         print(f"server exited {server.returncode}\nstdout:\n{stdout}\nstderr:\n{stderr}", file=sys.stderr)
+        return 1
+    try:
+        verify_worker_queue_overload(args.server)
+        verify_outbound_queue_overload(args.server)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+        print(f"rpc process E2E overload phase failed: {error}", file=sys.stderr)
         return 1
     return 0
 

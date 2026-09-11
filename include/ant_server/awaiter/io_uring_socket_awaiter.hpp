@@ -12,6 +12,9 @@
 #include "ant_server/type.hpp"
 #include "butil/iobuf.h"
 #include "liburing.h"
+#if defined(ANT_SERVER_ENABLE_TEST_SOCKET_FAULT_INJECTION)
+#include "ant_server/testing/socket_fault_injector.hpp"
+#endif
 
 struct BaseAwaiter : IOHandler {
   explicit BaseAwaiter(Context& context) : context_(context) {}
@@ -155,14 +158,26 @@ class UringIOBufWriteAwaiter final : public BaseAwaiter {
 
  private:
   void Init() {
-    count = std::min(source.backing_block_num(), std::size_t {64});
-    if (!count) {
+    const std::size_t capacity = std::min(source.backing_block_num(), std::size_t {64});
+    if (!capacity) {
       return;
     }
-    iov = std::make_unique<iovec[]>(count);
-    for (std::size_t i = 0; i < count; ++i) {
+    iov = std::make_unique<iovec[]>(capacity);
+    std::size_t max_bytes = 0;
+#if defined(ANT_SERVER_ENABLE_TEST_SOCKET_FAULT_INJECTION)
+    max_bytes = ant_server::testing::SocketFaultInjector::MaxWriteBytes();
+#endif
+    std::size_t remaining = max_bytes;
+    for (std::size_t i = 0; i < capacity && (max_bytes == 0 || remaining > 0); ++i) {
       auto b = source.backing_block(i);
-      iov[i] = {const_cast<char*>(b.data()), b.size()};
+      const std::size_t bytes = max_bytes == 0 ? b.size() : std::min(b.size(), remaining);
+      if (bytes == 0) {
+        break;
+      }
+      iov[count++] = {const_cast<char*>(b.data()), bytes};
+      if (max_bytes != 0) {
+        remaining -= bytes;
+      }
     }
   }
   SocketHandle socket;
