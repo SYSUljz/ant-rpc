@@ -172,9 +172,14 @@ def verify_client_rejects_bad_response(client_path: str, name: str, response: by
 
 
 def read_metrics(admin_port: int) -> str:
+    _, body = admin_get(admin_port, "/metrics")
+    return body
+
+
+def admin_get(admin_port: int, path: str) -> tuple[str, str]:
     with socket.create_connection(("127.0.0.1", admin_port), timeout=3) as connection:
         connection.settimeout(3)
-        connection.sendall(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        connection.sendall(f"GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n".encode())
         response = bytearray()
         while True:
             chunk = connection.recv(4096)
@@ -182,9 +187,9 @@ def read_metrics(admin_port: int) -> str:
                 break
             response.extend(chunk)
     header, separator, body = bytes(response).partition(b"\r\n\r\n")
-    if not separator or not header.startswith(b"HTTP/1.1 200 OK"):
-        raise RuntimeError(f"admin server returned invalid /metrics response: {bytes(response)!r}")
-    return body.decode("utf-8")
+    if not separator:
+        raise RuntimeError(f"admin server returned malformed HTTP response: {bytes(response)!r}")
+    return header.decode("ascii", errors="replace"), body.decode("utf-8")
 
 
 def metric_value(metrics: str, name: str) -> int:
@@ -193,6 +198,88 @@ def metric_value(metrics: str, name: str) -> int:
         if line.startswith(prefix):
             return int(line[len(prefix):])
     raise RuntimeError(f"missing metric {name} in /metrics output")
+
+
+def verify_admin_endpoints(admin_port: int) -> None:
+    health_header, health_body = admin_get(admin_port, "/health")
+    if not health_header.startswith("HTTP/1.1 200 OK") or health_body != "ok\n":
+        raise RuntimeError(f"unexpected /health response: {health_header!r}, {health_body!r}")
+    status_header, status_body = admin_get(admin_port, "/status")
+    if not status_header.startswith("HTTP/1.1 200 OK") or '"running"' not in status_body:
+        raise RuntimeError(f"unexpected /status response: {status_header!r}, {status_body!r}")
+
+
+def verify_large_pipelined_requests(port: int) -> None:
+    # A single TCP write contains many frames, including one body larger than a
+    # typical socket receive buffer. Responses may be reordered, so compare the
+    # whole set instead of assuming wire order.
+    messages = [f"pipeline-{index}" for index in range(16)]
+    messages.append("large-" + "x" * (128 * 1024))
+    frames = b"".join(request_frame(1000 + index, message) for index, message in enumerate(messages))
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
+        connection.settimeout(5)
+        connection.sendall(frames)
+        responses = [recv_frame(connection) for _ in messages]
+    for message in messages:
+        if not any(("Echo: " + message).encode() in response for response in responses):
+            raise RuntimeError(f"pipelined response missing message with length {len(message)}")
+
+
+def verify_out_of_order_completion(port: int) -> None:
+    # Request A blocks one worker; B must nevertheless be dispatched and sent
+    # first through the same ServerConnection.
+    slow = request_frame(2001, "sleep:180")
+    fast = request_frame(2002, "fast-after-slow")
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
+        connection.settimeout(3)
+        connection.sendall(slow + fast)
+        first = recv_frame(connection)
+        second = recv_frame(connection)
+    if b"Echo: fast-after-slow" not in first or b"Echo: sleep:180" not in second:
+        raise RuntimeError("same-connection responses did not follow worker completion order")
+
+
+def verify_async_done_from_foreign_thread(port: int) -> None:
+    # The test service returns from CallMethod immediately, then a native
+    # thread writes the response and calls done->Run() twice. This proves the
+    # process boundary, worker->foreign-thread hand-off, IO command hand-off,
+    # and exactly-once completion together.
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
+        connection.settimeout(3)
+        started_at = time.monotonic()
+        connection.sendall(request_frame(2501, "async:cross-process"))
+        response = recv_frame(connection)
+        elapsed = time.monotonic() - started_at
+        if b"Async: async:cross-process" not in response:
+            raise RuntimeError("foreign-thread async done did not produce its response")
+        if elapsed < 0.025:
+            raise RuntimeError("async done response arrived before its foreign-thread delay")
+
+        # The service intentionally calls done twice. A duplicate must not
+        # create a second response on the same live TCP connection.
+        connection.settimeout(0.25)
+        try:
+            extra = connection.recv(1)
+        except TimeoutError:
+            return
+        if extra:
+            raise RuntimeError("duplicate async done produced a second wire response")
+        raise RuntimeError("server unexpectedly closed after async done")
+
+
+def verify_peer_disconnect_releases_connection(port: int, admin_port: int) -> None:
+    # Peer EOF during a partial frame is common with cancelled HTTP requests.
+    # It must not leave a ServerConnection or in-flight RPC retained forever.
+    frame = request_frame(3001, "abandoned")
+    with socket.create_connection(("127.0.0.1", port), timeout=3) as connection:
+        connection.sendall(frame[: len(frame) // 2])
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        metrics = read_metrics(admin_port)
+        if metric_value(metrics, "ant_rpc_server_active_connections") == 0:
+            return
+        time.sleep(0.02)
+    raise RuntimeError("partial-frame peer disconnect leaked an active connection")
 
 
 def main() -> int:
@@ -205,6 +292,7 @@ def main() -> int:
     failure: str | None = None
     try:
         port, admin_port = read_ready(server)
+        verify_admin_endpoints(admin_port)
         # Large enough to exercise connection reuse, concurrent channels and
         # repeated slot allocation, while remaining suitable for normal CTest.
         random_requests = 1000
@@ -220,6 +308,10 @@ def main() -> int:
             raise RuntimeError("/metrics completed total does not match random client workload")
         if metric_value(metrics, "ant_rpc_server_call_errors_total") != 0:
             raise RuntimeError("/metrics reported an unexpected request error")
+        verify_large_pipelined_requests(port)
+        verify_out_of_order_completion(port)
+        verify_async_done_from_foreign_thread(port)
+        verify_peer_disconnect_releases_connection(port, admin_port)
         malformed = {
             "magic": wire_header(magic=b"NOPE"),
             "version": wire_header(flags=0x02000000),

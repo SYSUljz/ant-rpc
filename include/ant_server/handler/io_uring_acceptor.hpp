@@ -11,8 +11,10 @@ struct Acceptor final : IOHandler {
       : context_(context), listener_(listener), callback_(std::move(callback)) {}
   void Start() {
     auto* sqe = context_.GetSqe();
-    io_uring_prep_multishot_accept_direct(sqe, listener_, nullptr, nullptr, 0);
-    sqe->file_index = IORING_FILE_INDEX_ALLOC;
+    // Do not use accept_direct here. A native accepted fd can be handed to a
+    // different Context, whereas a registered-file index belongs only to the
+    // ring that allocated it.
+    io_uring_prep_multishot_accept(sqe, listener_, nullptr, nullptr, 0);
     io_uring_sqe_set_data(sqe, this);
     context_.Submit();
   }

@@ -255,7 +255,7 @@ class AdminConnection final : public IoCommandMailbox, public std::enable_shared
   }
   void DrainCommandsOnIoThread() override {
     if (close_requested_.load(std::memory_order_acquire) && fd_ >= 0) {
-      ShutdownSocket(state_->context, AcceptedSocket(fd_), SHUT_RDWR);
+      ShutdownSocket(state_->context, SocketHandle::Native(fd_), SHUT_RDWR);
     }
   }
 
@@ -296,7 +296,7 @@ class AdminConnection final : public IoCommandMailbox, public std::enable_shared
         AppendResponse(output, 400, "Bad Request", "bad request\n");
         break;
       }
-      const int bytes = co_await ReadAwaiter(self->state_->context, self->fd_, input, /*is_fixed=*/true);
+      const int bytes = co_await ReadAwaiter(self->state_->context, self->fd_, input, /*is_fixed=*/false);
       if (bytes <= 0) {
         self->CloseOnIoThread();
         co_return;
@@ -304,7 +304,7 @@ class AdminConnection final : public IoCommandMailbox, public std::enable_shared
     }
 
     while (!output.empty()) {
-      const int bytes = co_await IOBufWriteAwaiter(self->state_->context, self->fd_, output, /*is_fixed=*/true);
+      const int bytes = co_await IOBufWriteAwaiter(self->state_->context, self->fd_, output, /*is_fixed=*/false);
       if (bytes <= 0) {
         break;
       }
@@ -315,7 +315,7 @@ class AdminConnection final : public IoCommandMailbox, public std::enable_shared
 
   void CloseOnIoThread() {
     if (const int fd = std::exchange(fd_, -1); fd >= 0) {
-      CloseSocket(state_->context, AcceptedSocket(fd));
+      CloseSocket(state_->context, SocketHandle::Native(fd));
     }
     state_->ReleaseConnection(shared_from_this());
   }
@@ -387,7 +387,7 @@ class AdminServer {
     }
     acceptor_ = std::make_unique<Acceptor>(state_->context, listen_fd_, [state = state_](int client_fd) {
       if (!state->accepting.load(std::memory_order_acquire)) {
-        CloseSocket(state->context, AcceptedSocket(client_fd));
+        CloseSocket(state->context, SocketHandle::Native(client_fd));
         return;
       }
       auto connection = std::make_shared<detail::AdminConnection>(state, client_fd);

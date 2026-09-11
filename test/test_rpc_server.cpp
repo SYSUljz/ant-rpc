@@ -213,6 +213,9 @@ TEST(RpcOptionsTest, RejectsInvalidChannelAndServerConfigurations) {
 
   RpcServerOptions server_options;
   EXPECT_TRUE(server_options.IsValid());
+  server_options.io_contexts = 0;
+  EXPECT_FALSE(server_options.IsValid());
+  server_options = {};
   server_options.max_connections = 0;
   EXPECT_FALSE(server_options.IsValid());
   server_options = {};

@@ -8,6 +8,10 @@
 
 namespace ant_server::rpc {
 struct RpcServerOptions {
+  // Number of Scheduler IO Contexts eligible to own accepted connections.
+  // One keeps the old single-owner behavior; RpcServer clamps larger values
+  // to Scheduler::NumIOThreads().
+  std::size_t io_contexts {1};
   std::size_t max_connections {65536};
   std::size_t max_in_flight {65536};
   std::size_t max_in_flight_per_connection {4096};
@@ -20,7 +24,7 @@ struct RpcServerOptions {
   std::chrono::milliseconds idle_timeout {0};
 
   [[nodiscard]] bool IsValid() const noexcept {
-    return max_connections > 0 && max_in_flight > 0 && max_in_flight_per_connection > 0 &&
+    return io_contexts > 0 && max_connections > 0 && max_in_flight > 0 && max_in_flight_per_connection > 0 &&
            max_pending_worker_tasks > 0 && max_in_flight_per_connection <= max_in_flight &&
            max_frame_bytes >= kRpcHeaderBytes && max_outbound_bytes_per_connection >= kRpcHeaderBytes &&
            max_outbound_bytes_per_connection <= static_cast<std::size_t>(std::numeric_limits<int64_t>::max()) &&

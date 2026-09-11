@@ -3,6 +3,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <utility>
@@ -17,6 +18,7 @@
 #include "ant_server/logging/logging.hpp"
 #include "ant_server/rpc/server/server_connection.hpp"
 #include "ant_server/rpc/server/server_metrics.hpp"
+#include "ant_server/scheduler/scheduler.hpp"
 #include "butil/endpoint.h"
 
 namespace ant_server::rpc {
@@ -65,7 +67,7 @@ class RpcServer {
 
   bool AddService(google::protobuf::Service* service) {
     absl::MutexLock lock(&lifecycle_mu_);
-    if (status_ != Status::kCreated || !registry_.RegisterService(service)) {
+    if (status_ != Status::kCreated || !registry_->RegisterService(service)) {
       return false;
     }
     runtime_->RegisterServiceMetrics(*service->GetDescriptor());
@@ -76,7 +78,7 @@ class RpcServer {
     if (status_ != Status::kCreated || !service) {
       return false;
     }
-    if (!registry_.RegisterService(service.get())) {
+    if (!registry_->RegisterService(service.get())) {
       return false;
     }
     runtime_->RegisterServiceMetrics(*service->GetDescriptor());
@@ -101,15 +103,14 @@ class RpcServer {
     if (endpoint_.port == 0) {
       butil::get_local_side(server_socket_, &endpoint_);
     }
-    acceptor_ = std::make_unique<Acceptor>(ctx_, server_socket_, [this](int client_fd) {
-      if (!runtime_->TryAcquireConnection()) {
-        CloseSocket(ctx_, AcceptedSocket(client_fd));
-        return;
-      }
-      auto connection = std::make_shared<detail::ServerConnection>(ctx_, client_fd, registry_, runtime_);
-      runtime_->TrackConnection(connection);
-      connection->Start();
-    });
+    io_contexts_.clear();
+    io_contexts_.push_back(&ctx_);
+    const std::size_t requested_contexts = std::min(options_.io_contexts, ctx_.GetScheduler().NumIOThreads());
+    for (std::size_t index = 0; io_contexts_.size() < requested_contexts; ++index) {
+      Context& candidate = ctx_.GetScheduler().GetIOContext(index);
+      if (&candidate != &ctx_) io_contexts_.push_back(&candidate);
+    }
+    acceptor_ = std::make_unique<Acceptor>(ctx_, server_socket_, [this](int client_fd) { DispatchAcceptedSocket(client_fd); });
     acceptor_->Start();
     status_ = Status::kRunning;
     ant_server::logging::Write(ant_server::logging::Event::kServerStarted,
@@ -156,7 +157,7 @@ class RpcServer {
     return true;
   }
 
-  ServiceRegistry& GetRegistry() noexcept { return registry_; }
+  ServiceRegistry& GetRegistry() noexcept { return *registry_; }
   [[nodiscard]] int GetSocketFd() const noexcept { return server_socket_; }
   [[nodiscard]] const butil::EndPoint& GetEndPoint() const noexcept { return endpoint_; }
   [[nodiscard]] const RpcServerOptions& options() const noexcept { return options_; }
@@ -184,6 +185,50 @@ class RpcServer {
   }
 
  private:
+  // Owns the fd until it is attached on its chosen Context. Capturing the
+  // registry/runtime by shared_ptr keeps queued hand-offs valid while server
+  // Stop/Join races an accept completion.
+  struct AcceptedConnectionMailbox final : IoCommandMailbox {
+    AcceptedConnectionMailbox(Context& context, int fd, std::shared_ptr<ServiceRegistry> registry,
+                              std::shared_ptr<detail::ServerRuntime> runtime)
+        : context(context), fd(fd), registry(std::move(registry)), runtime(std::move(runtime)) {}
+    void DrainCommandsOnIoThread() override {
+      if (!runtime->TryAcquireConnection()) {
+        CloseSocket(context, SocketHandle::Native(fd));
+        return;
+      }
+      auto connection = std::make_shared<detail::ServerConnection>(context, fd, *registry, runtime);
+      runtime->TrackConnection(connection);
+      connection->Start();
+    }
+    Context& context;
+    int fd;
+    std::shared_ptr<ServiceRegistry> registry;
+    std::shared_ptr<detail::ServerRuntime> runtime;
+  };
+  void DispatchAcceptedSocket(int fd) {
+    // P2C selects only from this server's configured Context set. Existing
+    // sockets remain pinned; this decision is made once per accepted fd.
+    // Advance once per accepted socket. Taking two consecutive increments
+    // makes the first candidate permanently zero when there are exactly two
+    // Contexts; use the next Context as the second P2C candidate instead.
+    const std::size_t first = next_io_context_.fetch_add(1, std::memory_order_relaxed) % io_contexts_.size();
+    const std::size_t second = (first + 1) % io_contexts_.size();
+    Context& target = io_contexts_[first]->PendingCommandCount() <= io_contexts_[second]->PendingCommandCount()
+                          ? *io_contexts_[first]
+                          : *io_contexts_[second];
+    if (&target == &ctx_) {
+      if (!runtime_->TryAcquireConnection()) {
+        CloseSocket(ctx_, SocketHandle::Native(fd));
+        return;
+      }
+      auto connection = std::make_shared<detail::ServerConnection>(ctx_, fd, *registry_, runtime_);
+      runtime_->TrackConnection(connection);
+      connection->Start();
+      return;
+    }
+    target.Notify(std::make_shared<AcceptedConnectionMailbox>(target, fd, registry_, runtime_));
+  }
   Context& ctx_;
   butil::EndPoint endpoint_;
   const RpcServerOptions options_;
@@ -193,9 +238,11 @@ class RpcServer {
   mutable absl::Mutex observers_mu_;
   mutable std::vector<std::weak_ptr<detail::ServerObserver>> observers_ ABSL_GUARDED_BY(observers_mu_);
   int server_socket_ {-1};
-  ServiceRegistry registry_;
+  std::shared_ptr<ServiceRegistry> registry_ {std::make_shared<ServiceRegistry>()};
   std::vector<std::shared_ptr<google::protobuf::Service>> owned_services_;
   std::unique_ptr<Acceptor> acceptor_;
+  std::vector<Context*> io_contexts_;
+  std::atomic<std::size_t> next_io_context_ {0};
 };
 
 inline DetachedTask handle_rpc_client(Context& ctx, int client_fd, ServiceRegistry& registry) {
