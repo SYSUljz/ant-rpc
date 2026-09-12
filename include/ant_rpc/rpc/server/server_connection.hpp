@@ -1,0 +1,813 @@
+#pragma once
+#include <unistd.h>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <deque>
+#include <memory>
+#include <utility>
+#include <vector>
+
+#include <sys/socket.h>
+
+#include "absl/container/flat_hash_map.h"
+#include "absl/synchronization/mutex.h"
+#include "ant_rpc/awaiter/socket_awaiter.hpp"
+#include "ant_rpc/context/context.hpp"
+#include "ant_rpc/logging/logging.hpp"
+#include "ant_rpc/rpc/controller.hpp"
+#include "ant_rpc/rpc/error_code.hpp"
+#include "ant_rpc/rpc/server/server_metrics.hpp"
+#include "ant_rpc/rpc/server/server_options.hpp"
+#include "ant_rpc/rpc/service_registry.hpp"
+#include "ant_rpc/scheduler/timer_keeper.hpp"
+#include "ant_rpc/type.hpp"
+#include "butil/iobuf.h"
+
+namespace ant_rpc::rpc::detail {
+
+class ServerConnection;
+
+class ServerRuntime final : public std::enable_shared_from_this<ServerRuntime> {
+ public:
+  ServerRuntime(Context& context, RpcServerOptions options)
+      : timer_keeper_(context.GetTimerKeeper()),
+        options_(std::move(options)),
+        metrics_(std::make_shared<ServerMetrics>()) {}
+  bool TryAcquireConnection() noexcept {
+    if (!accepting_.load(std::memory_order_acquire)) {
+      metrics_->rejected_connections.Add();
+      return false;
+    }
+    std::size_t current = active_connections_.load(std::memory_order_acquire);
+    while (current < options_.max_connections) {
+      if (active_connections_.compare_exchange_weak(current, current + 1, std::memory_order_acq_rel,
+                                                    std::memory_order_acquire)) {
+        metrics_->accepted_connections.Add();
+        metrics_->active_connections.Add(1);
+        return true;
+      }
+    }
+    metrics_->rejected_connections.Add();
+    return false;
+  }
+  void TrackConnection(const std::shared_ptr<ServerConnection>& connection);
+  void ReleaseConnection(const std::shared_ptr<ServerConnection>& connection);
+  bool TryAcquireInFlight() noexcept {
+    std::size_t current = in_flight_.load(std::memory_order_acquire);
+    while (current < options_.max_in_flight) {
+      if (in_flight_.compare_exchange_weak(current, current + 1, std::memory_order_acq_rel,
+                                           std::memory_order_acquire)) {
+        metrics_->active_in_flight.Add(1);
+        return true;
+      }
+    }
+    return false;
+  }
+  void ReleaseInFlight() noexcept {
+    in_flight_.fetch_sub(1, std::memory_order_acq_rel);
+    metrics_->active_in_flight.Add(-1);
+    NotifyDrained();
+  }
+  bool TryAcquireWorkerTask() noexcept {
+    std::size_t current = pending_worker_tasks_.load(std::memory_order_acquire);
+    while (current < options_.max_pending_worker_tasks) {
+      if (pending_worker_tasks_.compare_exchange_weak(current, current + 1, std::memory_order_acq_rel,
+                                                      std::memory_order_acquire)) {
+        metrics_->pending_worker_tasks.Add(1);
+        return true;
+      }
+    }
+    return false;
+  }
+  void ReleaseWorkerTask() noexcept {
+    pending_worker_tasks_.fetch_sub(1, std::memory_order_acq_rel);
+    metrics_->pending_worker_tasks.Add(-1);
+  }
+  [[nodiscard]] bool IsAccepting() const noexcept { return accepting_.load(std::memory_order_acquire); }
+  void BeginGracefulStop();
+  void WaitForDrained() {
+    absl::MutexLock lock(&drain_mu_);
+    drain_mu_.Await(absl::Condition(this, &ServerRuntime::IsDrained));
+  }
+  const RpcServerOptions& options() const noexcept { return options_; }
+  [[nodiscard]] ServerMetrics& metrics() noexcept { return *metrics_; }
+  [[nodiscard]] const ServerMetrics& metrics() const noexcept { return *metrics_; }
+  [[nodiscard]] std::shared_ptr<const ServerMetrics> metrics_handle() const noexcept { return metrics_; }
+  // RpcServer calls this only during its kCreated phase. Once Start() makes
+  // requests visible, the map is immutable and worker lookups are lock-free.
+  void RegisterServiceMetrics(const google::protobuf::ServiceDescriptor& service) {
+    for (int index = 0; index < service.method_count(); ++index) {
+      const auto* method = service.method(index);
+      method_metrics_.try_emplace(method, &metrics_->GetOrCreateMethod(*method));
+    }
+  }
+  [[nodiscard]] ServerMethodMetrics* FindMethodMetrics(
+      const google::protobuf::MethodDescriptor& method) const noexcept {
+    const auto iterator = method_metrics_.find(&method);
+    return iterator == method_metrics_.end() ? nullptr : iterator->second;
+  }
+
+ private:
+  struct InboundDoneClosure;
+
+  void ForceCloseLiveConnections();
+  void CancelGracefulStopTimer();
+  bool IsDrained() const {
+    return active_connections_.load(std::memory_order_acquire) == 0 && in_flight_.load(std::memory_order_acquire) == 0;
+  }
+  // Abseil's Await waiters are re-evaluated on unlock. The counters are
+  // atomic hot-path state, so take this control lock only to publish a change.
+  void NotifyDrained() { absl::MutexLock lock(&drain_mu_); }
+  TimerKeeper& timer_keeper_;
+  const RpcServerOptions options_;
+  std::atomic<bool> accepting_ {true};
+  std::atomic<std::size_t> active_connections_ {0};
+  std::atomic<std::size_t> in_flight_ {0};
+  std::atomic<std::size_t> pending_worker_tasks_ {0};
+  std::atomic<uint64_t> graceful_stop_timer_id_ {0};
+  std::shared_ptr<ServerMetrics> metrics_;
+  absl::flat_hash_map<const google::protobuf::MethodDescriptor*, ServerMethodMetrics*> method_metrics_;
+  absl::Mutex connections_mu_;
+  std::vector<std::shared_ptr<ServerConnection>> connections_;
+  absl::Mutex drain_mu_;
+};
+
+inline bool PackServerErrorResponse(const FrameParseResult& request, int error_code, const char* error_text,
+                                    butil::IOBuf& response, std::size_t max_frame_bytes) {
+  RpcMeta meta;
+  meta.set_msg_type(RPC_RESPONSE);
+  meta.set_correlation_id(request.meta.correlation_id());
+  meta.set_service_name(request.meta.service_name());
+  meta.set_method_name(request.meta.method_name());
+  meta.set_error_code(error_code);
+  meta.set_error_text(error_text);
+  return PackRpcFrame(meta, nullptr, nullptr, response, max_frame_bytes);
+}
+
+// Per-accepted-fd state machine. Only its Context IO thread mutates the fd,
+// receive buffer, inbound-call list, outbound queue and write state. Workers
+// return completion through a typed ServerCommand.
+class ServerConnection final : public IoCommandMailbox, public std::enable_shared_from_this<ServerConnection> {
+ private:
+  const uint64_t connection_id_ {ant_rpc::logging::NextConnectionId()};
+  struct InboundCallState;
+
+ public:
+  uint64_t connection_id() const noexcept { return connection_id_; }
+  struct OutboundFrame {
+    butil::IOBuf buffer;
+  };
+  struct ServerCommand {
+    enum class Type : uint8_t { kStart, kCompleteInbound, kClose };
+    Type type;
+    OutboundFrame frame {};
+    std::shared_ptr<InboundCallState> inbound_call {};
+    bool close_after_completion {false};
+
+    static ServerCommand Start() { return {Type::kStart, {}}; }
+    static ServerCommand CompleteInbound(std::shared_ptr<InboundCallState> call, OutboundFrame frame,
+                                         bool close_after_completion) {
+      return {Type::kCompleteInbound, std::move(frame), std::move(call), close_after_completion};
+    }
+    static ServerCommand Close() { return {Type::kClose, {}}; }
+  };
+
+  ServerConnection(Context& context, int fd, ServiceRegistry& registry, std::shared_ptr<ServerRuntime> runtime,
+                   bool is_fixed_file = false)
+      : context_(context),
+        fd_(fd),
+        is_fixed_file_(is_fixed_file),
+        registry_(registry),
+        runtime_(std::move(runtime)),
+        idle_timeout_(runtime_->options().idle_timeout) {}
+  void Start() { PostCommand(ServerCommand::Start()); }
+  void RequestClose(ConnectionCloseReason reason = ConnectionCloseReason::kLocalRequest) {
+    RecordCloseReason(reason);
+    if (running_.exchange(false, std::memory_order_acq_rel)) {
+      PostCommand(ServerCommand::Close());
+    }
+  }
+  int fd() const noexcept { return fd_.load(std::memory_order_acquire); }
+  [[nodiscard]] ConnectionCloseReason close_reason() const noexcept {
+    return close_reason_.load(std::memory_order_acquire);
+  }
+
+  void DrainCommandsOnIoThread() override {
+    commands_.Drain([this](ServerCommand&& command) {
+      runtime_->metrics().io_command_backlog.Add(-1);
+      switch (command.type) {
+        case ServerCommand::Type::kStart:
+          StartOnIoThread();
+          break;
+        case ServerCommand::Type::kCompleteInbound:
+          CompleteInboundOnIoThread(std::move(command.inbound_call), std::move(command.frame),
+                                    command.close_after_completion);
+          break;
+        case ServerCommand::Type::kClose:
+          BeginCloseOnIoThread();
+          break;
+      }
+    });
+  }
+
+ private:
+  struct InboundDoneClosure;
+
+  // Ownership hand-off from the IO state machine to one worker execution.
+  // The IO thread never accesses request-owned state after moving it here.
+  struct InboundCallState final : std::enable_shared_from_this<InboundCallState> {
+    enum class CompletionState : uint8_t { kPending, kFinalizationScheduled, kFinalized };
+
+    InboundCallState(std::weak_ptr<ServerConnection> connection, std::shared_ptr<ServerRuntime> runtime,
+                     FrameParseResult frame, Executor& executor, std::size_t max_frame_bytes)
+        : connection(std::move(connection)),
+          runtime(std::move(runtime)),
+          frame(std::move(frame)),
+          executor(&executor),
+          max_frame_bytes(max_frame_bytes) {}
+
+    std::weak_ptr<ServerConnection> connection;
+    std::shared_ptr<ServerRuntime> runtime;
+    FrameParseResult frame;
+    RpcMeta response_meta;
+    google::protobuf::Service* service {nullptr};
+    const google::protobuf::MethodDescriptor* method {nullptr};
+    std::unique_ptr<google::protobuf::Message> request;
+    std::unique_ptr<google::protobuf::Message> response;
+    std::unique_ptr<RpcController> controller;
+    std::unique_ptr<InboundDoneClosure> done;
+    ServerMethodMetrics* method_metrics {nullptr};
+    Executor* executor;
+    const std::size_t max_frame_bytes;
+    std::atomic<CompletionState> completion {CompletionState::kPending};
+    const std::chrono::steady_clock::time_point received_at {std::chrono::steady_clock::now()};
+  };
+
+  // The callback is valid until its first successful completion has been
+  // observed by the connection. A conforming protobuf service calls Run()
+  // once; duplicate calls before retirement are reduced to a no-op by the
+  // InboundCallState CAS.
+  struct InboundDoneClosure final : google::protobuf::Closure {
+    explicit InboundDoneClosure(std::weak_ptr<InboundCallState> call) : call_(std::move(call)) {}
+    void Run() override;
+
+   private:
+    std::weak_ptr<InboundCallState> call_;
+  };
+
+  static void FinalizeInboundCall(std::shared_ptr<InboundCallState> call) noexcept;
+
+  struct ServerFinalizeTask final : TaskNode {
+    explicit ServerFinalizeTask(std::shared_ptr<InboundCallState> call) : call(std::move(call)) {
+      execute = [](TaskNode* task) noexcept {
+        auto* self = static_cast<ServerFinalizeTask*>(task);
+        ServerConnection::FinalizeInboundCall(std::move(self->call));
+        delete self;
+      };
+    }
+
+    std::shared_ptr<InboundCallState> call;
+  };
+
+  static void ScheduleInboundFinalization(std::shared_ptr<InboundCallState> call) {
+    call->executor->schedule(new ServerFinalizeTask(std::move(call)));
+  }
+
+  // A concrete task rather than an erased closure makes the server's IO to
+  // worker transition visible in the type system and in profiles.
+  struct ServerDispatchTask final : TaskNode {
+    ServerDispatchTask(std::shared_ptr<InboundCallState> call, ServiceRegistry& registry)
+        : call(std::move(call)), registry(&registry) {
+      execute = [](TaskNode* task) noexcept {
+        auto* self = static_cast<ServerDispatchTask*>(task);
+        auto call = std::move(self->call);
+        auto* registry = self->registry;
+        delete self;
+        // This task has left the executor queue. It is now represented by the
+        // in-flight call lifecycle until its done closure finalizes it.
+        call->runtime->ReleaseWorkerTask();
+        ServerConnection::RunInboundCall(std::move(call), *registry);
+      };
+    }
+
+    std::shared_ptr<InboundCallState> call;
+    ServiceRegistry* registry;
+  };
+  void PostCommand(ServerCommand command) {
+    runtime_->metrics().io_command_backlog.Add(1);
+    commands_.Push(std::move(command));
+    context_.Notify(shared_from_this());
+  }
+  void RecordCloseReason(ConnectionCloseReason reason) noexcept {
+    ConnectionCloseReason expected = ConnectionCloseReason::kNone;
+    close_reason_.compare_exchange_strong(expected, reason, std::memory_order_acq_rel, std::memory_order_acquire);
+  }
+  void CompleteInbound(std::shared_ptr<InboundCallState> call, butil::IOBuf response, bool close_after_completion) {
+    PostCommand(ServerCommand::CompleteInbound(std::move(call), {std::move(response)}, close_after_completion));
+  }
+  void CompleteInboundOnIoThread(std::shared_ptr<InboundCallState> call, OutboundFrame response,
+                                 bool close_after_completion) {
+    if (call) {
+      std::erase(inbound_calls_, call);
+      --in_flight_calls_;
+    }
+    if (close_after_completion) {
+      ReleaseFrameReservation(response);
+      RecordCloseReason(ConnectionCloseReason::kResourceLimit);
+      running_.store(false, std::memory_order_release);
+      BeginCloseOnIoThread();
+      return;
+    }
+    if (running_.load(std::memory_order_acquire) && !response.buffer.empty()) {
+      outbound_.push_back(std::move(response));
+      runtime_->metrics().responses_enqueued.Add();
+      StartNextWriteOnIoThread();
+    } else {
+      ReleaseFrameReservation(response);
+    }
+    TryFinishCloseOnIoThread();
+  }
+  // HandleRequest already runs on the IO owner. Putting its immediately
+  // available overload response back through the MPSC mailbox would require
+  // a later CQE merely to begin the write, so append it directly instead.
+  void EnqueueResponseOnIoThread(butil::IOBuf response) {
+    if (response.empty()) {
+      return;
+    }
+    if (!TryReserveOutboundBytes(response.size())) {
+      RequestClose(ConnectionCloseReason::kResourceLimit);
+      return;
+    }
+    if (!running_.load(std::memory_order_acquire)) {
+      OutboundFrame frame {std::move(response)};
+      ReleaseFrameReservation(frame);
+      return;
+    }
+    outbound_.push_back({std::move(response)});
+    runtime_->metrics().responses_enqueued.Add();
+    StartNextWriteOnIoThread();
+  }
+  // The request has already passed framing validation, so rejection remains a
+  // normal RPC response whenever it fits the configured wire limits. A
+  // packing failure means the connection cannot produce a safe reply.
+  void SendErrorResponseOnIoThread(const FrameParseResult& request, int error_code, const char* error_text) {
+    if (error_code == RPC_EOVERLOAD) {
+      ant_rpc::logging::Write(ant_rpc::logging::Event::kOverload, [&](auto& out) {
+        out << " side=server connection_id=" << connection_id_ << " correlation_id=" << request.meta.correlation_id()
+            << " reason=" << ant_rpc::logging::Quote(error_text);
+      });
+    }
+    butil::IOBuf response;
+    if (!PackServerErrorResponse(request, error_code, error_text, response, runtime_->options().max_frame_bytes)) {
+      RequestClose(ConnectionCloseReason::kResourceLimit);
+      return;
+    }
+    EnqueueResponseOnIoThread(std::move(response));
+  }
+  void StartOnIoThread() {
+    if (!running_.load(std::memory_order_acquire)) {
+      receiver_exited_ = true;
+      TryFinishCloseOnIoThread();
+      return;
+    }
+    ArmIdleTimerOnIoThread();
+    ReceiveLoop(shared_from_this());
+  }
+  void BeginCloseOnIoThread() {
+    CancelIdleTimer();
+    if (const int socket = fd(); socket >= 0) {
+      ShutdownSocket(context_, SocketHandle::Native(socket), SHUT_RDWR);
+    }
+    DiscardQueuedOutboundOnIoThread();
+    if (!receiver_started_) {
+      receiver_exited_ = true;
+    }
+    TryFinishCloseOnIoThread();
+  }
+  void TryFinishCloseOnIoThread() {
+    if (running_.load(std::memory_order_acquire) || !receiver_exited_ || writing_) {
+      return;
+    }
+    CancelIdleTimer();
+    if (const int socket = fd_.exchange(-1, std::memory_order_acq_rel); socket >= 0) {
+      CloseSocket(context_, SocketHandle::Native(socket));
+    }
+    if (!inbound_calls_.empty()) {
+      return;
+    }
+    if (!released_.exchange(true, std::memory_order_acq_rel)) {
+      runtime_->ReleaseConnection(shared_from_this());
+    }
+  }
+  void StartNextWriteOnIoThread() {
+    if (writing_ || outbound_.empty() || !running_.load(std::memory_order_acquire)) {
+      return;
+    }
+    writing_ = true;
+    OutboundFrame frame = std::move(outbound_.front());
+    outbound_.pop_front();
+    WriteFrame(shared_from_this(), std::move(frame));
+  }
+  bool TryReserveOutboundBytes(std::size_t bytes) noexcept {
+    if (bytes == 0 || !running_.load(std::memory_order_acquire)) {
+      return bytes == 0;
+    }
+    const std::size_t limit = runtime_->options().max_outbound_bytes_per_connection;
+    if (bytes > limit) {
+      return false;
+    }
+    std::size_t current = reserved_outbound_bytes_.load(std::memory_order_acquire);
+    while (current <= limit - bytes) {
+      if (reserved_outbound_bytes_.compare_exchange_weak(current, current + bytes, std::memory_order_acq_rel,
+                                                         std::memory_order_acquire)) {
+        runtime_->metrics().outbound_bytes.Add(static_cast<int64_t>(bytes));
+        return true;
+      }
+    }
+    return false;
+  }
+  void ReleaseOutboundBytes(std::size_t bytes) noexcept {
+    if (bytes == 0) {
+      return;
+    }
+    reserved_outbound_bytes_.fetch_sub(bytes, std::memory_order_acq_rel);
+    runtime_->metrics().outbound_bytes.Add(-static_cast<int64_t>(bytes));
+  }
+  void ReleaseFrameReservation(OutboundFrame& frame) noexcept {
+    ReleaseOutboundBytes(frame.buffer.size());
+    frame.buffer.clear();
+  }
+  void DiscardQueuedOutboundOnIoThread() noexcept {
+    while (!outbound_.empty()) {
+      ReleaseFrameReservation(outbound_.front());
+      outbound_.pop_front();
+    }
+  }
+  void ArmIdleTimerOnIoThread() {
+    if (idle_timeout_.count() <= 0 || !running_.load(std::memory_order_acquire)) {
+      return;
+    }
+    const uint64_t generation = idle_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    CancelIdleTimer();
+    auto self = shared_from_this();
+    const uint64_t timer = context_.GetTimerKeeper().AddTimer(idle_timeout_, [self, generation] {
+      if (self->idle_generation_.load(std::memory_order_acquire) == generation) {
+        self->RequestClose(ConnectionCloseReason::kIdleTimeout);
+      }
+    });
+    idle_timer_id_.store(timer, std::memory_order_release);
+  }
+  void CancelIdleTimer() {
+    if (const uint64_t timer = idle_timer_id_.exchange(0, std::memory_order_acq_rel); timer != 0) {
+      context_.GetTimerKeeper().CancelTimer(timer);
+    }
+  }
+  DetachedTask ReceiveLoop(std::shared_ptr<ServerConnection> self) {
+    self->receiver_started_ = true;
+    while (self->running_.load(std::memory_order_acquire)) {
+      while (true) {
+        FrameParseResult frame = TryParseRpcFrame(self->recv_buffer_, self->runtime_->options().max_frame_bytes);
+        if (frame.status == FrameParseStatus::NEED_MORE_DATA) {
+          break;
+        }
+        if (frame.status != FrameParseStatus::SUCCESS) {
+          self->runtime_->metrics().protocol_errors.Add();
+          self->RecordCloseReason(ConnectionCloseReason::kProtocolError);
+          // A protocol violation is terminal for this TCP connection. Do not
+          // wait for another read CQE to make that visible to the peer.
+          self->running_.store(false, std::memory_order_release);
+          if (const int socket = self->fd(); socket >= 0) {
+            ShutdownSocket(self->context_, SocketHandle::Native(socket), SHUT_RDWR);
+          }
+          break;
+        }
+        if (frame.meta.msg_type() != RPC_REQUEST) {
+          self->runtime_->metrics().protocol_errors.Add();
+          self->RecordCloseReason(ConnectionCloseReason::kProtocolError);
+          // A peer may not send a response or an unspecified message type to
+          // a server connection. Treat it as a terminal protocol violation.
+          self->running_.store(false, std::memory_order_release);
+          if (const int socket = self->fd(); socket >= 0) {
+            ShutdownSocket(self->context_, SocketHandle::Native(socket), SHUT_RDWR);
+          }
+          break;
+        }
+        self->recv_buffer_.pop_front(frame.total_frame_bytes);
+        self->HandleRequest(std::move(frame));
+      }
+      if (!self->running_.load(std::memory_order_acquire)) {
+        break;
+      }
+      const int bytes = co_await ReadAwaiter(self->context_, self->fd(), self->recv_buffer_, self->is_fixed_file_);
+      if (bytes <= 0) {
+        self->RecordCloseReason(bytes == 0 ? ConnectionCloseReason::kPeerEof : ConnectionCloseReason::kReadError);
+        break;
+      }
+      self->ArmIdleTimerOnIoThread();
+    }
+    self->running_.store(false, std::memory_order_release);
+    self->receiver_exited_ = true;
+    self->DiscardQueuedOutboundOnIoThread();
+    self->TryFinishCloseOnIoThread();
+  }
+  // The framework's request entry point. It is called only after a complete,
+  // valid RPC_REQUEST frame has been decoded on the connection's IO owner.
+  // All generic server request accounting begins here; individual protobuf
+  // services do not need to add their own transport-level instrumentation.
+  void HandleRequest(FrameParseResult frame) {
+    runtime_->metrics().requests_received.Add();
+    if (!runtime_->IsAccepting()) {
+      runtime_->metrics().requests_rejected_overload.Add();
+      SendErrorResponseOnIoThread(frame, RPC_EOVERLOAD, "RPC server is stopping");
+      return;
+    }
+    if (in_flight_calls_ >= runtime_->options().max_in_flight_per_connection) {
+      runtime_->metrics().requests_rejected_overload.Add();
+      SendErrorResponseOnIoThread(frame, RPC_EOVERLOAD, "RPC connection max_in_flight limit reached");
+      return;
+    }
+    if (!runtime_->TryAcquireInFlight()) {
+      runtime_->metrics().requests_rejected_overload.Add();
+      SendErrorResponseOnIoThread(frame, RPC_EOVERLOAD, "RPC server max_in_flight limit reached");
+      return;
+    }
+
+    if (!runtime_->TryAcquireWorkerTask()) {
+      runtime_->ReleaseInFlight();
+      runtime_->metrics().requests_rejected_overload.Add();
+      SendErrorResponseOnIoThread(frame, RPC_EOVERLOAD, "RPC worker queue limit reached");
+      return;
+    }
+
+    auto* executor = context_.GetExecutor();
+    if (executor == nullptr) {
+      runtime_->ReleaseWorkerTask();
+      runtime_->ReleaseInFlight();
+      RequestClose(ConnectionCloseReason::kInternalError);
+      return;
+    }
+    auto call = std::make_shared<InboundCallState>(weak_from_this(), runtime_, std::move(frame), *executor,
+                                                   runtime_->options().max_frame_bytes);
+    runtime_->metrics().calls_started.Add();
+    inbound_calls_.push_back(call);
+    ++in_flight_calls_;
+    executor->schedule(new ServerDispatchTask(std::move(call), registry_));
+  }
+
+  static void RunInboundCall(std::shared_ptr<InboundCallState> call, ServiceRegistry& registry) noexcept {
+    call->response_meta.set_msg_type(RPC_RESPONSE);
+    call->response_meta.set_correlation_id(call->frame.meta.correlation_id());
+    call->response_meta.set_service_name(call->frame.meta.service_name());
+    call->response_meta.set_method_name(call->frame.meta.method_name());
+
+    const auto lookup = registry.FindMethod(call->frame.meta.service_name(), call->frame.meta.method_name());
+    if (!lookup.service) {
+      call->response_meta.set_error_code(RPC_ENOSERVICE);
+      call->response_meta.set_error_text("Service not found: " + call->frame.meta.service_name());
+    } else if (!lookup.method) {
+      call->response_meta.set_error_code(RPC_ENOMETHOD);
+      call->response_meta.set_error_text("Method not found: " + call->frame.meta.method_name());
+    } else {
+      call->service = lookup.service;
+      call->method = lookup.method;
+      call->method_metrics = call->runtime->FindMethodMetrics(*call->method);
+      // Compatibility helpers may construct ServerRuntime directly without
+      // RpcServer's registration phase. They lazily create the same bounded
+      // descriptor entry; the public RpcServer path never takes this branch.
+      if (call->method_metrics == nullptr) {
+        call->method_metrics = &call->runtime->metrics().GetOrCreateMethod(*call->method);
+      }
+      call->method_metrics->calls_started.Add();
+      call->method_metrics->active_in_flight.Add(1);
+      call->request.reset(call->service->GetRequestPrototype(call->method).New());
+      call->response.reset(call->service->GetResponsePrototype(call->method).New());
+      if (!call->frame.body_iobuf.empty()) {
+        butil::IOBufAsZeroCopyInputStream input(call->frame.body_iobuf);
+        if (!call->request->ParseFromZeroCopyStream(&input)) {
+          call->response_meta.set_error_code(RPC_EINVALID_DATA);
+          call->response_meta.set_error_text("Failed to parse request protobuf");
+        }
+      }
+      if (call->response_meta.error_code() == RPC_SUCCESS) {
+        call->controller = std::make_unique<RpcController>();
+        call->controller->SetCorrelationId(call->frame.meta.correlation_id());
+        call->controller->SetLogId(call->frame.meta.log_id());
+        call->controller->SetTimeoutMs(call->frame.meta.timeout_ms());
+        if (!call->frame.meta.headers().empty()) {
+          call->controller->MutableRequestHeaders().swap(*call->frame.meta.mutable_headers());
+        }
+        if (!call->frame.attachment_iobuf.empty()) {
+          call->controller->RequestAttachment() = std::move(call->frame.attachment_iobuf);
+        }
+        call->done = std::make_unique<InboundDoneClosure>(call);
+        call->service->CallMethod(call->method, call->controller.get(), call->request.get(), call->response.get(),
+                                  call->done.get());
+        return;
+      }
+    }
+
+    call->completion.store(InboundCallState::CompletionState::kFinalizationScheduled, std::memory_order_release);
+    ScheduleInboundFinalization(std::move(call));
+  }
+  DetachedTask WriteFrame(std::shared_ptr<ServerConnection> self, OutboundFrame frame) {
+    while (!frame.buffer.empty() && self->running_.load(std::memory_order_acquire)) {
+      const std::size_t offered = frame.buffer.size();
+      const int written = co_await IOBufWriteAwaiter(self->context_, self->fd(), frame.buffer, self->is_fixed_file_);
+      if (!self->running_.load(std::memory_order_acquire) || written <= 0) {
+        self->runtime_->metrics().write_errors.Add();
+        self->RecordCloseReason(ConnectionCloseReason::kWriteError);
+        self->running_.store(false, std::memory_order_release);
+        if (const int socket = self->fd(); socket >= 0) {
+          ShutdownSocket(self->context_, SocketHandle::Native(socket), SHUT_RDWR);
+        }
+        break;
+      }
+      if (static_cast<std::size_t>(written) < offered) {
+        self->runtime_->metrics().partial_write_completions.Add();
+      }
+      frame.buffer.pop_front(static_cast<std::size_t>(written));
+      self->ReleaseOutboundBytes(static_cast<std::size_t>(written));
+    }
+    self->ReleaseFrameReservation(frame);
+    self->writing_ = false;
+    self->StartNextWriteOnIoThread();
+    self->TryFinishCloseOnIoThread();
+  }
+  Context& context_;
+  std::atomic<int> fd_ {-1};
+  const bool is_fixed_file_ {false};
+  ServiceRegistry& registry_;
+  std::shared_ptr<ServerRuntime> runtime_;
+  const std::chrono::milliseconds idle_timeout_;
+  MpscQueue<ServerCommand> commands_;
+  butil::IOBuf recv_buffer_;
+  std::vector<std::shared_ptr<InboundCallState>> inbound_calls_;
+  std::deque<OutboundFrame> outbound_;
+  std::size_t in_flight_calls_ {0};
+  std::atomic<std::size_t> reserved_outbound_bytes_ {0};
+  std::atomic<bool> running_ {true};
+  std::atomic<bool> released_ {false};
+  std::atomic<uint64_t> idle_generation_ {0};
+  std::atomic<uint64_t> idle_timer_id_ {0};
+  std::atomic<ConnectionCloseReason> close_reason_ {ConnectionCloseReason::kNone};
+  bool receiver_started_ {false};
+  bool receiver_exited_ {false};
+  bool writing_ {false};
+};
+
+inline void ServerConnection::InboundDoneClosure::Run() {
+  auto call = call_.lock();
+  if (!call) {
+    return;
+  }
+  auto expected = InboundCallState::CompletionState::kPending;
+  if (!call->completion.compare_exchange_strong(expected, InboundCallState::CompletionState::kFinalizationScheduled,
+                                                std::memory_order_acq_rel, std::memory_order_acquire)) {
+    return;
+  }
+  ServerConnection::ScheduleInboundFinalization(std::move(call));
+}
+
+inline void ServerConnection::FinalizeInboundCall(std::shared_ptr<InboundCallState> call) noexcept {
+  butil::IOBuf wire_response;
+  bool close_after_completion = false;
+
+  if (call->controller) {
+    call->response_meta.set_error_code(call->controller->ErrorCode());
+    call->response_meta.set_error_text(call->controller->ErrorText());
+    if (!call->controller->ResponseHeaders().empty()) {
+      call->response_meta.mutable_headers()->swap(call->controller->MutableResponseHeaders());
+    }
+    const butil::IOBuf* attachment =
+        !call->controller->ResponseAttachment().empty() ? &call->controller->ResponseAttachment() : nullptr;
+    if (!PackRpcFrame(call->response_meta, call->response.get(), attachment, wire_response, call->max_frame_bytes)) {
+      close_after_completion = true;
+      wire_response.clear();
+    }
+  } else if (!PackRpcFrame(call->response_meta, nullptr, nullptr, wire_response, call->max_frame_bytes)) {
+    close_after_completion = true;
+    wire_response.clear();
+  }
+
+  // Reserve before publishing a completed frame into the MPSC mailbox. The
+  // reservation covers that mailbox, the IO-owner outbound queue and partial
+  // writes, so workers cannot collectively bypass a connection's byte limit.
+  auto connection = call->connection.lock();
+  if (connection && !close_after_completion && !wire_response.empty()) {
+    if (!connection->running_.load(std::memory_order_acquire)) {
+      // The peer has already gone away. The business call still completed; no
+      // response may be queued and no outbound reservation was made.
+      wire_response.clear();
+    } else if (!connection->TryReserveOutboundBytes(wire_response.size())) {
+      close_after_completion = true;
+      wire_response.clear();
+    }
+  }
+
+  auto& metrics = call->runtime->metrics();
+  const bool failed = call->response_meta.error_code() != RPC_SUCCESS || close_after_completion;
+  const auto latency =
+      std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - call->received_at);
+  metrics.calls_completed.Add();
+  if (failed) {
+    metrics.call_errors.Add();
+  }
+  metrics.request_latency.Record(latency);
+  if (static_cast<uint64_t>(latency.count()) >= ant_rpc::logging::slow_rpc_us.load()) {
+    ant_rpc::logging::Write(ant_rpc::logging::Event::kSlowRpc, [&](auto& out) {
+      out << " side=server correlation_id=" << call->frame.meta.correlation_id()
+          << " service=" << ant_rpc::logging::Quote(call->frame.meta.service_name())
+          << " method=" << ant_rpc::logging::Quote(call->frame.meta.method_name())
+          << " elapsed_us=" << latency.count() << " error_code=" << call->response_meta.error_code();
+    });
+  }
+  if (call->method_metrics != nullptr) {
+    call->method_metrics->calls_completed.Add();
+    if (failed) {
+      call->method_metrics->call_errors.Add();
+    }
+    call->method_metrics->call_latency.Record(latency);
+    call->method_metrics->active_in_flight.Add(-1);
+  }
+
+  call->completion.store(InboundCallState::CompletionState::kFinalized, std::memory_order_release);
+  auto runtime = call->runtime;
+  if (connection) {
+    connection->CompleteInbound(std::move(call), std::move(wire_response), close_after_completion);
+  }
+  runtime->ReleaseInFlight();
+}
+
+inline void ServerRuntime::TrackConnection(const std::shared_ptr<ServerConnection>& connection) {
+  absl::MutexLock lock(&connections_mu_);
+  connections_.push_back(connection);
+}
+inline void ServerRuntime::ReleaseConnection(const std::shared_ptr<ServerConnection>& connection) {
+  {
+    absl::MutexLock lock(&connections_mu_);
+    std::erase(connections_, connection);
+  }
+  active_connections_.fetch_sub(1, std::memory_order_acq_rel);
+  metrics_->active_connections.Add(-1);
+  metrics_->RecordConnectionClose(connection->close_reason());
+  const auto reason = connection->close_reason();
+  if (reason != ConnectionCloseReason::kPeerEof && reason != ConnectionCloseReason::kLocalRequest &&
+      reason != ConnectionCloseReason::kServerStop && reason != ConnectionCloseReason::kIdleTimeout) {
+    ant_rpc::logging::Write(ant_rpc::logging::Event::kConnectionFailed, [&](auto& out) {
+      out << " side=server connection_id=" << connection->connection_id()
+          << " reason=" << ConnectionCloseReasonName(reason);
+    });
+  }
+  metrics_->closed_connections.Add();
+  if (active_connections_.load(std::memory_order_acquire) == 0) {
+    CancelGracefulStopTimer();
+  }
+  NotifyDrained();
+}
+inline void ServerRuntime::BeginGracefulStop() {
+  accepting_.store(false, std::memory_order_release);
+  if (active_connections_.load(std::memory_order_acquire) == 0) {
+    return;
+  }
+  if (options_.graceful_stop_timeout.count() == 0) {
+    ForceCloseLiveConnections();
+    return;
+  }
+  auto self = shared_from_this();
+  const uint64_t timer =
+      timer_keeper_.AddTimer(options_.graceful_stop_timeout, [self] { self->ForceCloseLiveConnections(); });
+  const uint64_t old = graceful_stop_timer_id_.exchange(timer, std::memory_order_acq_rel);
+  if (old != 0) {
+    timer_keeper_.CancelTimer(old);
+  }
+}
+inline void ServerRuntime::ForceCloseLiveConnections() {
+  std::vector<std::shared_ptr<ServerConnection>> snapshot;
+  {
+    absl::MutexLock lock(&connections_mu_);
+    snapshot = connections_;
+  }
+  for (const auto& connection : snapshot) {
+    connection->RequestClose(ConnectionCloseReason::kServerStop);
+  }
+}
+inline void ServerRuntime::CancelGracefulStopTimer() {
+  if (const uint64_t timer = graceful_stop_timer_id_.exchange(0, std::memory_order_acq_rel); timer != 0) {
+    timer_keeper_.CancelTimer(timer);
+  }
+}
+inline DetachedTask handle_rpc_client(Context& ctx, int client_fd, ServiceRegistry& registry) {
+  auto runtime = std::make_shared<ServerRuntime>(ctx, RpcServerOptions {});
+  if (!runtime->TryAcquireConnection()) {
+    CloseSocket(ctx, SocketHandle::Native(client_fd));
+    co_return;
+  }
+  auto connection = std::make_shared<ServerConnection>(ctx, client_fd, registry, runtime);
+  runtime->TrackConnection(connection);
+  connection->Start();
+}
+}  // namespace ant_rpc::rpc::detail

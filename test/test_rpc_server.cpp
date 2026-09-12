@@ -14,23 +14,25 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
-#include "ant_server/context/context.hpp"
-#include "ant_server/rpc/channel.hpp"
-#include "ant_server/rpc/controller.hpp"
-#include "ant_server/rpc/error_code.hpp"
-#include "ant_server/rpc/rpc_server.hpp"
-#include "ant_server/scheduler/scheduler.hpp"
+#include "ant_rpc/context/context.hpp"
+#include "ant_rpc/rpc/channel.hpp"
+#include "ant_rpc/rpc/controller.hpp"
+#include "ant_rpc/rpc/error_code.hpp"
+#include "ant_rpc/rpc/rpc_server.hpp"
+#include "ant_rpc/scheduler/scheduler.hpp"
 #include "echo.pb.h"
 
-using namespace ant_server::rpc;
+using namespace ant_rpc;
+using namespace ant_rpc::rpc;
+using ant_rpc::metrics::Counter;
 
 namespace {
 
 // 1. Standard Protobuf EchoService implementation
-class EchoServiceImpl : public ant_rpc::EchoService {
+class EchoServiceImpl : public EchoService {
  public:
-  void Echo(google::protobuf::RpcController* controller, const ant_rpc::EchoRequest* request,
-            ant_rpc::EchoResponse* response, google::protobuf::Closure* done) override {
+  void Echo(google::protobuf::RpcController* controller, const EchoRequest* request, EchoResponse* response,
+            google::protobuf::Closure* done) override {
     auto* cntl = static_cast<RpcController*>(controller);
     if (request->message() == "trigger_error") {
       if (cntl) {
@@ -48,9 +50,9 @@ class EchoServiceImpl : public ant_rpc::EchoService {
   }
 };
 
-class BlockingEchoService final : public ant_rpc::EchoService {
+class BlockingEchoService final : public EchoService {
  public:
-  void Echo(google::protobuf::RpcController*, const ant_rpc::EchoRequest* request, ant_rpc::EchoResponse* response,
+  void Echo(google::protobuf::RpcController*, const EchoRequest* request, EchoResponse* response,
             google::protobuf::Closure* done) override {
     entered.Notify();
     release.WaitForNotification();
@@ -64,9 +66,9 @@ class BlockingEchoService final : public ant_rpc::EchoService {
   absl::Notification release;
 };
 
-class QueueSaturatingEchoService final : public ant_rpc::EchoService {
+class QueueSaturatingEchoService final : public EchoService {
  public:
-  void Echo(google::protobuf::RpcController*, const ant_rpc::EchoRequest* request, ant_rpc::EchoResponse* response,
+  void Echo(google::protobuf::RpcController*, const EchoRequest* request, EchoResponse* response,
             google::protobuf::Closure* done) override {
     if (!first_call_started.exchange(true, std::memory_order_acq_rel)) {
       entered.Notify();
@@ -83,9 +85,9 @@ class QueueSaturatingEchoService final : public ant_rpc::EchoService {
   absl::Notification release;
 };
 
-class OutOfOrderEchoService final : public ant_rpc::EchoService {
+class OutOfOrderEchoService final : public EchoService {
  public:
-  void Echo(google::protobuf::RpcController*, const ant_rpc::EchoRequest* request, ant_rpc::EchoResponse* response,
+  void Echo(google::protobuf::RpcController*, const EchoRequest* request, EchoResponse* response,
             google::protobuf::Closure* done) override {
     if (request->message() == "slow") {
       slow_started.Notify();
@@ -100,11 +102,11 @@ class OutOfOrderEchoService final : public ant_rpc::EchoService {
   absl::Notification slow_started;
 };
 
-class AsyncDoneEchoService final : public ant_rpc::EchoService {
+class AsyncDoneEchoService final : public EchoService {
  public:
   ~AsyncDoneEchoService() override { Join(); }
 
-  void Echo(google::protobuf::RpcController*, const ant_rpc::EchoRequest* request, ant_rpc::EchoResponse* response,
+  void Echo(google::protobuf::RpcController*, const EchoRequest* request, EchoResponse* response,
             google::protobuf::Closure* done) override {
     const std::string message = request->message();
     std::lock_guard<std::mutex> lock(mu_);
@@ -130,11 +132,11 @@ class AsyncDoneEchoService final : public ant_rpc::EchoService {
   std::thread worker_;
 };
 
-class DeferredDoneEchoService final : public ant_rpc::EchoService {
+class DeferredDoneEchoService final : public EchoService {
  public:
   ~DeferredDoneEchoService() override { Join(); }
 
-  void Echo(google::protobuf::RpcController*, const ant_rpc::EchoRequest* request, ant_rpc::EchoResponse* response,
+  void Echo(google::protobuf::RpcController*, const EchoRequest* request, EchoResponse* response,
             google::protobuf::Closure* done) override {
     const std::string message = request->message();
     std::lock_guard<std::mutex> lock(mu_);
@@ -283,17 +285,17 @@ class RpcServerTest : public ::testing::Test {
 
 // 1. Basic Echo RPC Call via Protobuf Stub
 TEST_F(RpcServerTest, BasicEchoCall) {
-  ant_rpc::EchoService_Stub stub(&channel_);
+  EchoService_Stub stub(&channel_);
   RpcController cntl;
-  ant_rpc::EchoRequest req;
-  ant_rpc::EchoResponse resp;
+  EchoRequest req;
+  EchoResponse resp;
 
-  req.set_message("Hello AntServer RPC!");
+  req.set_message("Hello AntRPC RPC!");
   stub.Echo(&cntl, &req, &resp, nullptr);
 
   EXPECT_FALSE(cntl.Failed());
   EXPECT_EQ(cntl.ErrorCode(), RPC_SUCCESS);
-  EXPECT_EQ(resp.message(), "Echo: Hello AntServer RPC!");
+  EXPECT_EQ(resp.message(), "Echo: Hello AntRPC RPC!");
 
   // These are framework metrics: EchoServiceImpl does not perform any manual
   // instrumentation. HandleRequest and FinalizeInboundCall own the updates.
@@ -482,7 +484,7 @@ TEST(AdminServerTest, ServesRpcMetricsOnTheSameContext) {
   // shares the RPC listener's Context and thus its IO thread.
   AdminServer admin_server(rpc_context);
   ASSERT_TRUE(admin_server.AddServer("echo", rpc_server));
-  auto business_requests = std::make_shared<ant_server::metrics::Counter>();
+  auto business_requests = std::make_shared<Counter>();
   ASSERT_TRUE(admin_server.Registry().Register("business_requests_total", business_requests));
   business_requests->Add(3);
   ASSERT_TRUE(admin_server.Start());
@@ -490,10 +492,10 @@ TEST(AdminServerTest, ServesRpcMetricsOnTheSameContext) {
 
   RpcChannel channel(client_context);
   ASSERT_EQ(channel.Init("127.0.0.1", rpc_server.GetEndPoint().port), 0);
-  ant_rpc::EchoService_Stub stub(&channel);
+  EchoService_Stub stub(&channel);
   RpcController controller;
-  ant_rpc::EchoRequest request;
-  ant_rpc::EchoResponse response;
+  EchoRequest request;
+  EchoResponse response;
   request.set_message("metrics");
   stub.Echo(&controller, &request, &response, nullptr);
   ASSERT_FALSE(controller.Failed()) << controller.ErrorText();
@@ -549,10 +551,10 @@ TEST(AdminServerTest, ServesRpcMetricsOnTheSameContext) {
 
 // 2. Custom Business Failure Propagation
 TEST_F(RpcServerTest, CustomBusinessError) {
-  ant_rpc::EchoService_Stub stub(&channel_);
+  EchoService_Stub stub(&channel_);
   RpcController cntl;
-  ant_rpc::EchoRequest req;
-  ant_rpc::EchoResponse resp;
+  EchoRequest req;
+  EchoResponse resp;
 
   req.set_message("trigger_error");
   stub.Echo(&cntl, &req, &resp, nullptr);
@@ -593,10 +595,10 @@ TEST_F(RpcServerTest, MethodNotFound) {
 
   // A method lookup failure is an RPC-level response, not a transport
   // failure. The same multiplexed connection must remain usable.
-  ant_rpc::EchoService_Stub stub(&channel_);
+  EchoService_Stub stub(&channel_);
   RpcController echo_controller;
-  ant_rpc::EchoRequest echo_request;
-  ant_rpc::EchoResponse echo_response;
+  EchoRequest echo_request;
+  EchoResponse echo_response;
   echo_request.set_message("after-method-error");
   stub.Echo(&echo_controller, &echo_request, &echo_response, nullptr);
   EXPECT_FALSE(echo_controller.Failed()) << echo_controller.ErrorText();
@@ -612,13 +614,13 @@ TEST_F(RpcServerTest, MethodNotFound) {
 
 // 5. Headers and Attachments Transmission
 TEST_F(RpcServerTest, HeadersAndAttachments) {
-  ant_rpc::EchoService_Stub stub(&channel_);
+  EchoService_Stub stub(&channel_);
   RpcController cntl;
   cntl.SetHeader("auth_token", "secret123");
   cntl.RequestAttachment().append("extra_payload_binary");
 
-  ant_rpc::EchoRequest req;
-  ant_rpc::EchoResponse resp;
+  EchoRequest req;
+  EchoResponse resp;
   req.set_message("HelloWithMeta");
 
   stub.Echo(&cntl, &req, &resp, nullptr);
@@ -640,12 +642,12 @@ TEST_F(RpcServerTest, ConcurrentRequests) {
     threads.emplace_back([this, &success_count, t]() {
       RpcChannel ch(client_context_);
       ch.Init("127.0.0.1", port_);
-      ant_rpc::EchoService_Stub stub(&ch);
+      EchoService_Stub stub(&ch);
 
       for (size_t i = 0; i < kCallsPerThread; ++i) {
         RpcController cntl;
-        ant_rpc::EchoRequest req;
-        ant_rpc::EchoResponse resp;
+        EchoRequest req;
+        EchoResponse resp;
 
         std::string payload = "msg_" + std::to_string(t) + "_" + std::to_string(i);
         req.set_message(payload);
@@ -743,10 +745,10 @@ TEST(RpcServerOptionsTest, MaxConnectionsRejectsAdditionalConnectionWithoutDistu
 
   // Rejecting the second connection must not evict or poison the admitted
   // connection.
-  ant_rpc::EchoService_Stub admitted_stub(&admitted_channel);
+  EchoService_Stub admitted_stub(&admitted_channel);
   RpcController admitted_controller;
-  ant_rpc::EchoRequest admitted_request;
-  ant_rpc::EchoResponse admitted_response;
+  EchoRequest admitted_request;
+  EchoResponse admitted_response;
   admitted_request.set_message("still-admitted");
   admitted_stub.Echo(&admitted_controller, &admitted_request, &admitted_response, nullptr);
   EXPECT_FALSE(admitted_controller.Failed()) << admitted_controller.ErrorText();
@@ -777,12 +779,12 @@ TEST(RpcServerOptionsTest, GlobalMaxInFlightRejectsCallFromAnotherConnection) {
   RpcChannel second_channel(client_context);
   ASSERT_EQ(first_channel.Init("127.0.0.1", server.GetEndPoint().port), 0);
   ASSERT_EQ(second_channel.Init("127.0.0.1", server.GetEndPoint().port), 0);
-  ant_rpc::EchoService_Stub first_stub(&first_channel);
-  ant_rpc::EchoService_Stub second_stub(&second_channel);
+  EchoService_Stub first_stub(&first_channel);
+  EchoService_Stub second_stub(&second_channel);
 
   RpcController first_controller;
-  ant_rpc::EchoRequest first_request;
-  ant_rpc::EchoResponse first_response;
+  EchoRequest first_request;
+  EchoResponse first_response;
   first_request.set_message("occupies-global-slot");
   absl::Notification first_done;
   NotifyClosure first_closure(first_done);
@@ -791,8 +793,8 @@ TEST(RpcServerOptionsTest, GlobalMaxInFlightRejectsCallFromAnotherConnection) {
   ASSERT_EQ(server.metrics().active_in_flight.Value(), 1);
 
   RpcController second_controller;
-  ant_rpc::EchoRequest second_request;
-  ant_rpc::EchoResponse second_response;
+  EchoRequest second_request;
+  EchoResponse second_response;
   second_request.set_message("different-connection");
   second_stub.Echo(&second_controller, &second_request, &second_response, nullptr);
   EXPECT_TRUE(second_controller.Failed());
@@ -829,11 +831,11 @@ TEST(RpcChannelOptionsTest, FrameLargerThanClientOutboundBudgetFailsInline) {
   channel_options.max_outbound_bytes = kRpcHeaderBytes;
   RpcChannel channel(client_context);
   ASSERT_EQ(channel.Init("127.0.0.1", server.GetEndPoint().port, &channel_options), 0);
-  ant_rpc::EchoService_Stub stub(&channel);
+  EchoService_Stub stub(&channel);
 
   RpcController controller;
-  ant_rpc::EchoRequest request;
-  ant_rpc::EchoResponse response;
+  EchoRequest request;
+  EchoResponse response;
   request.set_message("larger-than-header-only-budget");
   stub.Echo(&controller, &request, &response, nullptr);
 
@@ -866,20 +868,20 @@ TEST(RpcServerOptionsTest, MaxInFlightPerConnectionReturnsOverloadWithoutBlockin
 
   RpcChannel channel(client_context);
   ASSERT_EQ(channel.Init("127.0.0.1", server.GetEndPoint().port), 0);
-  ant_rpc::EchoService_Stub stub(&channel);
+  EchoService_Stub stub(&channel);
 
-  ant_rpc::EchoRequest first_request;
+  EchoRequest first_request;
   first_request.set_message("first");
-  ant_rpc::EchoResponse first_response;
+  EchoResponse first_response;
   RpcController first_controller;
   absl::Notification first_done;
   NotifyClosure first_closure(first_done);
   stub.Echo(&first_controller, &first_request, &first_response, &first_closure);
   ASSERT_TRUE(service->entered.WaitForNotificationWithTimeout(absl::Seconds(2)));
 
-  ant_rpc::EchoRequest second_request;
+  EchoRequest second_request;
   second_request.set_message("second");
-  ant_rpc::EchoResponse second_response;
+  EchoResponse second_response;
   RpcController second_controller;
   stub.Echo(&second_controller, &second_request, &second_response, nullptr);
   EXPECT_TRUE(second_controller.Failed());
@@ -927,22 +929,22 @@ TEST(RpcServerOptionsTest, PendingWorkerLimitReturnsOverloadAndBoundsQueue) {
   ASSERT_EQ(first_channel.Init("127.0.0.1", server.GetEndPoint().port), 0);
   ASSERT_EQ(second_channel.Init("127.0.0.1", server.GetEndPoint().port), 0);
   ASSERT_EQ(third_channel.Init("127.0.0.1", server.GetEndPoint().port), 0);
-  ant_rpc::EchoService_Stub first_stub(&first_channel);
-  ant_rpc::EchoService_Stub second_stub(&second_channel);
-  ant_rpc::EchoService_Stub third_stub(&third_channel);
+  EchoService_Stub first_stub(&first_channel);
+  EchoService_Stub second_stub(&second_channel);
+  EchoService_Stub third_stub(&third_channel);
 
-  ant_rpc::EchoRequest first_request;
+  EchoRequest first_request;
   first_request.set_message("first");
-  ant_rpc::EchoResponse first_response;
+  EchoResponse first_response;
   RpcController first_controller;
   absl::Notification first_done;
   NotifyClosure first_closure(first_done);
   first_stub.Echo(&first_controller, &first_request, &first_response, &first_closure);
   ASSERT_TRUE(service->entered.WaitForNotificationWithTimeout(absl::Seconds(2)));
 
-  ant_rpc::EchoRequest second_request;
+  EchoRequest second_request;
   second_request.set_message("second");
-  ant_rpc::EchoResponse second_response;
+  EchoResponse second_response;
   RpcController second_controller;
   absl::Notification second_done;
   NotifyClosure second_closure(second_done);
@@ -958,9 +960,9 @@ TEST(RpcServerOptionsTest, PendingWorkerLimitReturnsOverloadAndBoundsQueue) {
   }
   EXPECT_TRUE(second_is_queued);
 
-  ant_rpc::EchoRequest third_request;
+  EchoRequest third_request;
   third_request.set_message("third");
-  ant_rpc::EchoResponse third_response;
+  EchoResponse third_response;
   RpcController third_controller;
   absl::Notification third_done;
   NotifyClosure third_closure(third_done);
@@ -1018,10 +1020,10 @@ TEST(RpcServerOptionsTest, OversizedResponseForConnectionOutboundLimitClosesConn
 
   RpcChannel channel(client_context);
   ASSERT_EQ(channel.Init("127.0.0.1", server.GetEndPoint().port), 0);
-  ant_rpc::EchoService_Stub stub(&channel);
+  EchoService_Stub stub(&channel);
   RpcController controller;
-  ant_rpc::EchoRequest request;
-  ant_rpc::EchoResponse response;
+  EchoRequest request;
+  EchoResponse response;
   request.set_message(std::string(1024, 'x'));
   stub.Echo(&controller, &request, &response, nullptr);
 
@@ -1054,15 +1056,15 @@ TEST(RpcServerConnectionTest, SameConnectionResponsesFollowWorkerCompletionOrder
 
   RpcChannel channel(client_context);
   ASSERT_EQ(channel.Init("127.0.0.1", server.GetEndPoint().port), 0);
-  ant_rpc::EchoService_Stub stub(&channel);
+  EchoService_Stub stub(&channel);
 
   RpcController slow_controller;
-  ant_rpc::EchoRequest slow_request;
-  ant_rpc::EchoResponse slow_response;
+  EchoRequest slow_request;
+  EchoResponse slow_response;
   slow_request.set_message("slow");
   RpcController fast_controller;
-  ant_rpc::EchoRequest fast_request;
-  ant_rpc::EchoResponse fast_response;
+  EchoRequest fast_request;
+  EchoResponse fast_response;
   fast_request.set_message("fast");
 
   absl::Notification slow_done;
@@ -1107,10 +1109,10 @@ TEST(RpcServerServiceTest, AsyncDoneFromAnotherThreadCompletesExactlyOnce) {
 
   RpcChannel channel(client_context);
   ASSERT_EQ(channel.Init("127.0.0.1", server.GetEndPoint().port), 0);
-  ant_rpc::EchoService_Stub stub(&channel);
+  EchoService_Stub stub(&channel);
   RpcController controller;
-  ant_rpc::EchoRequest request;
-  ant_rpc::EchoResponse response;
+  EchoRequest request;
+  EchoResponse response;
   request.set_message("later");
   absl::Notification done;
   std::atomic<int> completion_count {0};
@@ -1141,10 +1143,10 @@ TEST(RpcServerServiceTest, LateDoneAfterClientDisconnectIsSafelyDiscarded) {
 
   RpcChannel channel(client_context);
   ASSERT_EQ(channel.Init("127.0.0.1", server.GetEndPoint().port), 0);
-  ant_rpc::EchoService_Stub stub(&channel);
+  EchoService_Stub stub(&channel);
   RpcController controller;
-  ant_rpc::EchoRequest request;
-  ant_rpc::EchoResponse response;
+  EchoRequest request;
+  EchoResponse response;
   request.set_message("abandoned");
   absl::Notification callback_done;
   NotifyClosure closure(callback_done);
@@ -1177,10 +1179,10 @@ TEST(RpcServerLifecycleTest, StopClosesConnectionsButWaitsForRunningService) {
 
   RpcChannel channel(client_context);
   ASSERT_EQ(channel.Init("127.0.0.1", server.GetEndPoint().port), 0);
-  ant_rpc::EchoService_Stub stub(&channel);
+  EchoService_Stub stub(&channel);
   RpcController controller;
-  ant_rpc::EchoRequest request;
-  ant_rpc::EchoResponse response;
+  EchoRequest request;
+  EchoResponse response;
   request.set_message("finish-after-stop");
   absl::Notification callback_done;
   NotifyClosure closure(callback_done);

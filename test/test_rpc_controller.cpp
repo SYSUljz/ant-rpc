@@ -3,10 +3,10 @@
 
 #include <gtest/gtest.h>
 
-#include "ant_server/rpc/controller.hpp"
-#include "ant_server/rpc/error_code.hpp"
+#include "ant_rpc/rpc/controller.hpp"
+#include "ant_rpc/rpc/error_code.hpp"
 
-using namespace ant_server::rpc;
+using namespace ant_rpc::rpc;
 
 // 1. Test Default State of RpcController
 TEST(RpcControllerTest, DefaultState) {

@@ -11,20 +11,23 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
-#include "ant_server/awaiter/timeput_awaiter.hpp"
-#include "ant_server/context/context.hpp"
-#include "ant_server/handler/acceptor.hpp"
-#include "ant_server/rpc/protocol.hpp"
-#include "ant_server/rpc/rpc_server.hpp"
-#include "ant_server/rpc/service_registry.hpp"
-#include "ant_server/scheduler/scheduler.hpp"
+#include "ant_rpc/awaiter/timeput_awaiter.hpp"
+#include "ant_rpc/context/context.hpp"
+#include "ant_rpc/handler/acceptor.hpp"
+#include "ant_rpc/rpc/protocol.hpp"
+#include "ant_rpc/rpc/rpc_server.hpp"
+#include "ant_rpc/rpc/service_registry.hpp"
+#include "ant_rpc/scheduler/scheduler.hpp"
 #include "butil/iobuf.h"
 #include "echo.pb.h"
 
-class EchoServiceImpl : public ant_rpc::EchoService {
+using namespace ant_rpc;
+using namespace ant_rpc::rpc;
+
+class EchoServiceImpl : public EchoService {
  public:
-  void Echo(google::protobuf::RpcController* controller, const ant_rpc::EchoRequest* request,
-            ant_rpc::EchoResponse* response, google::protobuf::Closure* done) override {
+  void Echo(google::protobuf::RpcController* controller, const EchoRequest* request, EchoResponse* response,
+            google::protobuf::Closure* done) override {
     (void)controller;
     response->set_message("Echo: " + request->message());
     if (done) {
@@ -38,7 +41,7 @@ class AntRpcE2ETest : public ::testing::Test {
   static constexpr int PORT = 9012;
   Scheduler scheduler_ {1, 1};
   Context& context_ {scheduler_.GetIOContext(0)};
-  ant_rpc::ServiceRegistry registry_;
+  ServiceRegistry registry_;
   EchoServiceImpl echo_service_;
   std::unique_ptr<Acceptor> acceptor_;
   int server_socket_ {-1};
@@ -60,9 +63,8 @@ class AntRpcE2ETest : public ::testing::Test {
     ASSERT_GE(bind(server_socket_, (struct sockaddr*)&addr, sizeof(addr)), 0);
     ASSERT_GE(listen(server_socket_, 128), 0);
 
-    acceptor_ = std::make_unique<Acceptor>(context_, server_socket_, [this](int client_fd) {
-      ant_rpc::handle_rpc_client(context_, client_fd, registry_);
-    });
+    acceptor_ = std::make_unique<Acceptor>(
+        context_, server_socket_, [this](int client_fd) { handle_rpc_client(context_, client_fd, registry_); });
     acceptor_->Start();
 
     scheduler_.Start();
@@ -96,11 +98,11 @@ TEST_F(AntRpcE2ETest, SingleRpcCallOverTcp) {
   ASSERT_GE(client_fd, 0);
 
   // 1. Pack RPC Request
-  ant_rpc::EchoRequest req;
+  EchoRequest req;
   req.set_message("Hello Ant RPC!");
 
   butil::IOBuf send_buf;
-  ant_rpc::PackRpcFrame(/*msg_type=Request*/ 0, /*correlation_id*/ 1001, "ant_rpc.EchoService", "Echo", req, send_buf);
+  PackRpcFrame(/*msg_type=Request*/ 0, /*correlation_id*/ 1001, "ant_rpc.EchoService", "Echo", req, send_buf);
 
   // 2. Send over TCP
   std::string flat_bytes = send_buf.to_string();
@@ -114,15 +116,15 @@ TEST_F(AntRpcE2ETest, SingleRpcCallOverTcp) {
   ASSERT_GT(n, 0);
   recv_buf.append(temp, n);
 
-  ant_rpc::FrameParseResult res = ant_rpc::TryParseRpcFrame(recv_buf);
-  ASSERT_EQ(res.status, ant_rpc::FrameParseStatus::SUCCESS);
-  EXPECT_EQ(res.meta.msg_type(), ant_server::rpc::RPC_RESPONSE);
+  FrameParseResult res = TryParseRpcFrame(recv_buf);
+  ASSERT_EQ(res.status, FrameParseStatus::SUCCESS);
+  EXPECT_EQ(res.meta.msg_type(), RPC_RESPONSE);
   EXPECT_EQ(res.meta.correlation_id(), 1001);
   EXPECT_EQ(res.meta.service_name(), "ant_rpc.EchoService");
   EXPECT_EQ(res.meta.method_name(), "Echo");
 
   // 4. Parse response protobuf message
-  ant_rpc::EchoResponse resp;
+  EchoResponse resp;
   butil::IOBufAsZeroCopyInputStream zc_in(res.body_iobuf);
   ASSERT_TRUE(resp.ParseFromZeroCopyStream(&zc_in));
   EXPECT_EQ(resp.message(), "Echo: Hello Ant RPC!");
@@ -135,11 +137,11 @@ TEST_F(AntRpcE2ETest, MultiplexedContinuousCallsOnSingleTcpConnection) {
   ASSERT_GE(client_fd, 0);
 
   for (uint64_t i = 1; i <= 20; ++i) {
-    ant_rpc::EchoRequest req;
+    EchoRequest req;
     req.set_message("Ping " + std::to_string(i));
 
     butil::IOBuf send_buf;
-    ant_rpc::PackRpcFrame(0, i, "ant_rpc.EchoService", "Echo", req, send_buf);
+    PackRpcFrame(0, i, "ant_rpc.EchoService", "Echo", req, send_buf);
     std::string flat_bytes = send_buf.to_string();
     ASSERT_EQ(write(client_fd, flat_bytes.data(), flat_bytes.size()), static_cast<ssize_t>(flat_bytes.size()));
 
@@ -149,11 +151,11 @@ TEST_F(AntRpcE2ETest, MultiplexedContinuousCallsOnSingleTcpConnection) {
     ASSERT_GT(n, 0);
     recv_buf.append(temp, n);
 
-    ant_rpc::FrameParseResult res = ant_rpc::TryParseRpcFrame(recv_buf);
-    ASSERT_EQ(res.status, ant_rpc::FrameParseStatus::SUCCESS);
+    FrameParseResult res = TryParseRpcFrame(recv_buf);
+    ASSERT_EQ(res.status, FrameParseStatus::SUCCESS);
     EXPECT_EQ(res.meta.correlation_id(), i);
 
-    ant_rpc::EchoResponse resp;
+    EchoResponse resp;
     butil::IOBufAsZeroCopyInputStream zc_in(res.body_iobuf);
     ASSERT_TRUE(resp.ParseFromZeroCopyStream(&zc_in));
     EXPECT_EQ(resp.message(), "Echo: Ping " + std::to_string(i));
@@ -166,11 +168,11 @@ TEST_F(AntRpcE2ETest, ChunkedAndFragmentedByteStreaming) {
   int client_fd = ConnectClient();
   ASSERT_GE(client_fd, 0);
 
-  ant_rpc::EchoRequest req;
+  EchoRequest req;
   req.set_message("Fragmented Chunked RPC Payload Test");
 
   butil::IOBuf send_buf;
-  ant_rpc::PackRpcFrame(0, 9999, "ant_rpc.EchoService", "Echo", req, send_buf);
+  PackRpcFrame(0, 9999, "ant_rpc.EchoService", "Echo", req, send_buf);
   std::string flat_bytes = send_buf.to_string();
 
   // Send byte-by-byte with small delays to simulate heavy network fragmentation
@@ -186,10 +188,10 @@ TEST_F(AntRpcE2ETest, ChunkedAndFragmentedByteStreaming) {
     ssize_t n = read(client_fd, temp, sizeof(temp));
     if (n > 0) {
       recv_buf.append(temp, n);
-      auto res = ant_rpc::TryParseRpcFrame(recv_buf);
-      if (res.status == ant_rpc::FrameParseStatus::SUCCESS) {
+      auto res = TryParseRpcFrame(recv_buf);
+      if (res.status == FrameParseStatus::SUCCESS) {
         EXPECT_EQ(res.meta.correlation_id(), 9999);
-        ant_rpc::EchoResponse resp;
+        EchoResponse resp;
         butil::IOBufAsZeroCopyInputStream zc_in(res.body_iobuf);
         ASSERT_TRUE(resp.ParseFromZeroCopyStream(&zc_in));
         EXPECT_EQ(resp.message(), "Echo: Fragmented Chunked RPC Payload Test");

@@ -6,9 +6,9 @@
 
 #include <gtest/gtest.h>
 
-#include "ant_server/awaiter/resume_on.hpp"
-#include "ant_server/scheduler/executor.hpp"
-#include "ant_server/type.hpp"
+#include "ant_rpc/awaiter/resume_on.hpp"
+#include "ant_rpc/scheduler/executor.hpp"
+#include "ant_rpc/type.hpp"
 
 // 1. Basic test: Hop from a non-worker std::thread to Worker Executor
 TEST(ResumeOnAwaiterTest, BasicHopFromNonWorkerThread) {

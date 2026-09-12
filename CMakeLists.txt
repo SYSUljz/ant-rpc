@@ -1,30 +1,30 @@
 cmake_minimum_required(VERSION 3.16)
-project(ant_server VERSION 1.0.0 LANGUAGES CXX)
+project(AntRPC VERSION 1.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-option(ANT_SERVER_ENABLE_TSAN "Build every target with ThreadSanitizer" OFF)
-set(ANT_SERVER_IO_BACKEND "epoll" CACHE STRING "Socket runtime: epoll or io_uring")
-set_property(CACHE ANT_SERVER_IO_BACKEND PROPERTY STRINGS epoll io_uring)
-if(ANT_SERVER_ENABLE_TSAN)
+option(ANT_RPC_ENABLE_TSAN "Build every target with ThreadSanitizer" OFF)
+set(ANT_RPC_IO_BACKEND "epoll" CACHE STRING "Socket runtime: epoll or io_uring")
+set_property(CACHE ANT_RPC_IO_BACKEND PROPERTY STRINGS epoll io_uring)
+if(ANT_RPC_ENABLE_TSAN)
     if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        message(FATAL_ERROR "ANT_SERVER_ENABLE_TSAN requires Clang or GCC")
+        message(FATAL_ERROR "ANT_RPC_ENABLE_TSAN requires Clang or GCC")
     endif()
     add_compile_options(-fsanitize=thread -fno-omit-frame-pointer)
     add_link_options(-fsanitize=thread)
 endif()
 
-if(ANT_SERVER_IO_BACKEND STREQUAL "io_uring")
+if(ANT_RPC_IO_BACKEND STREQUAL "io_uring")
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(URING REQUIRED liburing)
-    set(ANT_SERVER_IO_BACKEND_DEFINE ANT_SERVER_USE_IO_URING=1)
-elseif(ANT_SERVER_IO_BACKEND STREQUAL "epoll")
-    set(ANT_SERVER_IO_BACKEND_DEFINE ANT_SERVER_USE_EPOLL=1)
+    set(ANT_RPC_IO_BACKEND_DEFINE ANT_RPC_USE_IO_URING=1)
+elseif(ANT_RPC_IO_BACKEND STREQUAL "epoll")
+    set(ANT_RPC_IO_BACKEND_DEFINE ANT_RPC_USE_EPOLL=1)
 else()
-    message(FATAL_ERROR "ANT_SERVER_IO_BACKEND must be epoll or io_uring")
+    message(FATAL_ERROR "ANT_RPC_IO_BACKEND must be epoll or io_uring")
 endif()
 
 # --- FetchContent Dependencies ---
@@ -100,25 +100,26 @@ target_include_directories(echo_proto PUBLIC ${PROTO_GEN_DIR})
 add_subdirectory(3rd_party/butil)
 add_subdirectory(3rd_party/llhttp)
 
-add_library(ant_server INTERFACE)
-target_include_directories(ant_server INTERFACE
+add_library(AntRPC INTERFACE)
+add_library(AntRPC::AntRPC ALIAS AntRPC)
+target_include_directories(AntRPC INTERFACE
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/3rd_party
     ${PROTO_GEN_DIR}
 )
-target_link_libraries(ant_server INTERFACE butil llhttp echo_proto protobuf::libprotobuf absl::flat_hash_map
+target_link_libraries(AntRPC INTERFACE butil llhttp echo_proto protobuf::libprotobuf absl::flat_hash_map
     absl::log absl::log_initialize absl::log_globals)
-target_compile_definitions(ant_server INTERFACE ${ANT_SERVER_IO_BACKEND_DEFINE})
+target_compile_definitions(AntRPC INTERFACE ${ANT_RPC_IO_BACKEND_DEFINE})
 
 # Executables for demo / server testing
 add_executable(test_server test/main.cpp)
-target_link_libraries(test_server PRIVATE ant_server ${URING_LIBRARIES} absl::synchronization absl::base)
+target_link_libraries(test_server PRIVATE AntRPC ${URING_LIBRARIES} absl::synchronization absl::base)
 
 add_executable(test_client test/client.cpp)
 target_link_libraries(test_client PRIVATE butil)
 
 add_executable(test_timeout test/test_timeout.cpp)
-target_link_libraries(test_timeout PRIVATE ant_server ${URING_LIBRARIES} absl::synchronization absl::base)
+target_link_libraries(test_timeout PRIVATE AntRPC ${URING_LIBRARIES} absl::synchronization absl::base)
 
 # --- GoogleTest Configuration ---
 enable_testing()
@@ -126,11 +127,11 @@ enable_testing()
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 add_executable(rpc_e2e_server test/e2e/rpc_e2e_server.cpp)
-target_link_libraries(rpc_e2e_server PRIVATE ant_server ${URING_LIBRARIES} absl::synchronization absl::base)
-target_compile_definitions(rpc_e2e_server PRIVATE ANT_SERVER_ENABLE_TEST_SOCKET_FAULT_INJECTION=1)
+target_link_libraries(rpc_e2e_server PRIVATE AntRPC ${URING_LIBRARIES} absl::synchronization absl::base)
+target_compile_definitions(rpc_e2e_server PRIVATE ANT_RPC_ENABLE_TEST_SOCKET_FAULT_INJECTION=1)
 
 add_executable(rpc_e2e_client test/e2e/rpc_e2e_client.cpp)
-target_link_libraries(rpc_e2e_client PRIVATE ant_server ${URING_LIBRARIES} absl::synchronization absl::base)
+target_link_libraries(rpc_e2e_client PRIVATE AntRPC ${URING_LIBRARIES} absl::synchronization absl::base)
 
 add_test(
     NAME rpc_process_e2e
@@ -155,7 +156,7 @@ add_executable(unit_tests
     test/test_rpc_server.cpp
     test/test_ant_rpc_e2e.cpp
 )
-target_link_libraries(unit_tests PRIVATE ant_server ${URING_LIBRARIES} absl::synchronization absl::base gtest_main)
+target_link_libraries(unit_tests PRIVATE AntRPC ${URING_LIBRARIES} absl::synchronization absl::base gtest_main)
 
 include(GoogleTest)
 gtest_discover_tests(unit_tests)

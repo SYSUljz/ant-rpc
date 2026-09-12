@@ -5,7 +5,7 @@
 
 #include <gtest/gtest.h>
 
-#include "ant_server/http/parser.hpp"
+#include "ant_rpc/http/parser.hpp"
 #include "butil/iobuf.h"
 
 TEST(IOBufTest, BasicAppendAndCut) {

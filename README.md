@@ -1,4 +1,4 @@
-# ant_server
+# ant_rpc
 
 A high-performance, asynchronous HTTP/1.1 Web Server framework built with **C++20 Coroutines**, Linux **`io_uring`**, and a **3-Tier Work-Stealing Task Scheduler**.
 
@@ -20,8 +20,8 @@ A high-performance, asynchronous HTTP/1.1 Web Server framework built with **C++2
 ## 📁 Directory Structure
 
 ```
-ant_server/
-├── include/ant_server/
+ant_rpc/
+├── include/ant_rpc/
 │   ├── awaiter/          # Async Socket & Timeout coroutine awaiters
 │   ├── context/          # io_uring Context and Service Registry (IOuringSocketService, AntTimer)
 │   ├── handler/          # Multishot Connection Acceptor

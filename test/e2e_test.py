@@ -77,7 +77,7 @@ def test_timeout_cleanup():
     print("  -> PASSED!")
 
 if __name__ == '__main__':
-    print("=== Starting ant_server E2E Integration Suite ===")
+    print("=== Starting ant_rpc E2E Integration Suite ===")
     try:
         test_tcp_chunking()
         test_keep_alive()

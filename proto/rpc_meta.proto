@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package ant_server.rpc;
+package ant_rpc.rpc;
 
 enum RpcMessageType {
   RPC_REQUEST = 0;

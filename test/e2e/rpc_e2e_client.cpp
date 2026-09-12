@@ -6,8 +6,8 @@
 #include <thread>
 #include <vector>
 
-#include "ant_server/rpc/channel.hpp"
-#include "ant_server/rpc/controller.hpp"
+#include "ant_rpc/rpc/channel.hpp"
+#include "ant_rpc/rpc/controller.hpp"
 #include "echo.pb.h"
 
 namespace {
@@ -46,7 +46,7 @@ std::string RandomMessage(std::mt19937_64& generator, int request_index) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  ant_server::logging::Initialize();
+  ant_rpc::logging::Initialize();
   if (argc != 3 && argc != 9) {
     std::cerr << "usage: rpc_e2e_client HOST PORT [--requests N --threads N --seed N]\n";
     return 2;

@@ -9,9 +9,9 @@
 #include <thread>
 #include <vector>
 
-#include "ant_server/rpc/rpc_server.hpp"
-#include "ant_server/scheduler/scheduler.hpp"
-#include "ant_server/testing/socket_fault_injector.hpp"
+#include "ant_rpc/rpc/rpc_server.hpp"
+#include "ant_rpc/scheduler/scheduler.hpp"
+#include "ant_rpc/testing/socket_fault_injector.hpp"
 #include "echo.pb.h"
 
 namespace {
@@ -153,7 +153,7 @@ bool ParseArguments(int argc, char** argv, E2eServerConfig& config) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  ant_server::logging::Initialize();
+  ant_rpc::logging::Initialize();
   E2eServerConfig config;
   if (!ParseArguments(argc, argv, config)) {
     std::cerr << "invalid port\n";
@@ -161,7 +161,7 @@ int main(int argc, char** argv) {
   }
 
   Scheduler scheduler(config.worker_threads, 2);
-  ant_server::testing::SocketFaultInjector::SetMaxWriteBytes(config.max_write_bytes);
+  ant_rpc::testing::SocketFaultInjector::SetMaxWriteBytes(config.max_write_bytes);
   ant_rpc::RpcServer server(scheduler.GetIOContext(0), config.port, butil::IP_ANY,
                             ant_rpc::RpcServerOptions {.io_contexts = 2,
                                                        .max_pending_worker_tasks = config.max_pending_worker_tasks,

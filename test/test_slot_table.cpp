@@ -6,10 +6,15 @@
 
 #include <gtest/gtest.h>
 
-#include "ant_server/rpc/controller.hpp"
-#include "ant_server/rpc/slot_table.hpp"
+#include "ant_rpc/rpc/controller.hpp"
+#include "ant_rpc/rpc/slot_table.hpp"
 
 namespace {
+
+// This translation unit exercises the slot state machine exclusively. Keep
+// test bodies focused on state transitions rather than repeating the library
+// namespace on every expectation.
+using namespace ant_rpc::rpc;
 
 struct CountingTask final : TaskNode {
   explicit CountingTask(std::atomic<int>& count) : count_(count) {
@@ -59,14 +64,14 @@ struct RecordingExecutor final : Executor {
   std::atomic<int> schedules {0};
 };
 
-ant_server::rpc::ContinuationTarget TestContinuationTarget() {
+ContinuationTarget TestContinuationTarget() {
   static RecordingExecutor executor;
-  return ant_server::rpc::ContinuationTarget::Worker(executor);
+  return ContinuationTarget::Worker(executor);
 }
 
 TEST(SlotTableTest, CancelDuringArmingIsDeliveredByPublish) {
-  ant_server::rpc::SlotTable<4> slots;
-  ant_server::rpc::RpcController controller;
+  SlotTable<4> slots;
+  RpcController controller;
   std::atomic<int> ran {0};
   CountingTask task(ran);
 
@@ -77,15 +82,15 @@ TEST(SlotTableTest, CancelDuringArmingIsDeliveredByPublish) {
   EXPECT_EQ(ran.load(), 0) << "ARMING must not run the continuation";
   EXPECT_FALSE(controller.Failed());
 
-  EXPECT_EQ(slots.PublishSlot(cid), ant_server::rpc::PublishOutcome::kCanceled);
+  EXPECT_EQ(slots.PublishSlot(cid), PublishOutcome::kCanceled);
   EXPECT_EQ(ran.load(), 1);
   EXPECT_TRUE(controller.Failed());
-  EXPECT_EQ(controller.ErrorCode(), ant_server::rpc::RPC_ECANCELED);
+  EXPECT_EQ(controller.ErrorCode(), RPC_ECANCELED);
 }
 
 TEST(SlotTableTest, NotifyOnCancelRunsOnceBeforeNormalCompletionContinuation) {
-  ant_server::rpc::SlotTable<1> slots;
-  ant_server::rpc::RpcController controller;
+  SlotTable<1> slots;
+  RpcController controller;
   std::atomic<int> order {0};
   std::atomic<int> task_order {0};
   std::atomic<int> notify_order {0};
@@ -96,7 +101,7 @@ TEST(SlotTableTest, NotifyOnCancelRunsOnceBeforeNormalCompletionContinuation) {
   controller.NotifyOnCancel(&notify);
   const uint64_t cid = slots.AllocateSlot(&task, nullptr, &controller, TestContinuationTarget());
   ASSERT_NE(cid, 0);
-  ASSERT_EQ(slots.PublishSlot(cid), ant_server::rpc::PublishOutcome::kInFlight);
+  ASSERT_EQ(slots.PublishSlot(cid), PublishOutcome::kInFlight);
   ASSERT_TRUE(slots.CompleteSlot(cid, body));
 
   EXPECT_EQ(notify_order.load(), 1);
@@ -106,8 +111,8 @@ TEST(SlotTableTest, NotifyOnCancelRunsOnceBeforeNormalCompletionContinuation) {
 }
 
 TEST(SlotTableTest, TimeoutDuringArmingIsDeliveredByPublish) {
-  ant_server::rpc::SlotTable<4> slots;
-  ant_server::rpc::RpcController controller;
+  SlotTable<4> slots;
+  RpcController controller;
   std::atomic<int> ran {0};
   CountingTask task(ran);
 
@@ -117,15 +122,15 @@ TEST(SlotTableTest, TimeoutDuringArmingIsDeliveredByPublish) {
   EXPECT_TRUE(slots.TimeoutSlot(cid));
   EXPECT_EQ(ran.load(), 0) << "ARMING must not run the continuation";
 
-  EXPECT_EQ(slots.PublishSlot(cid), ant_server::rpc::PublishOutcome::kTimedOut);
+  EXPECT_EQ(slots.PublishSlot(cid), PublishOutcome::kTimedOut);
   EXPECT_EQ(ran.load(), 1);
   EXPECT_TRUE(controller.Failed());
-  EXPECT_EQ(controller.ErrorCode(), ant_server::rpc::RPC_ETIMEOUT);
+  EXPECT_EQ(controller.ErrorCode(), RPC_ETIMEOUT);
 }
 
 TEST(SlotTableTest, FirstPendingResolutionWins) {
-  ant_server::rpc::SlotTable<4> slots;
-  ant_server::rpc::RpcController controller;
+  SlotTable<4> slots;
+  RpcController controller;
   std::atomic<int> ran {0};
   CountingTask task(ran);
 
@@ -134,45 +139,45 @@ TEST(SlotTableTest, FirstPendingResolutionWins) {
 
   EXPECT_TRUE(slots.CancelSlot(cid));
   EXPECT_FALSE(slots.TimeoutSlot(cid));
-  EXPECT_EQ(slots.PublishSlot(cid), ant_server::rpc::PublishOutcome::kCanceled);
+  EXPECT_EQ(slots.PublishSlot(cid), PublishOutcome::kCanceled);
   EXPECT_EQ(ran.load(), 1);
-  EXPECT_EQ(controller.ErrorCode(), ant_server::rpc::RPC_ECANCELED);
+  EXPECT_EQ(controller.ErrorCode(), RPC_ECANCELED);
 }
 
 TEST(SlotTableTest, PublishedSlotResolvesImmediately) {
-  ant_server::rpc::SlotTable<4> slots;
-  ant_server::rpc::RpcController controller;
+  SlotTable<4> slots;
+  RpcController controller;
   std::atomic<int> ran {0};
   CountingTask task(ran);
 
   const uint64_t cid = slots.AllocateSlot(&task, nullptr, &controller, TestContinuationTarget());
   ASSERT_NE(cid, 0);
-  ASSERT_EQ(slots.PublishSlot(cid), ant_server::rpc::PublishOutcome::kInFlight);
+  ASSERT_EQ(slots.PublishSlot(cid), PublishOutcome::kInFlight);
 
   EXPECT_TRUE(slots.CancelSlot(cid));
   EXPECT_EQ(ran.load(), 1);
-  EXPECT_EQ(controller.ErrorCode(), ant_server::rpc::RPC_ECANCELED);
+  EXPECT_EQ(controller.ErrorCode(), RPC_ECANCELED);
 }
 
 TEST(SlotTableTest, PublishedSlotTimesOutImmediately) {
-  ant_server::rpc::SlotTable<4> slots;
-  ant_server::rpc::RpcController controller;
+  SlotTable<4> slots;
+  RpcController controller;
   std::atomic<int> ran {0};
   CountingTask task(ran);
 
   const uint64_t cid = slots.AllocateSlot(&task, nullptr, &controller, TestContinuationTarget());
   ASSERT_NE(cid, 0);
-  ASSERT_EQ(slots.PublishSlot(cid), ant_server::rpc::PublishOutcome::kInFlight);
+  ASSERT_EQ(slots.PublishSlot(cid), PublishOutcome::kInFlight);
 
   EXPECT_TRUE(slots.TimeoutSlot(cid));
   EXPECT_EQ(ran.load(), 1);
   EXPECT_TRUE(controller.Failed());
-  EXPECT_EQ(controller.ErrorCode(), ant_server::rpc::RPC_ETIMEOUT);
+  EXPECT_EQ(controller.ErrorCode(), RPC_ETIMEOUT);
 }
 
 TEST(SlotTableTest, ResponseCannotCompleteAnArmingSlot) {
-  ant_server::rpc::SlotTable<4> slots;
-  ant_server::rpc::RpcController controller;
+  SlotTable<4> slots;
+  RpcController controller;
   std::atomic<int> ran {0};
   CountingTask task(ran);
 
@@ -182,15 +187,15 @@ TEST(SlotTableTest, ResponseCannotCompleteAnArmingSlot) {
 
   EXPECT_FALSE(slots.CompleteSlot(cid, body)) << "a response may only resolve a published slot";
   EXPECT_EQ(ran.load(), 0);
-  ASSERT_EQ(slots.PublishSlot(cid), ant_server::rpc::PublishOutcome::kInFlight);
+  ASSERT_EQ(slots.PublishSlot(cid), PublishOutcome::kInFlight);
   EXPECT_TRUE(slots.CompleteSlot(cid, body));
   EXPECT_EQ(ran.load(), 1);
 }
 
 TEST(SlotTableTest, LateResponseAfterCancellationIsIgnored) {
-  ant_server::rpc::SlotTable<1> slots;
-  ant_server::rpc::RpcController first_controller;
-  ant_server::rpc::RpcController second_controller;
+  SlotTable<1> slots;
+  RpcController first_controller;
+  RpcController second_controller;
   std::atomic<int> first_ran {0};
   std::atomic<int> second_ran {0};
   CountingTask first_task(first_ran);
@@ -199,14 +204,14 @@ TEST(SlotTableTest, LateResponseAfterCancellationIsIgnored) {
 
   const uint64_t first_cid = slots.AllocateSlot(&first_task, nullptr, &first_controller, TestContinuationTarget());
   ASSERT_NE(first_cid, 0);
-  ASSERT_EQ(slots.PublishSlot(first_cid), ant_server::rpc::PublishOutcome::kInFlight);
+  ASSERT_EQ(slots.PublishSlot(first_cid), PublishOutcome::kInFlight);
   ASSERT_TRUE(slots.CancelSlot(first_cid));
   ASSERT_EQ(first_ran.load(), 1);
 
   const uint64_t second_cid = slots.AllocateSlot(&second_task, nullptr, &second_controller, TestContinuationTarget());
   ASSERT_NE(second_cid, 0);
   ASSERT_NE(second_cid, first_cid) << "slot reuse must advance the correlation-id version";
-  ASSERT_EQ(slots.PublishSlot(second_cid), ant_server::rpc::PublishOutcome::kInFlight);
+  ASSERT_EQ(slots.PublishSlot(second_cid), PublishOutcome::kInFlight);
 
   EXPECT_FALSE(slots.CompleteSlot(first_cid, body)) << "a late response must not resolve a recycled slot";
   EXPECT_EQ(second_ran.load(), 0);
@@ -220,9 +225,9 @@ TEST(SlotTableTest, LateResponseAfterCancellationIsIgnored) {
 }
 
 TEST(SlotTableTest, LateTimeoutAfterSlotReuseCannotResolveNewCall) {
-  ant_server::rpc::SlotTable<1> slots;
-  ant_server::rpc::RpcController first_controller;
-  ant_server::rpc::RpcController second_controller;
+  SlotTable<1> slots;
+  RpcController first_controller;
+  RpcController second_controller;
   std::atomic<int> first_ran {0};
   std::atomic<int> second_ran {0};
   CountingTask first_task(first_ran);
@@ -231,13 +236,13 @@ TEST(SlotTableTest, LateTimeoutAfterSlotReuseCannotResolveNewCall) {
 
   const uint64_t first_cid = slots.AllocateSlot(&first_task, nullptr, &first_controller, TestContinuationTarget());
   ASSERT_NE(first_cid, 0);
-  ASSERT_EQ(slots.PublishSlot(first_cid), ant_server::rpc::PublishOutcome::kInFlight);
+  ASSERT_EQ(slots.PublishSlot(first_cid), PublishOutcome::kInFlight);
   ASSERT_TRUE(slots.TimeoutSlot(first_cid));
 
   const uint64_t second_cid = slots.AllocateSlot(&second_task, nullptr, &second_controller, TestContinuationTarget());
   ASSERT_NE(second_cid, 0);
   ASSERT_NE(first_cid, second_cid);
-  ASSERT_EQ(slots.PublishSlot(second_cid), ant_server::rpc::PublishOutcome::kInFlight);
+  ASSERT_EQ(slots.PublishSlot(second_cid), PublishOutcome::kInFlight);
 
   EXPECT_FALSE(slots.TimeoutSlot(first_cid));
   EXPECT_TRUE(slots.CompleteSlot(second_cid, body));
@@ -247,10 +252,10 @@ TEST(SlotTableTest, LateTimeoutAfterSlotReuseCannotResolveNewCall) {
 }
 
 TEST(SlotTableTest, UnknownCorrelationIdIsCountedAndIgnored) {
-  ant_server::rpc::SlotTable<4> slots;
+  SlotTable<4> slots;
   butil::IOBuf body;
 
-  EXPECT_FALSE(slots.CompleteSlot(ant_server::rpc::SlotTable<4>::MakeCorrelationId(1, 99), body));
+  EXPECT_FALSE(slots.CompleteSlot(SlotTable<4>::MakeCorrelationId(1, 99), body));
   const auto stats = slots.response_completion_stats();
   EXPECT_EQ(stats.completed, 0U);
   EXPECT_EQ(stats.unknown_correlation_id, 1U);
@@ -258,17 +263,16 @@ TEST(SlotTableTest, UnknownCorrelationIdIsCountedAndIgnored) {
 }
 
 TEST(SlotTableTest, CompletionIsAlwaysScheduledOnWorkerExecutor) {
-  ant_server::rpc::SlotTable<4> slots;
-  ant_server::rpc::RpcController controller;
+  SlotTable<4> slots;
+  RpcController controller;
   RecordingExecutor executor;
   std::atomic<int> ran {0};
   CountingTask task(ran);
   butil::IOBuf body;
 
-  const uint64_t cid =
-      slots.AllocateSlot(&task, nullptr, &controller, ant_server::rpc::ContinuationTarget::Worker(executor));
+  const uint64_t cid = slots.AllocateSlot(&task, nullptr, &controller, ContinuationTarget::Worker(executor));
   ASSERT_NE(cid, 0);
-  ASSERT_EQ(slots.PublishSlot(cid), ant_server::rpc::PublishOutcome::kInFlight);
+  ASSERT_EQ(slots.PublishSlot(cid), PublishOutcome::kInFlight);
   ASSERT_TRUE(slots.CompleteSlot(cid, body));
 
   EXPECT_EQ(ran.load(), 1);
@@ -276,116 +280,116 @@ TEST(SlotTableTest, CompletionIsAlwaysScheduledOnWorkerExecutor) {
 }
 
 TEST(SlotTableTest, ResponseWinsWhenItCompletesBeforeClose) {
-  ant_server::rpc::SlotTable<1> slots;
-  ant_server::rpc::RpcController controller;
+  SlotTable<1> slots;
+  RpcController controller;
   std::atomic<int> ran {0};
   CountingTask task(ran);
   butil::IOBuf body;
 
   const uint64_t cid = slots.AllocateSlot(&task, nullptr, &controller, TestContinuationTarget());
   ASSERT_NE(cid, 0);
-  ASSERT_EQ(slots.PublishSlot(cid), ant_server::rpc::PublishOutcome::kInFlight);
+  ASSERT_EQ(slots.PublishSlot(cid), PublishOutcome::kInFlight);
   ASSERT_TRUE(slots.CompleteSlot(cid, body));
-  EXPECT_EQ(slots.FailAllActiveSlots(ant_server::rpc::RPC_ECONN_FAILED, "peer closed"), 0U);
+  EXPECT_EQ(slots.FailAllActiveSlots(RPC_ECONN_FAILED, "peer closed"), 0U);
 
   EXPECT_FALSE(controller.Failed());
   EXPECT_EQ(ran.load(), 1);
 }
 
 TEST(SlotTableTest, CloseWinsAndMakesSubsequentResponseLate) {
-  ant_server::rpc::SlotTable<1> slots;
-  ant_server::rpc::RpcController controller;
+  SlotTable<1> slots;
+  RpcController controller;
   std::atomic<int> ran {0};
   CountingTask task(ran);
   butil::IOBuf body;
 
   const uint64_t cid = slots.AllocateSlot(&task, nullptr, &controller, TestContinuationTarget());
   ASSERT_NE(cid, 0);
-  ASSERT_EQ(slots.PublishSlot(cid), ant_server::rpc::PublishOutcome::kInFlight);
-  EXPECT_EQ(slots.FailAllActiveSlots(ant_server::rpc::RPC_ECONN_FAILED, "peer closed"), 1U);
+  ASSERT_EQ(slots.PublishSlot(cid), PublishOutcome::kInFlight);
+  EXPECT_EQ(slots.FailAllActiveSlots(RPC_ECONN_FAILED, "peer closed"), 1U);
   EXPECT_FALSE(slots.CompleteSlot(cid, body));
 
-  EXPECT_EQ(controller.ErrorCode(), ant_server::rpc::RPC_ECONN_FAILED);
+  EXPECT_EQ(controller.ErrorCode(), RPC_ECONN_FAILED);
   EXPECT_EQ(ran.load(), 1);
   EXPECT_EQ(slots.response_completion_stats().late_response, 1U);
 }
 
 TEST(SlotTableTest, CancelWinsWhenItRacesCloseFirst) {
-  ant_server::rpc::SlotTable<1> slots;
-  ant_server::rpc::RpcController controller;
+  SlotTable<1> slots;
+  RpcController controller;
   std::atomic<int> ran {0};
   CountingTask task(ran);
 
   const uint64_t cid = slots.AllocateSlot(&task, nullptr, &controller, TestContinuationTarget());
   ASSERT_NE(cid, 0);
-  ASSERT_EQ(slots.PublishSlot(cid), ant_server::rpc::PublishOutcome::kInFlight);
+  ASSERT_EQ(slots.PublishSlot(cid), PublishOutcome::kInFlight);
   ASSERT_TRUE(slots.CancelSlot(cid));
-  EXPECT_EQ(slots.FailAllActiveSlots(ant_server::rpc::RPC_ECONN_FAILED, "peer closed"), 0U);
+  EXPECT_EQ(slots.FailAllActiveSlots(RPC_ECONN_FAILED, "peer closed"), 0U);
 
-  EXPECT_EQ(controller.ErrorCode(), ant_server::rpc::RPC_ECANCELED);
+  EXPECT_EQ(controller.ErrorCode(), RPC_ECANCELED);
   EXPECT_EQ(ran.load(), 1);
 }
 
 TEST(SlotTableTest, CloseWinsWhenItRacesCancelFirst) {
-  ant_server::rpc::SlotTable<1> slots;
-  ant_server::rpc::RpcController controller;
+  SlotTable<1> slots;
+  RpcController controller;
   std::atomic<int> ran {0};
   CountingTask task(ran);
 
   const uint64_t cid = slots.AllocateSlot(&task, nullptr, &controller, TestContinuationTarget());
   ASSERT_NE(cid, 0);
-  ASSERT_EQ(slots.PublishSlot(cid), ant_server::rpc::PublishOutcome::kInFlight);
-  ASSERT_EQ(slots.FailAllActiveSlots(ant_server::rpc::RPC_ECONN_FAILED, "peer closed"), 1U);
+  ASSERT_EQ(slots.PublishSlot(cid), PublishOutcome::kInFlight);
+  ASSERT_EQ(slots.FailAllActiveSlots(RPC_ECONN_FAILED, "peer closed"), 1U);
   EXPECT_FALSE(slots.CancelSlot(cid));
 
-  EXPECT_EQ(controller.ErrorCode(), ant_server::rpc::RPC_ECONN_FAILED);
+  EXPECT_EQ(controller.ErrorCode(), RPC_ECONN_FAILED);
   EXPECT_EQ(ran.load(), 1);
 }
 
 TEST(SlotTableTest, TimeoutAndCloseResolveExactlyOnce) {
-  ant_server::rpc::SlotTable<1> slots;
-  ant_server::rpc::RpcController controller;
+  SlotTable<1> slots;
+  RpcController controller;
   std::atomic<int> ran {0};
   CountingTask task(ran);
 
   const uint64_t cid = slots.AllocateSlot(&task, nullptr, &controller, TestContinuationTarget());
   ASSERT_NE(cid, 0);
-  ASSERT_EQ(slots.PublishSlot(cid), ant_server::rpc::PublishOutcome::kInFlight);
+  ASSERT_EQ(slots.PublishSlot(cid), PublishOutcome::kInFlight);
   ASSERT_TRUE(slots.TimeoutSlot(cid));
-  EXPECT_EQ(slots.FailAllActiveSlots(ant_server::rpc::RPC_ECONN_FAILED, "peer closed"), 0U);
+  EXPECT_EQ(slots.FailAllActiveSlots(RPC_ECONN_FAILED, "peer closed"), 0U);
 
-  EXPECT_EQ(controller.ErrorCode(), ant_server::rpc::RPC_ETIMEOUT);
+  EXPECT_EQ(controller.ErrorCode(), RPC_ETIMEOUT);
   EXPECT_EQ(ran.load(), 1);
 }
 
 TEST(SlotTableTest, CloseWinsWhenItRacesTimeoutFirst) {
-  ant_server::rpc::SlotTable<1> slots;
-  ant_server::rpc::RpcController controller;
+  SlotTable<1> slots;
+  RpcController controller;
   std::atomic<int> ran {0};
   CountingTask task(ran);
 
   const uint64_t cid = slots.AllocateSlot(&task, nullptr, &controller, TestContinuationTarget());
   ASSERT_NE(cid, 0);
-  ASSERT_EQ(slots.PublishSlot(cid), ant_server::rpc::PublishOutcome::kInFlight);
-  ASSERT_EQ(slots.FailAllActiveSlots(ant_server::rpc::RPC_ECONN_FAILED, "peer closed"), 1U);
+  ASSERT_EQ(slots.PublishSlot(cid), PublishOutcome::kInFlight);
+  ASSERT_EQ(slots.FailAllActiveSlots(RPC_ECONN_FAILED, "peer closed"), 1U);
   EXPECT_FALSE(slots.TimeoutSlot(cid));
 
-  EXPECT_EQ(controller.ErrorCode(), ant_server::rpc::RPC_ECONN_FAILED);
+  EXPECT_EQ(controller.ErrorCode(), RPC_ECONN_FAILED);
   EXPECT_EQ(ran.load(), 1);
 }
 
 TEST(SlotTableConcurrencyTest, ResponseAndTimeoutRaceHasExactlyOneWinner) {
   constexpr int kIterations = 512;
   for (int iteration = 0; iteration < kIterations; ++iteration) {
-    ant_server::rpc::SlotTable<1> slots;
-    ant_server::rpc::RpcController controller;
+    SlotTable<1> slots;
+    RpcController controller;
     std::atomic<int> ran {0};
     CountingTask task(ran);
     butil::IOBuf body;
 
     const uint64_t cid = slots.AllocateSlot(&task, nullptr, &controller, TestContinuationTarget());
     ASSERT_NE(cid, 0);
-    ASSERT_EQ(slots.PublishSlot(cid), ant_server::rpc::PublishOutcome::kInFlight);
+    ASSERT_EQ(slots.PublishSlot(cid), PublishOutcome::kInFlight);
 
     std::barrier start {3};
     std::atomic<bool> response_won {false};
@@ -407,7 +411,7 @@ TEST(SlotTableConcurrencyTest, ResponseAndTimeoutRaceHasExactlyOneWinner) {
     if (response_won.load(std::memory_order_acquire)) {
       EXPECT_FALSE(controller.Failed());
     } else {
-      EXPECT_EQ(controller.ErrorCode(), ant_server::rpc::RPC_ETIMEOUT);
+      EXPECT_EQ(controller.ErrorCode(), RPC_ETIMEOUT);
     }
   }
 }
@@ -415,15 +419,15 @@ TEST(SlotTableConcurrencyTest, ResponseAndTimeoutRaceHasExactlyOneWinner) {
 TEST(SlotTableConcurrencyTest, ResponseCancelAndTimeoutRaceCompletesExactlyOnce) {
   constexpr int kIterations = 512;
   for (int iteration = 0; iteration < kIterations; ++iteration) {
-    ant_server::rpc::SlotTable<1> slots;
-    ant_server::rpc::RpcController controller;
+    SlotTable<1> slots;
+    RpcController controller;
     std::atomic<int> ran {0};
     CountingTask task(ran);
     butil::IOBuf body;
 
     const uint64_t cid = slots.AllocateSlot(&task, nullptr, &controller, TestContinuationTarget());
     ASSERT_NE(cid, 0);
-    ASSERT_EQ(slots.PublishSlot(cid), ant_server::rpc::PublishOutcome::kInFlight);
+    ASSERT_EQ(slots.PublishSlot(cid), PublishOutcome::kInFlight);
 
     std::barrier start {4};
     std::atomic<bool> response_won {false};
@@ -459,8 +463,8 @@ TEST(SlotTableConcurrencyTest, ConcurrentAllocationAndReuseNeverHandsOutOneCellT
   constexpr int kThreadCount = 8;
   constexpr int kIterationsPerThread = 2000;
 
-  ant_server::rpc::SlotTable<kCapacity> slots;
-  ant_server::rpc::ClientMetrics metrics;
+  SlotTable<kCapacity> slots;
+  ClientMetrics metrics;
   slots.SetClientMetrics(metrics);
   std::array<std::atomic<int>, kCapacity> owners {};
   std::atomic<int> failures {0};
@@ -471,7 +475,7 @@ TEST(SlotTableConcurrencyTest, ConcurrentAllocationAndReuseNeverHandsOutOneCellT
 
   for (int thread_index = 0; thread_index < kThreadCount; ++thread_index) {
     threads.emplace_back([&] {
-      ant_server::rpc::RpcController controller;
+      RpcController controller;
       CountingTask task(completions);
       butil::IOBuf body;
       start.arrive_and_wait();
@@ -484,11 +488,11 @@ TEST(SlotTableConcurrencyTest, ConcurrentAllocationAndReuseNeverHandsOutOneCellT
           continue;
         }
 
-        const uint32_t slot_id = ant_server::rpc::SlotTable<kCapacity>::GetSlotId(cid);
+        const uint32_t slot_id = SlotTable<kCapacity>::GetSlotId(cid);
         if (owners[slot_id].fetch_add(1, std::memory_order_acq_rel) != 0) {
           failures.fetch_add(1, std::memory_order_relaxed);
         }
-        if (slots.PublishSlot(cid) != ant_server::rpc::PublishOutcome::kInFlight) {
+        if (slots.PublishSlot(cid) != PublishOutcome::kInFlight) {
           failures.fetch_add(1, std::memory_order_relaxed);
           owners[slot_id].fetch_sub(1, std::memory_order_acq_rel);
           continue;
@@ -522,9 +526,9 @@ TEST(SlotTableConcurrencyTest, ConcurrentAllocationAndReuseNeverHandsOutOneCellT
 }
 
 TEST(SlotTableTest, StaleTerminalEventsCannotChangeReusedSlotLifecycle) {
-  ant_server::rpc::SlotTable<1> slots;
-  ant_server::rpc::RpcController old_controller;
-  ant_server::rpc::RpcController new_controller;
+  SlotTable<1> slots;
+  RpcController old_controller;
+  RpcController new_controller;
   std::atomic<int> old_completions {0};
   std::atomic<int> new_completions {0};
   CountingTask old_task(old_completions);
@@ -533,14 +537,14 @@ TEST(SlotTableTest, StaleTerminalEventsCannotChangeReusedSlotLifecycle) {
 
   const uint64_t old_cid = slots.AllocateSlot(&old_task, nullptr, &old_controller, TestContinuationTarget());
   ASSERT_NE(old_cid, 0);
-  ASSERT_EQ(slots.PublishSlot(old_cid), ant_server::rpc::PublishOutcome::kInFlight);
+  ASSERT_EQ(slots.PublishSlot(old_cid), PublishOutcome::kInFlight);
   ASSERT_TRUE(slots.CompleteSlot(old_cid, body));
 
   const uint64_t new_cid = slots.AllocateSlot(&new_task, nullptr, &new_controller, TestContinuationTarget());
   ASSERT_NE(new_cid, 0);
   ASSERT_NE(new_cid, old_cid);
-  ASSERT_EQ(ant_server::rpc::SlotTable<1>::GetSlotId(new_cid), ant_server::rpc::SlotTable<1>::GetSlotId(old_cid));
-  ASSERT_EQ(slots.PublishSlot(new_cid), ant_server::rpc::PublishOutcome::kInFlight);
+  ASSERT_EQ(SlotTable<1>::GetSlotId(new_cid), SlotTable<1>::GetSlotId(old_cid));
+  ASSERT_EQ(slots.PublishSlot(new_cid), PublishOutcome::kInFlight);
 
   std::barrier start {4};
   std::thread stale_timeout([&] {
@@ -573,8 +577,8 @@ TEST(SlotTableTest, StaleTerminalEventsCannotChangeReusedSlotLifecycle) {
 }
 
 TEST(SlotTableTest, ConfiguredMaxInFlightBoundsAllocatedSlots) {
-  ant_server::rpc::SlotTable<2> slots;
-  ant_server::rpc::RpcController controller;
+  SlotTable<2> slots;
+  RpcController controller;
   std::atomic<int> ran {0};
   CountingTask task(ran);
   butil::IOBuf body;
@@ -587,7 +591,7 @@ TEST(SlotTableTest, ConfiguredMaxInFlightBoundsAllocatedSlots) {
                                /*max_in_flight=*/1),
             0U);
 
-  ASSERT_EQ(slots.PublishSlot(first), ant_server::rpc::PublishOutcome::kInFlight);
+  ASSERT_EQ(slots.PublishSlot(first), PublishOutcome::kInFlight);
   ASSERT_TRUE(slots.CompleteSlot(first, body));
   EXPECT_EQ(slots.active_slot_count(), 0U);
   EXPECT_NE(slots.AllocateSlot(&task, nullptr, &controller, TestContinuationTarget(), nullptr,
@@ -596,26 +600,26 @@ TEST(SlotTableTest, ConfiguredMaxInFlightBoundsAllocatedSlots) {
 }
 
 TEST(SlotTableTest, LocalFailurePreservesItsErrorCodeAndReleasesQuota) {
-  ant_server::rpc::SlotTable<1> slots;
-  ant_server::rpc::RpcController controller;
+  SlotTable<1> slots;
+  RpcController controller;
   std::atomic<int> ran {0};
   CountingTask task(ran);
 
   const uint64_t cid =
       slots.AllocateSlot(&task, nullptr, &controller, TestContinuationTarget(), nullptr, /*max_in_flight=*/1);
   ASSERT_NE(cid, 0);
-  ASSERT_EQ(slots.PublishSlot(cid), ant_server::rpc::PublishOutcome::kInFlight);
-  ASSERT_TRUE(slots.FailSlot(cid, ant_server::rpc::RPC_EOVERLOAD, "outbound queue full"));
+  ASSERT_EQ(slots.PublishSlot(cid), PublishOutcome::kInFlight);
+  ASSERT_TRUE(slots.FailSlot(cid, RPC_EOVERLOAD, "outbound queue full"));
 
-  EXPECT_EQ(controller.ErrorCode(), ant_server::rpc::RPC_EOVERLOAD);
+  EXPECT_EQ(controller.ErrorCode(), RPC_EOVERLOAD);
   EXPECT_EQ(ran.load(), 1);
   EXPECT_EQ(slots.active_slot_count(), 0U);
 }
 
 TEST(SlotTableTest, TerminalFailureFailsEveryPendingCall) {
-  ant_server::rpc::SlotTable<4> slots;
-  ant_server::rpc::RpcController first_controller;
-  ant_server::rpc::RpcController second_controller;
+  SlotTable<4> slots;
+  RpcController first_controller;
+  RpcController second_controller;
   std::atomic<int> first_ran {0};
   std::atomic<int> second_ran {0};
   CountingTask first_task(first_ran);
@@ -625,37 +629,37 @@ TEST(SlotTableTest, TerminalFailureFailsEveryPendingCall) {
   const uint64_t second = slots.AllocateSlot(&second_task, nullptr, &second_controller, TestContinuationTarget());
   ASSERT_NE(first, 0);
   ASSERT_NE(second, 0);
-  ASSERT_EQ(slots.PublishSlot(first), ant_server::rpc::PublishOutcome::kInFlight);
-  ASSERT_EQ(slots.PublishSlot(second), ant_server::rpc::PublishOutcome::kInFlight);
+  ASSERT_EQ(slots.PublishSlot(first), PublishOutcome::kInFlight);
+  ASSERT_EQ(slots.PublishSlot(second), PublishOutcome::kInFlight);
 
-  EXPECT_EQ(slots.FailAllActiveSlots(ant_server::rpc::RPC_ECONN_FAILED, "peer closed"), 2U);
+  EXPECT_EQ(slots.FailAllActiveSlots(RPC_ECONN_FAILED, "peer closed"), 2U);
   EXPECT_TRUE(first_controller.Failed());
   EXPECT_TRUE(second_controller.Failed());
-  EXPECT_EQ(first_controller.ErrorCode(), ant_server::rpc::RPC_ECONN_FAILED);
-  EXPECT_EQ(second_controller.ErrorCode(), ant_server::rpc::RPC_ECONN_FAILED);
+  EXPECT_EQ(first_controller.ErrorCode(), RPC_ECONN_FAILED);
+  EXPECT_EQ(second_controller.ErrorCode(), RPC_ECONN_FAILED);
   EXPECT_EQ(first_ran.load(), 1);
   EXPECT_EQ(second_ran.load(), 1);
   EXPECT_EQ(slots.active_slot_count(), 0U);
 }
 
 TEST(SlotTableTest, FailAllActiveSlotsDefersArmingCallUntilPublish) {
-  ant_server::rpc::SlotTable<4> slots;
-  ant_server::rpc::RpcController controller;
+  SlotTable<4> slots;
+  RpcController controller;
   std::atomic<int> ran {0};
   CountingTask task(ran);
 
   const uint64_t cid = slots.AllocateSlot(&task, nullptr, &controller, TestContinuationTarget());
   ASSERT_NE(cid, 0);
 
-  EXPECT_EQ(slots.FailAllActiveSlots(ant_server::rpc::RPC_ECONN_FAILED, "peer closed"), 0U)
+  EXPECT_EQ(slots.FailAllActiveSlots(RPC_ECONN_FAILED, "peer closed"), 0U)
       << "ARMING calls are not yet in the active published-call set";
   EXPECT_FALSE(controller.Failed()) << "ARMING must retain caller-owned objects until PublishSlot";
   EXPECT_EQ(ran.load(), 0);
   EXPECT_EQ(slots.active_slot_count(), 1U);
 
-  EXPECT_EQ(slots.PublishSlot(cid), ant_server::rpc::PublishOutcome::kFailed);
+  EXPECT_EQ(slots.PublishSlot(cid), PublishOutcome::kFailed);
   EXPECT_TRUE(controller.Failed());
-  EXPECT_EQ(controller.ErrorCode(), ant_server::rpc::RPC_ECONN_FAILED);
+  EXPECT_EQ(controller.ErrorCode(), RPC_ECONN_FAILED);
   EXPECT_EQ(ran.load(), 1);
   EXPECT_EQ(slots.active_slot_count(), 0U);
 }

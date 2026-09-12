@@ -6,19 +6,21 @@
 
 #include <gtest/gtest.h>
 
-#include "ant_server/coroutine/operator/when_any.hpp"
-#include "ant_server/scheduler/scheduler.hpp"
-#include "ant_server/scheduler/timer_keeper.hpp"
-#include "ant_server/type.hpp"
-#include "ant_server/utils/sleep.hpp"
+#include "ant_rpc/coroutine/operator/when_any.hpp"
+#include "ant_rpc/scheduler/scheduler.hpp"
+#include "ant_rpc/scheduler/timer_keeper.hpp"
+#include "ant_rpc/type.hpp"
+#include "ant_rpc/utils/sleep.hpp"
 
 using namespace std::chrono_literals;
+using ant_rpc::Task;
+using ant_rpc::when_any;
 
 namespace {
 
-ant_server::Task<int> ImmediateValue(int value) { co_return value; }
+Task<int> ImmediateValue(int value) { co_return value; }
 
-ant_server::Task<int> DelayedValue(TimerKeeper& timer_keeper, std::chrono::milliseconds delay, int value) {
+Task<int> DelayedValue(TimerKeeper& timer_keeper, std::chrono::milliseconds delay, int value) {
   co_await sleep_for(timer_keeper, delay);
   co_return value;
 }
@@ -28,7 +30,7 @@ ant_server::Task<int> DelayedValue(TimerKeeper& timer_keeper, std::chrono::milli
 TEST(WhenAnyTest, SynchronousWinnerDoesNotResumeParentReentrantly) {
   int observed = 0;
   [](int& output) -> DetachedTask {
-    auto result = co_await ant_server::when_any(ImmediateValue(7), ImmediateValue(9));
+    auto result = co_await when_any(ImmediateValue(7), ImmediateValue(9));
     EXPECT_EQ(result.index, 0U);
     output = std::get<0>(result.value);
   }(observed);
@@ -44,7 +46,7 @@ TEST(WhenAnyTest, FirstCompletionProvidesItsValue) {
 
   std::atomic<int> observed {0};
   [](TimerKeeper& timer, std::atomic<int>& output) -> DetachedTask {
-    auto result = co_await ant_server::when_any(DelayedValue(timer, 10ms, 11), DelayedValue(timer, 50ms, 22));
+    auto result = co_await when_any(DelayedValue(timer, 10ms, 11), DelayedValue(timer, 50ms, 22));
     output.store(std::get<0>(result.value), std::memory_order_release);
   }(timer_keeper, observed);
 

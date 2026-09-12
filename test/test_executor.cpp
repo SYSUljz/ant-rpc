@@ -6,9 +6,9 @@
 
 #include <gtest/gtest.h>
 
-#include "ant_server/awaiter/resume_on.hpp"
-#include "ant_server/scheduler/scheduler.hpp"
-#include "ant_server/type.hpp"
+#include "ant_rpc/awaiter/resume_on.hpp"
+#include "ant_rpc/scheduler/scheduler.hpp"
+#include "ant_rpc/type.hpp"
 
 // 1. Test basic WorkStealingExecutor multi-threaded scheduling
 TEST(ExecutorTest, WorkStealingExecutorExecutesTasksConcurrently) {

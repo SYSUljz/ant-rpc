@@ -3,18 +3,18 @@
 
 #include <gtest/gtest.h>
 
-#include "ant_server/logging/logging.hpp"
+#include "ant_rpc/logging/logging.hpp"
 #include "butil/logging.h"
 
 TEST(LoggingTest, FiltersBeforeFormattingAndWritesEscapedFieldsToStderr) {
-  namespace log = ant_server::logging;
+  namespace log = ant_rpc::logging;
   log::Initialize({.min_severity = absl::LogSeverityAtLeast::kError});
   bool formatted = false;
   log::Write(log::Event::kServerStarted, [&](auto&) { formatted = true; });
   EXPECT_FALSE(formatted);
   testing::internal::CaptureStderr();
   log::Write(log::Event::kServerStartFailed,
-             [](auto& out) { out << " reason=" << ant_server::logging::Quote("bad\n\"input\\"); });
+             [](auto& out) { out << " reason=" << ant_rpc::logging::Quote("bad\n\"input\\"); });
   const auto text = testing::internal::GetCapturedStderr();
   EXPECT_NE(text.find("event=server_start_failed"), std::string::npos);
   EXPECT_NE(text.find("reason=\"bad\\x0a\\\"input\\\\\""), std::string::npos);
@@ -22,7 +22,7 @@ TEST(LoggingTest, FiltersBeforeFormattingAndWritesEscapedFieldsToStderr) {
 }
 
 TEST(LoggingTest, RateLimiterHasOneConcurrentWinnerAndReportsSuppression) {
-  ant_server::logging::RateLimiter limiter;
+  ant_rpc::logging::RateLimiter limiter;
   std::atomic<int> winners {0};
   std::vector<std::thread> threads;
   for (int i = 0; i < 16; ++i) {
@@ -43,7 +43,7 @@ TEST(LoggingTest, RateLimiterHasOneConcurrentWinnerAndReportsSuppression) {
 }
 
 TEST(LoggingTest, SuppressedWarningSkipsFieldsAndIncrementsCount) {
-  namespace log = ant_server::logging;
+  namespace log = ant_rpc::logging;
   log::Initialize();
   int formatted = 0;
   testing::internal::CaptureStderr();

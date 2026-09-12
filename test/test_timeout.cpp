@@ -9,8 +9,8 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
-#include "ant_server/scheduler/scheduler.hpp"
-#include "ant_server/server.hpp"
+#include "ant_rpc/scheduler/scheduler.hpp"
+#include "ant_rpc/server.hpp"
 
 int main() {
   std::cout << "[Test] Starting Server on port 8016..." << std::endl;

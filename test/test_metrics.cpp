@@ -5,15 +5,15 @@
 
 #include <gtest/gtest.h>
 
-#include "ant_server/metrics/latency_recorder.hpp"
-#include "ant_server/metrics/metric.hpp"
-#include "ant_server/metrics/metric_registry.hpp"
-#include "ant_server/rpc/core/client_metrics.hpp"
+#include "ant_rpc/metrics/latency_recorder.hpp"
+#include "ant_rpc/metrics/metric.hpp"
+#include "ant_rpc/metrics/metric_registry.hpp"
+#include "ant_rpc/rpc/core/client_metrics.hpp"
 
 namespace {
 
 TEST(MetricRegistryTest, ExportsTypedSamplesAndEscapesLabels) {
-  using namespace ant_server::metrics;
+  using namespace ant_rpc::metrics;
   MetricRegistry registry;
   auto count = std::make_shared<Counter>();
   auto gauge = std::make_shared<Gauge>();
@@ -33,7 +33,7 @@ TEST(MetricRegistryTest, ExportsTypedSamplesAndEscapesLabels) {
 }
 
 TEST(MetricRegistryTest, RejectsInvalidDuplicateAndConflictingSeries) {
-  using namespace ant_server::metrics;
+  using namespace ant_rpc::metrics;
   MetricRegistry registry;
   auto count = std::make_shared<Counter>();
   EXPECT_FALSE(registry.Register("bad-name", count));
@@ -52,7 +52,7 @@ TEST(MetricRegistryTest, RejectsInvalidDuplicateAndConflictingSeries) {
 }
 
 TEST(MetricRegistryTest, RetainsOwnerUntilUnregisteredAndAllowsReregistration) {
-  using namespace ant_server::metrics;
+  using namespace ant_rpc::metrics;
   struct Owner {
     Counter count;
   };
@@ -71,7 +71,7 @@ TEST(MetricRegistryTest, RetainsOwnerUntilUnregisteredAndAllowsReregistration) {
 }
 
 TEST(MetricRegistryTest, ConcurrentRegistrationCollectionAndUpdates) {
-  using namespace ant_server::metrics;
+  using namespace ant_rpc::metrics;
   MetricRegistry registry;
   auto counter = std::make_shared<Counter>();
   ASSERT_TRUE(registry.Register("permanent", counter));
@@ -98,7 +98,7 @@ TEST(MetricRegistryTest, ConcurrentRegistrationCollectionAndUpdates) {
 }
 
 TEST(MetricsTest, CounterAccumulatesAcrossThreads) {
-  ant_server::metrics::Counter counter;
+  ant_rpc::metrics::Counter counter;
   constexpr int kThreadCount = 8;
   constexpr int kIncrementsPerThread = 10'000;
 
@@ -119,7 +119,7 @@ TEST(MetricsTest, CounterAccumulatesAcrossThreads) {
 }
 
 TEST(MetricsTest, GaugeTracksSignedChanges) {
-  ant_server::metrics::Gauge gauge;
+  ant_rpc::metrics::Gauge gauge;
   gauge.Set(10);
   gauge.Add(-4);
   gauge.Add(7);
@@ -128,7 +128,7 @@ TEST(MetricsTest, GaugeTracksSignedChanges) {
 }
 
 TEST(MetricsTest, LatencyRecorderSummarizesSamples) {
-  ant_server::metrics::LatencyRecorder recorder;
+  ant_rpc::metrics::LatencyRecorder recorder;
   EXPECT_TRUE(recorder.Snapshot().empty());
 
   recorder.Record(std::chrono::microseconds(30));
@@ -146,7 +146,7 @@ TEST(MetricsTest, LatencyRecorderSummarizesSamples) {
 }
 
 TEST(MetricsTest, LatencyRecorderRecordsConcurrently) {
-  ant_server::metrics::LatencyRecorder recorder;
+  ant_rpc::metrics::LatencyRecorder recorder;
   constexpr int kThreadCount = 4;
   constexpr int kRecordsPerThread = 5'000;
 
@@ -172,12 +172,12 @@ TEST(MetricsTest, LatencyRecorderRecordsConcurrently) {
 }
 
 TEST(MetricsTest, ClientMetricsClassifiesUniqueTerminalOutcomes) {
-  ant_server::rpc::ClientMetrics metrics;
+  ant_rpc::rpc::ClientMetrics metrics;
   metrics.calls_started.Add(4);
-  metrics.RecordCompletion(ant_server::rpc::RPC_SUCCESS, 10);
-  metrics.RecordCompletion(ant_server::rpc::RPC_EINTERNAL, 20);
-  metrics.RecordCompletion(ant_server::rpc::RPC_ETIMEOUT, 30);
-  metrics.RecordCompletion(ant_server::rpc::RPC_ECANCELED, 40);
+  metrics.RecordCompletion(ant_rpc::rpc::RPC_SUCCESS, 10);
+  metrics.RecordCompletion(ant_rpc::rpc::RPC_EINTERNAL, 20);
+  metrics.RecordCompletion(ant_rpc::rpc::RPC_ETIMEOUT, 30);
+  metrics.RecordCompletion(ant_rpc::rpc::RPC_ECANCELED, 40);
 
   EXPECT_EQ(metrics.calls_started.Value(), 4);
   EXPECT_EQ(metrics.calls_completed.Value(), 4);

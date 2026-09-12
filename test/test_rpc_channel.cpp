@@ -14,22 +14,25 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 
-#include "ant_server/awaiter/timeput_awaiter.hpp"
-#include "ant_server/context/context.hpp"
-#include "ant_server/coroutine/task.hpp"
-#include "ant_server/handler/acceptor.hpp"
-#include "ant_server/rpc/channel.hpp"
-#include "ant_server/rpc/controller.hpp"
-#include "ant_server/rpc/protocol.hpp"
-#include "ant_server/rpc/rpc_server.hpp"
-#include "ant_server/rpc/service_registry.hpp"
-#include "ant_server/scheduler/scheduler.hpp"
+#include "ant_rpc/awaiter/timeput_awaiter.hpp"
+#include "ant_rpc/context/context.hpp"
+#include "ant_rpc/coroutine/task.hpp"
+#include "ant_rpc/handler/acceptor.hpp"
+#include "ant_rpc/rpc/channel.hpp"
+#include "ant_rpc/rpc/controller.hpp"
+#include "ant_rpc/rpc/protocol.hpp"
+#include "ant_rpc/rpc/rpc_server.hpp"
+#include "ant_rpc/rpc/service_registry.hpp"
+#include "ant_rpc/scheduler/scheduler.hpp"
 #include "echo.pb.h"
 
-class EchoServiceImpl : public ant_rpc::EchoService {
+using namespace ant_rpc;
+using namespace ant_rpc::rpc;
+
+class EchoServiceImpl : public EchoService {
  public:
-  void Echo(google::protobuf::RpcController* controller, const ant_rpc::EchoRequest* request,
-            ant_rpc::EchoResponse* response, google::protobuf::Closure* done) override {
+  void Echo(google::protobuf::RpcController* controller, const EchoRequest* request, EchoResponse* response,
+            google::protobuf::Closure* done) override {
     (void)controller;
     response->set_message("Echo: " + request->message());
     if (done) {
@@ -131,12 +134,12 @@ void ExpectActiveCallsFailAfterPeerTerminalEvent(RawTerminalPeer::Action action)
   Context& context = scheduler.GetIOContext(0);
   scheduler.Start();
 
-  ant_rpc::RpcChannel channel(context);
+  RpcChannel channel(context);
   ASSERT_EQ(channel.Init("127.0.0.1", peer.port()), 0);
-  ant_rpc::EchoService_Stub stub(&channel);
-  std::array<ant_rpc::EchoRequest, kCallCount> requests;
-  std::array<ant_rpc::EchoResponse, kCallCount> responses;
-  std::array<ant_rpc::RpcController, kCallCount> controllers;
+  EchoService_Stub stub(&channel);
+  std::array<EchoRequest, kCallCount> requests;
+  std::array<EchoResponse, kCallCount> responses;
+  std::array<RpcController, kCallCount> controllers;
   std::atomic<int> remaining {kCallCount};
   absl::Notification all_done;
   std::array<CountdownClosure, kCallCount> closures {
@@ -151,7 +154,7 @@ void ExpectActiveCallsFailAfterPeerTerminalEvent(RawTerminalPeer::Action action)
   ASSERT_TRUE(all_done.WaitForNotificationWithTimeout(absl::Seconds(3)));
   for (const auto& controller : controllers) {
     EXPECT_TRUE(controller.Failed());
-    EXPECT_EQ(controller.ErrorCode(), ant_rpc::RPC_ECONN_FAILED);
+    EXPECT_EQ(controller.ErrorCode(), RPC_ECONN_FAILED);
   }
   EXPECT_EQ(channel.metrics().calls_started.Value(), kCallCount);
   EXPECT_EQ(channel.metrics().calls_completed.Value(), kCallCount);
@@ -177,13 +180,13 @@ TEST(RpcChannelCancellationTest, StartCancelResolvesAnActiveSlot) {
   Context& context = scheduler.GetIOContext(0);
   scheduler.Start();
 
-  ant_rpc::RpcChannel channel(context);
+  RpcChannel channel(context);
   ASSERT_EQ(channel.Init("127.0.0.1", peer.port()), 0);
-  ant_rpc::EchoService_Stub stub(&channel);
-  ant_rpc::EchoRequest request;
+  EchoService_Stub stub(&channel);
+  EchoRequest request;
   request.set_message("cancel-me");
-  ant_rpc::EchoResponse response;
-  ant_rpc::RpcController controller;
+  EchoResponse response;
+  RpcController controller;
   std::atomic<int> remaining {1};
   absl::Notification done;
   CountdownClosure closure(remaining, done);
@@ -194,7 +197,7 @@ TEST(RpcChannelCancellationTest, StartCancelResolvesAnActiveSlot) {
   ASSERT_TRUE(done.WaitForNotificationWithTimeout(absl::Seconds(2)));
   EXPECT_TRUE(controller.IsCanceled());
   EXPECT_TRUE(controller.Failed());
-  EXPECT_EQ(controller.ErrorCode(), ant_rpc::RPC_ECANCELED);
+  EXPECT_EQ(controller.ErrorCode(), RPC_ECANCELED);
   EXPECT_EQ(remaining.load(), 0);
   EXPECT_EQ(channel.metrics().calls_completed.Value(), 1);
   EXPECT_EQ(channel.metrics().call_errors.Value(), 1);
@@ -211,15 +214,15 @@ TEST(RpcChannelDeadlineTest, CallbackCallTimesOutWithoutPeerResponse) {
   Context& context = scheduler.GetIOContext(0);
   scheduler.Start();
 
-  ant_rpc::RpcChannel channel(context);
-  ant_rpc::RpcChannelOptions options;
+  RpcChannel channel(context);
+  RpcChannelOptions options;
   options.default_rpc_timeout = std::chrono::milliseconds(30);
   ASSERT_EQ(channel.Init("127.0.0.1", peer.port(), &options), 0);
-  ant_rpc::EchoService_Stub stub(&channel);
-  ant_rpc::EchoRequest request;
+  EchoService_Stub stub(&channel);
+  EchoRequest request;
   request.set_message("deadline-callback");
-  ant_rpc::EchoResponse response;
-  ant_rpc::RpcController controller;
+  EchoResponse response;
+  RpcController controller;
   std::atomic<int> remaining {1};
   absl::Notification done;
   CountdownClosure closure(remaining, done);
@@ -228,7 +231,7 @@ TEST(RpcChannelDeadlineTest, CallbackCallTimesOutWithoutPeerResponse) {
 
   ASSERT_TRUE(done.WaitForNotificationWithTimeout(absl::Seconds(2)));
   EXPECT_TRUE(controller.Failed());
-  EXPECT_EQ(controller.ErrorCode(), ant_rpc::RPC_ETIMEOUT);
+  EXPECT_EQ(controller.ErrorCode(), RPC_ETIMEOUT);
   EXPECT_EQ(remaining.load(), 0);
   EXPECT_EQ(channel.metrics().calls_completed.Value(), 1);
   EXPECT_EQ(channel.metrics().call_errors.Value(), 1);
@@ -245,25 +248,25 @@ TEST(RpcChannelDeadlineTest, CoroutineCallTimesOutWithoutPeerResponse) {
   Context& context = scheduler.GetIOContext(0);
   scheduler.Start();
 
-  ant_rpc::RpcChannel channel(context);
-  ant_rpc::RpcChannelOptions options;
+  RpcChannel channel(context);
+  RpcChannelOptions options;
   options.default_rpc_timeout = std::chrono::milliseconds(30);
   ASSERT_EQ(channel.Init("127.0.0.1", peer.port(), &options), 0);
   absl::Notification done;
-  std::atomic<int> observed_error {ant_rpc::RPC_SUCCESS};
+  std::atomic<int> observed_error {RPC_SUCCESS};
 
-  [](ant_rpc::RpcChannel& channel, std::atomic<int>& observed_error, absl::Notification& done) -> DetachedTask {
-    ant_rpc::EchoRequest request;
+  [](RpcChannel& channel, std::atomic<int>& observed_error, absl::Notification& done) -> DetachedTask {
+    EchoRequest request;
     request.set_message("deadline-coroutine");
-    ant_rpc::EchoResponse response;
-    ant_rpc::RpcController controller;
+    EchoResponse response;
+    RpcController controller;
     co_await channel.CallAsync("ant_rpc.EchoService", "Echo", &controller, &request, &response);
     observed_error.store(controller.ErrorCode(), std::memory_order_release);
     done.Notify();
   }(channel, observed_error, done);
 
   ASSERT_TRUE(done.WaitForNotificationWithTimeout(absl::Seconds(2)));
-  EXPECT_EQ(observed_error.load(std::memory_order_acquire), ant_rpc::RPC_ETIMEOUT);
+  EXPECT_EQ(observed_error.load(std::memory_order_acquire), RPC_ETIMEOUT);
 
   channel.Close();
   scheduler.Stop();
@@ -276,7 +279,7 @@ class RpcChannelTest : public ::testing::Test {
   Scheduler client_scheduler_ {1, 1};
   Context& server_ctx_ {server_scheduler_.GetIOContext(0)};
   Context& client_ctx_ {client_scheduler_.GetIOContext(0)};
-  ant_rpc::ServiceRegistry registry_;
+  ServiceRegistry registry_;
   EchoServiceImpl echo_service_;
   std::unique_ptr<Acceptor> acceptor_;
   int server_socket_ {-1};
@@ -301,9 +304,8 @@ class RpcChannelTest : public ::testing::Test {
     ASSERT_GE(getsockname(server_socket_, (struct sockaddr*)&addr, &addr_len), 0);
     port_ = ntohs(addr.sin_port);
 
-    acceptor_ = std::make_unique<Acceptor>(server_ctx_, server_socket_, [this](int client_fd) {
-      ant_rpc::handle_rpc_client(server_ctx_, client_fd, registry_);
-    });
+    acceptor_ = std::make_unique<Acceptor>(
+        server_ctx_, server_socket_, [this](int client_fd) { handle_rpc_client(server_ctx_, client_fd, registry_); });
     acceptor_->Start();
 
     server_scheduler_.Start();
@@ -321,15 +323,15 @@ class RpcChannelTest : public ::testing::Test {
 };
 
 TEST_F(RpcChannelTest, StartCancelAndWireResponseRaceCompletesExactlyOnce) {
-  ant_rpc::RpcChannel channel(client_ctx_);
+  RpcChannel channel(client_ctx_);
   ASSERT_EQ(channel.Init("127.0.0.1", port_), 0);
-  ant_rpc::EchoService_Stub stub(&channel);
+  EchoService_Stub stub(&channel);
   constexpr int kIterations = 128;
   for (int iteration = 0; iteration < kIterations; ++iteration) {
-    ant_rpc::EchoRequest request;
+    EchoRequest request;
     request.set_message("race-cancel-response");
-    ant_rpc::EchoResponse response;
-    ant_rpc::RpcController controller;
+    EchoResponse response;
+    RpcController controller;
     std::atomic<int> remaining {1};
     absl::Notification done;
     CountdownClosure closure(remaining, done);
@@ -347,7 +349,7 @@ TEST_F(RpcChannelTest, StartCancelAndWireResponseRaceCompletesExactlyOnce) {
     EXPECT_TRUE(controller.IsCanceled());
     EXPECT_EQ(remaining.load(), 0) << "the RPC completion callback must run once";
     if (controller.Failed()) {
-      EXPECT_EQ(controller.ErrorCode(), ant_rpc::RPC_ECANCELED);
+      EXPECT_EQ(controller.ErrorCode(), RPC_ECANCELED);
     } else {
       EXPECT_EQ(response.message(), "Echo: race-cancel-response");
     }
@@ -357,16 +359,16 @@ TEST_F(RpcChannelTest, StartCancelAndWireResponseRaceCompletesExactlyOnce) {
 }
 
 TEST_F(RpcChannelTest, ProtobufStubSyncCall) {
-  ant_rpc::RpcChannel channel(client_ctx_);
+  RpcChannel channel(client_ctx_);
   ASSERT_EQ(channel.Init("127.0.0.1", port_), 0);
 
-  ant_rpc::EchoService_Stub stub(&channel);
+  EchoService_Stub stub(&channel);
 
-  ant_rpc::EchoRequest req;
+  EchoRequest req;
   req.set_message("Hello Protobuf Stub!");
 
-  ant_rpc::EchoResponse resp;
-  ant_rpc::RpcController cntl;
+  EchoResponse resp;
+  RpcController cntl;
 
   // Standard Protobuf synchronous blocking call via Stub
   stub.Echo(&cntl, &req, &resp, nullptr);
@@ -386,16 +388,16 @@ TEST_F(RpcChannelTest, ProtobufStubSyncCall) {
 }
 
 TEST(RpcChannelMetricsTest, CallRejectedBeforeSlotAllocationIsRecordedInline) {
-  ant_rpc::RpcChannel channel;
-  ant_rpc::EchoService_Stub stub(&channel);
-  ant_rpc::EchoRequest request;
-  ant_rpc::EchoResponse response;
-  ant_rpc::RpcController controller;
+  RpcChannel channel;
+  EchoService_Stub stub(&channel);
+  EchoRequest request;
+  EchoResponse response;
+  RpcController controller;
 
   stub.Echo(&controller, &request, &response, nullptr);
 
   EXPECT_TRUE(controller.Failed());
-  EXPECT_EQ(controller.ErrorCode(), ant_rpc::RPC_ECONN_FAILED);
+  EXPECT_EQ(controller.ErrorCode(), RPC_ECONN_FAILED);
   EXPECT_EQ(channel.metrics().calls_started.Value(), 1);
   EXPECT_EQ(channel.metrics().calls_completed.Value(), 1);
   EXPECT_EQ(channel.metrics().calls_succeeded.Value(), 0);
@@ -404,36 +406,36 @@ TEST(RpcChannelMetricsTest, CallRejectedBeforeSlotAllocationIsRecordedInline) {
 }
 
 TEST_F(RpcChannelTest, DefaultChannelUsesProcessRuntime) {
-  ASSERT_TRUE(ant_rpc::InitRuntime({.worker_threads = 1, .io_threads = 1}));
+  ASSERT_TRUE(InitRuntime({.worker_threads = 1, .io_threads = 1}));
 
-  ant_rpc::RpcChannel channel;
+  RpcChannel channel;
   ASSERT_EQ(channel.Init("127.0.0.1:" + std::to_string(port_)), 0);
 
-  ant_rpc::EchoService_Stub stub(&channel);
-  ant_rpc::EchoRequest req;
+  EchoService_Stub stub(&channel);
+  EchoRequest req;
   req.set_message("global-runtime");
-  ant_rpc::EchoResponse resp;
-  ant_rpc::RpcController cntl;
+  EchoResponse resp;
+  RpcController cntl;
   stub.Echo(&cntl, &req, &resp, nullptr);
 
   EXPECT_FALSE(cntl.Failed()) << cntl.ErrorText();
   EXPECT_EQ(resp.message(), "Echo: global-runtime");
 
   channel.Close();
-  EXPECT_TRUE(ant_rpc::ShutdownRuntime());
+  EXPECT_TRUE(ShutdownRuntime());
 }
 
 TEST_F(RpcChannelTest, AsyncCallbackCall) {
-  ant_rpc::RpcChannel channel(client_ctx_);
+  RpcChannel channel(client_ctx_);
   ASSERT_EQ(channel.Init("127.0.0.1", port_), 0);
 
-  ant_rpc::EchoService_Stub stub(&channel);
+  EchoService_Stub stub(&channel);
 
-  ant_rpc::EchoRequest req;
+  EchoRequest req;
   req.set_message("Async Callback Test");
 
-  ant_rpc::EchoResponse resp;
-  ant_rpc::RpcController cntl;
+  EchoResponse resp;
+  RpcController cntl;
 
   absl::Notification done_notification;
   struct TestClosure : public google::protobuf::Closure {
@@ -452,13 +454,13 @@ TEST_F(RpcChannelTest, AsyncCallbackCall) {
 }
 
 TEST_F(RpcChannelTest, RejectsForeignProtobufController) {
-  ant_rpc::RpcChannel channel(client_ctx_);
+  RpcChannel channel(client_ctx_);
   ASSERT_EQ(channel.Init("127.0.0.1", port_), 0);
-  ant_rpc::EchoService_Stub stub(&channel);
+  EchoService_Stub stub(&channel);
 
   ForeignRpcController controller;
-  ant_rpc::EchoRequest request;
-  ant_rpc::EchoResponse response;
+  EchoRequest request;
+  EchoResponse response;
   absl::Notification done_notification;
   struct TestClosure final : google::protobuf::Closure {
     explicit TestClosure(absl::Notification& notification) : notification(notification) {}
@@ -470,22 +472,22 @@ TEST_F(RpcChannelTest, RejectsForeignProtobufController) {
 
   EXPECT_TRUE(done_notification.WaitForNotificationWithTimeout(absl::Seconds(1)));
   EXPECT_TRUE(controller.Failed());
-  EXPECT_NE(controller.ErrorText().find("requires ant_server::rpc::RpcController"), std::string::npos);
+  EXPECT_NE(controller.ErrorText().find("requires ant_rpc::rpc::RpcController"), std::string::npos);
   channel.Close();
 }
 
 TEST_F(RpcChannelTest, CoroutineCallMethodTemplate) {
-  ant_rpc::RpcChannel channel(client_ctx_);
+  RpcChannel channel(client_ctx_);
   ASSERT_EQ(channel.Init("127.0.0.1", port_), 0);
 
   absl::Notification coroutine_done;
 
-  [](ant_rpc::RpcChannel& ch, int port, absl::Notification& notif) -> DetachedTask {
-    ant_rpc::EchoRequest req;
+  [](RpcChannel& ch, int port, absl::Notification& notif) -> DetachedTask {
+    EchoRequest req;
     req.set_message("Modern C++20 Coroutine Call");
 
-    ant_rpc::RpcController cntl;
-    auto resp = co_await ch.Call<ant_rpc::EchoResponse>("ant_rpc.EchoService", "Echo", req, &cntl);
+    RpcController cntl;
+    auto resp = co_await ch.Call<EchoResponse>("ant_rpc.EchoService", "Echo", req, &cntl);
 
     EXPECT_FALSE(cntl.Failed());
     EXPECT_EQ(resp.message(), "Echo: Modern C++20 Coroutine Call");
@@ -497,7 +499,7 @@ TEST_F(RpcChannelTest, CoroutineCallMethodTemplate) {
 }
 
 TEST_F(RpcChannelTest, HighConcurrencyMultiplexingOnSingleTcpConnection) {
-  ant_rpc::RpcChannel channel(client_ctx_);
+  RpcChannel channel(client_ctx_);
   ASSERT_EQ(channel.Init("127.0.0.1", port_), 0);
 
   constexpr int TOTAL_CALLS = 100;
@@ -505,12 +507,12 @@ TEST_F(RpcChannelTest, HighConcurrencyMultiplexingOnSingleTcpConnection) {
   absl::Notification all_done;
 
   for (int i = 0; i < TOTAL_CALLS; ++i) {
-    [](ant_rpc::RpcChannel& ch, int idx, std::atomic<int>& count, absl::Notification& notif) -> DetachedTask {
-      ant_rpc::EchoRequest req;
+    [](RpcChannel& ch, int idx, std::atomic<int>& count, absl::Notification& notif) -> DetachedTask {
+      EchoRequest req;
       req.set_message("Multiplex Ping " + std::to_string(idx));
 
-      ant_rpc::RpcController cntl;
-      auto resp = co_await ch.Call<ant_rpc::EchoResponse>("ant_rpc.EchoService", "Echo", req, &cntl);
+      RpcController cntl;
+      auto resp = co_await ch.Call<EchoResponse>("ant_rpc.EchoService", "Echo", req, &cntl);
 
       EXPECT_FALSE(cntl.Failed()) << cntl.ErrorText();
       EXPECT_EQ(resp.message(), "Echo: Multiplex Ping " + std::to_string(idx));
@@ -528,7 +530,7 @@ TEST_F(RpcChannelTest, HighConcurrencyMultiplexingOnSingleTcpConnection) {
 }
 
 TEST_F(RpcChannelTest, SharedChannelAcceptsCallsFromMultipleExternalThreads) {
-  ant_rpc::RpcChannel channel(client_ctx_);
+  RpcChannel channel(client_ctx_);
   ASSERT_EQ(channel.Init("127.0.0.1", port_), 0);
 
   constexpr int kThreadCount = 4;
@@ -540,11 +542,11 @@ TEST_F(RpcChannelTest, SharedChannelAcceptsCallsFromMultipleExternalThreads) {
 
   for (int thread_id = 0; thread_id < kThreadCount; ++thread_id) {
     callers.emplace_back([&channel, &successful_calls, &failed, thread_id] {
-      ant_rpc::EchoService_Stub stub(&channel);
+      EchoService_Stub stub(&channel);
       for (int call_id = 0; call_id < kCallsPerThread; ++call_id) {
-        ant_rpc::RpcController controller;
-        ant_rpc::EchoRequest request;
-        ant_rpc::EchoResponse response;
+        RpcController controller;
+        EchoRequest request;
+        EchoResponse response;
         const std::string payload = "external-" + std::to_string(thread_id) + "-" + std::to_string(call_id);
         request.set_message(payload);
         stub.Echo(&controller, &request, &response, nullptr);

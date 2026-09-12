@@ -10,10 +10,10 @@
 #include <gtest/gtest.h>
 #include <sys/socket.h>
 
-#include "ant_server/awaiter/socket_awaiter.hpp"
-#include "ant_server/context/context.hpp"
-#include "ant_server/scheduler/scheduler.hpp"
-#include "ant_server/type.hpp"
+#include "ant_rpc/awaiter/socket_awaiter.hpp"
+#include "ant_rpc/context/context.hpp"
+#include "ant_rpc/scheduler/scheduler.hpp"
+#include "ant_rpc/type.hpp"
 
 // Coroutine task type with initial_suspend = suspend_always to allow setting token into promise
 struct TestCancelTask {
