@@ -297,3 +297,48 @@ TEST(SleepTest, MassiveConcurrentTimers) {
   timer_keeper.Stop();
   executor.Stop();
 }
+
+// Reproduce a shutdown-hanging long-tail RPC: timer producers keep inserting
+// while the timer thread is popping an expired batch. Every callback must run;
+// losing even one would leave its protobuf done closure permanently pending.
+TEST(SleepTest, ConcurrentInsertionMustNotDropExpiredCallbacks) {
+  WorkStealingExecutor executor(4);
+  executor.Start();
+  TimerKeeper timer_keeper(executor);
+  timer_keeper.Start();
+
+  constexpr size_t kProducerCount = 8;
+  constexpr size_t kTimersPerProducer = 3000;
+  constexpr size_t kExpected = kProducerCount * kTimersPerProducer;
+  std::atomic<size_t> fired {0};
+  std::atomic<bool> start {false};
+  std::vector<std::thread> producers;
+  producers.reserve(kProducerCount);
+  for (size_t producer = 0; producer < kProducerCount; ++producer) {
+    producers.emplace_back([&, producer] {
+      while (!start.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      for (size_t index = 0; index < kTimersPerProducer; ++index) {
+        timer_keeper.AddTimer(std::chrono::milliseconds(1 + (index + producer) % 5),
+                              [&] { fired.fetch_add(1, std::memory_order_relaxed); });
+        if (index % 64 == 0) {
+          std::this_thread::yield();
+        }
+      }
+    });
+  }
+  start.store(true, std::memory_order_release);
+  for (auto& producer : producers) {
+    producer.join();
+  }
+
+  const auto deadline = std::chrono::steady_clock::now() + 5s;
+  while (fired.load(std::memory_order_acquire) < kExpected && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(5ms);
+  }
+  timer_keeper.Stop();
+  executor.Stop();
+  EXPECT_EQ(fired.load(std::memory_order_acquire), kExpected)
+      << "an expired timer callback was lost while new timers were inserted";
+}

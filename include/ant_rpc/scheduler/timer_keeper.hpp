@@ -335,7 +335,9 @@ class TimerKeeper {
         }
 
         // Before popping/executing, check if a newly scheduled timer in buckets is earlier
-        if (top->expire_at.time_since_epoch().count() > global_nearest_run_time_us_.load(std::memory_order_relaxed)) {
+        const int64_t top_expire_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(top->expire_at.time_since_epoch()).count();
+        if (top_expire_us > global_nearest_run_time_us_.load(std::memory_order_relaxed)) {
           pull_again = true;
           break;
         }
@@ -357,16 +359,18 @@ class TimerKeeper {
         delete top;
       }
 
-      if (pull_again) {
-        continue;
-      }
-
       // 4. Dispatch expired tasks to Executor outside of all locks
       while (expired_head) {
         TaskNode* next = expired_head->next;
         expired_head->next = nullptr;
         executor_.schedule(expired_head);
         expired_head = next;
+      }
+
+      // A newly inserted earlier timer requires another bucket scan, but the
+      // callbacks already popped from the heap must not be discarded.
+      if (pull_again) {
+        continue;
       }
 
       // 5. Determine next sleep deadline
