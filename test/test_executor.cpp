@@ -1,14 +1,50 @@
 #include <atomic>
 #include <chrono>
 #include <coroutine>
+#include <filesystem>
+#include <fstream>
+#include <set>
+#include <string>
 #include <thread>
 #include <vector>
+
+#if defined(__linux__)
+#include <pthread.h>
+#endif
 
 #include <gtest/gtest.h>
 
 #include "ant_rpc/awaiter/resume_on.hpp"
 #include "ant_rpc/scheduler/scheduler.hpp"
 #include "ant_rpc/type.hpp"
+
+TEST(ExecutorTest, WorkerThreadHasProfilerFriendlyName) {
+#if defined(__linux__)
+  WorkStealingExecutor executor(1);
+  executor.Start();
+
+  std::string observed_name;
+  std::atomic<bool> completed {false};
+  auto task = make_lambda_task([&]() {
+    char name[16] {};
+    if (pthread_getname_np(pthread_self(), name, sizeof(name)) == 0) {
+      observed_name = name;
+    }
+    completed.store(true, std::memory_order_release);
+  });
+  executor.schedule(&task);
+
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!completed.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_TRUE(completed.load(std::memory_order_acquire));
+  executor.Stop();
+  EXPECT_EQ(observed_name, "ant-wrk-0");
+#else
+  GTEST_SKIP() << "Linux thread names are not available on this platform";
+#endif
+}
 
 // 1. Test basic WorkStealingExecutor multi-threaded scheduling
 TEST(ExecutorTest, WorkStealingExecutorExecutesTasksConcurrently) {
@@ -154,6 +190,22 @@ TEST(SchedulerTest, SeparatedIOAndWorkerLifecycle) {
   scheduler.Start();
 
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+#if defined(__linux__)
+  std::set<std::string> thread_names;
+  for (const auto& entry : std::filesystem::directory_iterator("/proc/self/task")) {
+    std::ifstream comm(entry.path() / "comm");
+    std::string name;
+    if (std::getline(comm, name)) {
+      thread_names.insert(std::move(name));
+    }
+  }
+  EXPECT_TRUE(thread_names.contains("ant-timer"));
+  EXPECT_TRUE(thread_names.contains("ant-io-0"));
+  EXPECT_TRUE(thread_names.contains("ant-wrk-0"));
+  EXPECT_TRUE(thread_names.contains("ant-wrk-1"));
+  EXPECT_TRUE(thread_names.contains("ant-wrk-2"));
+#endif
 
   // Schedule task via Scheduler's Executor interface
   auto task = make_lambda_task([&worker_executed]() { worker_executed.store(42, std::memory_order_release); });

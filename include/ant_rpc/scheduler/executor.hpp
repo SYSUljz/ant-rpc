@@ -15,6 +15,7 @@
 
 #include "absl/synchronization/mutex.h"
 #include "ant_rpc/constants.hpp"
+#include "ant_rpc/platform.hpp"
 #include "ant_rpc/scheduler/mpmc_queue.hpp"
 #include "ant_rpc/type.hpp"
 #include "ant_rpc/utils/random.hpp"
@@ -168,6 +169,7 @@ class WorkStealingExecutor : public Executor {
   void SetScheduler(Scheduler* scheduler) noexcept { scheduler_ = scheduler; }
 
   void WorkerLoop(int thread_id) {
+    ant_rpc::platform::SetIndexedThreadName("ant-wrk", static_cast<std::size_t>(thread_id));
     g_thread_id = static_cast<std::size_t>(thread_id);
     g_executor = this;
     g_scheduler = scheduler_;

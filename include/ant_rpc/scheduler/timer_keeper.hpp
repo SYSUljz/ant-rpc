@@ -16,6 +16,7 @@
 #include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
 #include "ant_rpc/constants.hpp"
+#include "ant_rpc/platform.hpp"
 #include "ant_rpc/type.hpp"
 #include "ant_rpc/utils/random.hpp"
 
@@ -125,7 +126,10 @@ class TimerKeeper {
 
   void Start() {
     if (!running_.exchange(true, std::memory_order_acq_rel)) {
-      thread_ = std::thread([this]() { this->Run(); });
+      thread_ = std::thread([this]() {
+        ant_rpc::platform::SetCurrentThreadName("ant-timer");
+        this->Run();
+      });
     }
   }
 

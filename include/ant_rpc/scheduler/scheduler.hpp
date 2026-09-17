@@ -9,6 +9,7 @@
 
 #include "ant_rpc/constants.hpp"
 #include "ant_rpc/context/context.hpp"
+#include "ant_rpc/platform.hpp"
 #include "ant_rpc/scheduler/executor.hpp"
 #include "ant_rpc/scheduler/timer_keeper.hpp"
 #include "ant_rpc/type.hpp"
@@ -87,6 +88,7 @@ class Scheduler : public Executor {
   bool IsRunning() const noexcept { return running_.load(std::memory_order_acquire); }
 
   void IOLoop(int io_id) {
+    ant_rpc::platform::SetIndexedThreadName("ant-io", static_cast<std::size_t>(io_id));
     g_thread_id = static_cast<std::size_t>(io_id);
     g_local_context = io_contexts_[io_id].get();
     g_executor = worker_executor_.get();
