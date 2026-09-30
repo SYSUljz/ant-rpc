@@ -91,7 +91,7 @@ class Scheduler : public Executor {
     ant_rpc::platform::SetIndexedThreadName("ant-io", static_cast<std::size_t>(io_id));
     g_thread_id = static_cast<std::size_t>(io_id);
     g_local_context = io_contexts_[io_id].get();
-    g_executor = worker_executor_.get();
+    g_executor = nullptr;
     g_scheduler = this;
 
     auto& ctx = *io_contexts_[io_id];

@@ -1,76 +1,66 @@
 #pragma once
 
-#include "absl/base/internal/spinlock.h"
+#include "concurrentqueue/concurrentqueue.h"
 #include "ant_rpc/type.hpp"
 
-class IntrusiveSpinLockQueue {
+class ConcurrentGlobalQueue {
  public:
-  IntrusiveSpinLockQueue() = default;
-  ~IntrusiveSpinLockQueue() = default;
+  ConcurrentGlobalQueue() = default;
+  ~ConcurrentGlobalQueue() = default;
 
-  IntrusiveSpinLockQueue(const IntrusiveSpinLockQueue&) = delete;
-  IntrusiveSpinLockQueue& operator=(const IntrusiveSpinLockQueue&) = delete;
-  IntrusiveSpinLockQueue(IntrusiveSpinLockQueue&&) = delete;
-  IntrusiveSpinLockQueue& operator=(IntrusiveSpinLockQueue&&) = delete;
+  ConcurrentGlobalQueue(const ConcurrentGlobalQueue&) = delete;
+  ConcurrentGlobalQueue& operator=(const ConcurrentGlobalQueue&) = delete;
+  ConcurrentGlobalQueue(ConcurrentGlobalQueue&&) = delete;
+  ConcurrentGlobalQueue& operator=(ConcurrentGlobalQueue&&) = delete;
 
-  // Single item push (FIFO)
+  // Single item push (Lock-free FIFO)
   void Push(TaskNode* node) {
     if (!node) {
       return;
     }
     node->next = nullptr;
+    queue_.enqueue(node);
+  }
 
-    absl::base_internal::SpinLockHolder holder(&lock_);
-    if (!tail_) {
-      head_ = node;
-      tail_ = node;
-    } else {
-      tail_->next = node;
-      tail_ = node;
+  // Batch push: connects batch into queue
+  void PushBatch(TaskNode* const* nodes, std::size_t count) {
+    if (nodes && count > 0) {
+      queue_.enqueue_bulk(nodes, count);
     }
   }
 
-  // Batch push: connects batch_head -> ... -> batch_tail into queue tail in O(1)
+  // Compatible overload for linked list batch push
   void PushBatch(TaskNode* batch_head, TaskNode* batch_tail) {
-    if (!batch_head || !batch_tail) {
-      return;
-    }
-    batch_tail->next = nullptr;
-
-    absl::base_internal::SpinLockHolder holder(&lock_);
-    if (!tail_) {
-      head_ = batch_head;
-      tail_ = batch_tail;
-    } else {
-      tail_->next = batch_head;
-      tail_ = batch_tail;
+    for (TaskNode* curr = batch_head; curr != nullptr; curr = curr->next) {
+      queue_.enqueue(curr);
+      if (curr == batch_tail) {
+        break;
+      }
     }
   }
 
-  // Single item pop (FIFO)
+  // Single item pop (Lock-free FIFO)
   TaskNode* Pop() {
-    absl::base_internal::SpinLockHolder holder(&lock_);
-    if (!head_) {
-      return nullptr;
+    TaskNode* node = nullptr;
+    if (queue_.try_dequeue(node)) {
+      return node;
     }
+    return nullptr;
+  }
 
-    TaskNode* node = head_;
-    head_ = head_->next;
-    if (!head_) {
-      tail_ = nullptr;
-    }
-
-    node->next = nullptr;
-    return node;
+  // Batch pop (Lock-free bulk dequeue)
+  std::size_t PopBatch(TaskNode** buffer, std::size_t max_items) {
+    return queue_.try_dequeue_bulk(buffer, max_items);
   }
 
   bool empty() const {
-    absl::base_internal::SpinLockHolder holder(&lock_);
-    return head_ == nullptr;
+    return queue_.size_approx() == 0;
+  }
+
+  std::size_t size_approx() const {
+    return queue_.size_approx();
   }
 
  private:
-  TaskNode* head_ {nullptr};
-  TaskNode* tail_ {nullptr};
-  mutable absl::base_internal::SpinLock lock_;
+  moodycamel::ConcurrentQueue<TaskNode*> queue_;
 };

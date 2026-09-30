@@ -17,67 +17,71 @@
 #include "ant_rpc/constants.hpp"
 #include "ant_rpc/platform.hpp"
 #include "ant_rpc/scheduler/mpmc_queue.hpp"
+#include "ant_rpc/scheduler/spmc_queue.hpp"
 #include "ant_rpc/type.hpp"
 #include "ant_rpc/utils/random.hpp"
+#include "concurrentqueue/concurrentqueue.h"
 
 // ============================================================================
 // WorkStealingExecutor: Pure Compute / Coroutine Task Executor (Worker Pool)
 // Implements the Executor interface for decoupled, non-IO task scheduling.
-// Each worker owns a mutex-protected ready deque. This intentionally favors a
-// reviewable, testable concurrency boundary over a custom lock-free work-stealing
-// deque. P2C is retained only as a load-balancing policy for external producers.
-// ============================================================================
+// Each worker owns a lock-free Chase-Lev SPMC local queue for local tasks,
+// and a lock-free MPSC inbound queue for external/IO producers.
 class WorkStealingExecutor : public Executor {
  public:
+  struct WorkerState;
+  static inline thread_local WorkerState* g_current_worker = nullptr;
+
   struct WorkerState {
     int thread_id {0};
-    alignas(kCacheLineSize) absl::Mutex ready_mu;
-    std::deque<TaskNode*> ready_queue_;
+    alignas(kCacheLineSize) SPMCQueue<TaskNode*, 1024> local_queue_;
+    alignas(kCacheLineSize) moodycamel::ConcurrentQueue<TaskNode*> inbound_queue_;
     alignas(kCacheLineSize) uint64_t tick {0};
     alignas(kCacheLineSize) std::atomic<bool> is_parked {false};
 
     absl::Mutex park_mu;
     absl::CondVar park_cv;
 
-    // This is the only shared task container for a worker. Producers append at
-    // the back; the owner pops locally from the back while thieves take from
-    // the front. The mutex makes TaskNode::next ownership irrelevant here.
     void push_ready(TaskNode* task) {
       if (!task) {
         return;
       }
-      absl::MutexLock lock(&ready_mu);
-      ready_queue_.push_back(task);
+      if (g_current_worker == this) {
+        if (local_queue_.Push(task)) {
+          return;
+        }
+      }
+      inbound_queue_.enqueue(task);
     }
 
     TaskNode* pop_local() {
-      absl::MutexLock lock(&ready_mu);
-      if (ready_queue_.empty()) {
-        return nullptr;
+      if (auto* task = local_queue_.TryPop()) {
+        return task;
       }
-      TaskNode* task = ready_queue_.back();
-      ready_queue_.pop_back();
-      return task;
+      TaskNode* task = nullptr;
+      if (inbound_queue_.try_dequeue(task)) {
+        return task;
+      }
+      return nullptr;
     }
 
     TaskNode* steal_one() {
-      absl::MutexLock lock(&ready_mu);
-      if (ready_queue_.empty()) {
-        return nullptr;
+      if (auto* task = local_queue_.Steal()) {
+        return task;
       }
-      TaskNode* task = ready_queue_.front();
-      ready_queue_.pop_front();
-      return task;
+      TaskNode* task = nullptr;
+      if (inbound_queue_.try_dequeue(task)) {
+        return task;
+      }
+      return nullptr;
     }
 
-    std::size_t approximate_load() {
-      absl::MutexLock lock(&ready_mu);
-      return ready_queue_.size();
+    std::size_t approximate_load() const noexcept {
+      return static_cast<std::size_t>(local_queue_.Size()) + inbound_queue_.size_approx();
     }
 
-    bool has_ready_work() {
-      absl::MutexLock lock(&ready_mu);
-      return !ready_queue_.empty();
+    bool has_ready_work() const noexcept {
+      return !local_queue_.Empty() || inbound_queue_.size_approx() > 0;
     }
 
     void unpark() {
@@ -122,9 +126,10 @@ class WorkStealingExecutor : public Executor {
       return;
     }
 
-    // 1. If called from inside a worker thread, prioritize its own local slot/queue
-    if (g_executor == this && g_thread_id < workers_.size()) {
-      schedule(task, g_thread_id);
+    // 1. If called from inside a worker thread of this executor, prioritize its own local queue
+    if (g_current_worker != nullptr && g_executor == this) {
+      g_current_worker->push_ready(task);
+      g_current_worker->unpark();
       return;
     }
 
@@ -159,9 +164,6 @@ class WorkStealingExecutor : public Executor {
     }
 
     auto& w = *workers_[thread_id];
-
-    // This is an affinity hint for locality, not a non-stealable pin. Business
-    // coroutines are intentionally migratable across this executor's workers.
     w.push_ready(task);
     w.unpark();
   }
@@ -176,6 +178,7 @@ class WorkStealingExecutor : public Executor {
     g_local_context = nullptr;  // Worker threads do NOT own io_uring context
 
     auto& w = *workers_[thread_id];
+    g_current_worker = &w;
     int empty_spins = 0;
 
     while (running_.load(std::memory_order_relaxed)) {
@@ -283,7 +286,7 @@ class WorkStealingExecutor : public Executor {
 
   std::vector<std::unique_ptr<WorkerState>> workers_;
   std::vector<std::thread> threads_;
-  IntrusiveSpinLockQueue global_queue_;
+  ConcurrentGlobalQueue global_queue_;
   std::atomic<bool> running_ {false};
   std::size_t nthreads_;
   Scheduler* scheduler_ {nullptr};
