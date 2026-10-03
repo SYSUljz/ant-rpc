@@ -169,7 +169,7 @@ class ServerConnection final : public std::enable_shared_from_this<ServerConnect
         registry_(registry),
         runtime_(std::move(runtime)),
         idle_timeout_(runtime_->options().idle_timeout) {
-    ContextControl::SetServerDispatcher(&ServerConnection::DispatchCommand);
+    ContextControl::SetServerDispatcher(&ServerConnection::DispatchCommand, &ServerConnection::FlushWrites);
   }
   void Start() {
     runtime_->metrics().io_command_backlog.Add(1);
@@ -187,7 +187,8 @@ class ServerConnection final : public std::enable_shared_from_this<ServerConnect
     return close_reason_.load(std::memory_order_acquire);
   }
 
-  static void DispatchCommand(IoCommand&& cmd);
+  static void DispatchCommand(IoCommand&& cmd, bool defer_write);
+  static void FlushWrites(void* conn);
 
  private:
   struct InboundDoneClosure;
@@ -281,7 +282,8 @@ class ServerConnection final : public std::enable_shared_from_this<ServerConnect
     context_.PostCommand(
         IoCommand::ServerCompleteInbound(this, call.get(), std::move(response), close_after_completion));
   }
-  void CompleteInboundOnIoThread(void* call_state, butil::IOBuf response, bool close_after_completion) {
+  void CompleteInboundOnIoThread(void* call_state, butil::IOBuf response, bool close_after_completion,
+                                 bool defer_start_write = false) {
     if (call_state) {
       auto* call = static_cast<InboundCallState*>(call_state);
       std::erase_if(inbound_calls_, [call](const auto& item) { return item.get() == call; });
@@ -298,7 +300,9 @@ class ServerConnection final : public std::enable_shared_from_this<ServerConnect
     if (running_.load(std::memory_order_acquire) && !frame.buffer.empty()) {
       outbound_.push_back(std::move(frame));
       runtime_->metrics().responses_enqueued.Add();
-      StartNextWriteOnIoThread();
+      if (!defer_start_write) {
+        StartNextWriteOnIoThread();
+      }
     } else {
       ReleaseFrameReservation(frame);
     }
@@ -639,7 +643,7 @@ class ServerConnection final : public std::enable_shared_from_this<ServerConnect
   bool writing_ {false};
 };
 
-inline void ServerConnection::DispatchCommand(IoCommand&& cmd) {
+inline void ServerConnection::DispatchCommand(IoCommand&& cmd, bool defer_write) {
   auto* conn = static_cast<ServerConnection*>(cmd.connection);
   if (!conn) {
     return;
@@ -650,7 +654,7 @@ inline void ServerConnection::DispatchCommand(IoCommand&& cmd) {
       conn->StartOnIoThread();
       break;
     case IoCommand::Type::kServerCompleteInbound:
-      conn->CompleteInboundOnIoThread(cmd.inbound_call_state, std::move(cmd.payload), cmd.close_after);
+      conn->CompleteInboundOnIoThread(cmd.inbound_call_state, std::move(cmd.payload), cmd.close_after, defer_write);
       break;
     case IoCommand::Type::kServerClose:
       conn->BeginCloseOnIoThread();
@@ -660,8 +664,14 @@ inline void ServerConnection::DispatchCommand(IoCommand&& cmd) {
   }
 }
 
+inline void ServerConnection::FlushWrites(void* conn) {
+  if (auto* c = static_cast<ServerConnection*>(conn)) {
+    c->StartNextWriteOnIoThread();
+  }
+}
+
 inline static bool s_server_dispatcher_init = [] {
-  ContextControl::SetServerDispatcher(&ServerConnection::DispatchCommand);
+  ContextControl::SetServerDispatcher(&ServerConnection::DispatchCommand, &ServerConnection::FlushWrites);
   return true;
 }();
 

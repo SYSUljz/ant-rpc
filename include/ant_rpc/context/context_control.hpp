@@ -2,9 +2,11 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 #include <sys/eventfd.h>
 
@@ -57,12 +59,22 @@ class ContextControl {
   Scheduler& GetScheduler() const noexcept { return *scheduler_; }
   TimerKeeper& GetTimerKeeper() const noexcept { return *timer_keeper_; }
 
-  using IoCommandHandler = void (*)(IoCommand&&);
+  using IoCommandHandler = void (*)(IoCommand&&, bool defer_write);
+  using IoCommandFlushHandler = void (*)(void* connection);
+
   inline static IoCommandHandler s_server_dispatcher {nullptr};
   inline static IoCommandHandler s_channel_dispatcher {nullptr};
+  inline static IoCommandFlushHandler s_server_flush {nullptr};
+  inline static IoCommandFlushHandler s_channel_flush {nullptr};
 
-  static void SetServerDispatcher(IoCommandHandler handler) noexcept { s_server_dispatcher = handler; }
-  static void SetChannelDispatcher(IoCommandHandler handler) noexcept { s_channel_dispatcher = handler; }
+  static void SetServerDispatcher(IoCommandHandler handler, IoCommandFlushHandler flush = nullptr) noexcept {
+    s_server_dispatcher = handler;
+    s_server_flush = flush;
+  }
+  static void SetChannelDispatcher(IoCommandHandler handler, IoCommandFlushHandler flush = nullptr) noexcept {
+    s_channel_dispatcher = handler;
+    s_channel_flush = flush;
+  }
 
  protected:
   void DrainMailboxesOnIoThread() {
@@ -75,22 +87,71 @@ class ContextControl {
   }
 
   void DrainCommandsOnIoThread() {
-    commands_.Drain([](IoCommand&& cmd) {
+    touched_server_conns_.clear();
+    touched_channel_conns_.clear();
+
+    // Phase 1: Drain all commands, enqueueing frames to respective connection outbound queues
+    commands_.Drain([this](IoCommand&& cmd) {
       if (static_cast<uint8_t>(cmd.type) <= static_cast<uint8_t>(IoCommand::Type::kServerClose)) {
         if (s_server_dispatcher) {
-          s_server_dispatcher(std::move(cmd));
+          if (cmd.type == IoCommand::Type::kServerCompleteInbound) {
+            void* conn = cmd.connection;
+            s_server_dispatcher(std::move(cmd), /*defer_write=*/true);
+            touched_server_conns_.push_back(conn);
+          } else {
+            s_server_dispatcher(std::move(cmd), /*defer_write=*/false);
+          }
         }
       } else {
         if (s_channel_dispatcher) {
-          s_channel_dispatcher(std::move(cmd));
+          if (cmd.type == IoCommand::Type::kChannelSendFrame) {
+            void* conn = cmd.connection;
+            s_channel_dispatcher(std::move(cmd), /*defer_write=*/true);
+            touched_channel_conns_.push_back(conn);
+          } else {
+            s_channel_dispatcher(std::move(cmd), /*defer_write=*/false);
+          }
         }
       }
     });
+
+    // Phase 2: For each touched connection, trigger batched frame send
+    if (!touched_server_conns_.empty()) {
+      if (s_server_flush) {
+        if (touched_server_conns_.size() > 1) {
+          std::sort(touched_server_conns_.begin(), touched_server_conns_.end());
+          touched_server_conns_.erase(
+              std::unique(touched_server_conns_.begin(), touched_server_conns_.end()),
+              touched_server_conns_.end());
+        }
+        for (void* conn : touched_server_conns_) {
+          s_server_flush(conn);
+        }
+      }
+      touched_server_conns_.clear();
+    }
+
+    if (!touched_channel_conns_.empty()) {
+      if (s_channel_flush) {
+        if (touched_channel_conns_.size() > 1) {
+          std::sort(touched_channel_conns_.begin(), touched_channel_conns_.end());
+          touched_channel_conns_.erase(
+              std::unique(touched_channel_conns_.begin(), touched_channel_conns_.end()),
+              touched_channel_conns_.end());
+        }
+        for (void* conn : touched_channel_conns_) {
+          s_channel_flush(conn);
+        }
+      }
+      touched_channel_conns_.clear();
+    }
   }
 
  private:
   MpscQueue<IoCommand> commands_;
   MpscQueue<std::shared_ptr<IoCommandMailbox>> mailboxes_;
+  std::vector<void*> touched_server_conns_;
+  std::vector<void*> touched_channel_conns_;
   std::atomic<bool> notified_ {false};
   Scheduler* scheduler_ {nullptr};
   Executor* executor_ {nullptr};

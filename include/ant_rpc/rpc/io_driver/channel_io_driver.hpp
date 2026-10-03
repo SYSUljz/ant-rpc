@@ -48,7 +48,7 @@ class RpcChannelIoDriver : public std::enable_shared_from_this<RpcChannelIoDrive
         max_outbound_bytes_(max_outbound_bytes),
         connect_address_len_(address_len) {
     std::memcpy(&connect_address_, address, address_len);
-    ContextControl::SetChannelDispatcher(&RpcChannelIoDriver::DispatchCommand);
+    ContextControl::SetChannelDispatcher(&RpcChannelIoDriver::DispatchCommand, &RpcChannelIoDriver::FlushWrites);
   }
 
   int fd() const noexcept { return fd_.load(std::memory_order_acquire); }
@@ -80,8 +80,9 @@ class RpcChannelIoDriver : public std::enable_shared_from_this<RpcChannelIoDrive
   }
   void RequestClose();
   void WaitClosed();
-  void SendFrameOnIoThread(uint64_t correlation_id, butil::IOBuf buffer);
-  static void DispatchCommand(IoCommand&& cmd);
+  void SendFrameOnIoThread(uint64_t correlation_id, butil::IOBuf buffer, bool defer_start_write = false);
+  static void DispatchCommand(IoCommand&& cmd, bool defer_write);
+  static void FlushWrites(void* conn);
 
  private:
   void StartOnIoThread();
@@ -136,17 +137,20 @@ inline void RpcChannelIoDriver::WaitClosed() {
   state_->close_cv.wait(lock, [this] { return state_->closed; });
 }
 
-inline void RpcChannelIoDriver::SendFrameOnIoThread(uint64_t correlation_id, butil::IOBuf buffer) {
+inline void RpcChannelIoDriver::SendFrameOnIoThread(uint64_t correlation_id, butil::IOBuf buffer,
+                                                    bool defer_start_write) {
   if (!state_->running.load(std::memory_order_acquire)) {
     ReleaseReservedOutboundBytes(buffer.size());
     state_->slots.FailSlot(correlation_id, RPC_ECONN_FAILED, "Connection closed");
     return;
   }
   outbound_.push_back(OutboundFrame {correlation_id, std::move(buffer)});
-  StartNextWriteOnIoThread();
+  if (!defer_start_write) {
+    StartNextWriteOnIoThread();
+  }
 }
 
-inline void RpcChannelIoDriver::DispatchCommand(IoCommand&& cmd) {
+inline void RpcChannelIoDriver::DispatchCommand(IoCommand&& cmd, bool defer_write) {
   auto* driver = static_cast<RpcChannelIoDriver*>(cmd.connection);
   if (!driver) {
     return;
@@ -156,7 +160,7 @@ inline void RpcChannelIoDriver::DispatchCommand(IoCommand&& cmd) {
       driver->StartOnIoThread();
       break;
     case IoCommand::Type::kChannelSendFrame:
-      driver->SendFrameOnIoThread(cmd.correlation_id, std::move(cmd.payload));
+      driver->SendFrameOnIoThread(cmd.correlation_id, std::move(cmd.payload), defer_write);
       break;
     case IoCommand::Type::kChannelClose:
       driver->BeginCloseOnIoThread();
@@ -166,8 +170,14 @@ inline void RpcChannelIoDriver::DispatchCommand(IoCommand&& cmd) {
   }
 }
 
+inline void RpcChannelIoDriver::FlushWrites(void* conn) {
+  if (auto* d = static_cast<RpcChannelIoDriver*>(conn)) {
+    d->StartNextWriteOnIoThread();
+  }
+}
+
 inline static bool s_channel_dispatcher_init = [] {
-  ContextControl::SetChannelDispatcher(&RpcChannelIoDriver::DispatchCommand);
+  ContextControl::SetChannelDispatcher(&RpcChannelIoDriver::DispatchCommand, &RpcChannelIoDriver::FlushWrites);
   return true;
 }();
 
