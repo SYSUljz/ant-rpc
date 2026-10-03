@@ -28,13 +28,22 @@ class ContextControl {
     }
   }
 
+  void PostCommand(IoCommand command) {
+    commands_.Push(std::move(command));
+    if (!notified_.exchange(true, std::memory_order_release)) {
+      Wakeup();
+    }
+  }
+
   void Notify(std::shared_ptr<IoCommandMailbox> mailbox) {
     mailboxes_.Push(std::move(mailbox));
     if (!notified_.exchange(true, std::memory_order_release)) {
       Wakeup();
     }
   }
-  [[nodiscard]] std::size_t PendingCommandCount() const noexcept { return mailboxes_.ApproximateSize(); }
+  [[nodiscard]] std::size_t PendingCommandCount() const noexcept {
+    return commands_.ApproximateSize() + mailboxes_.ApproximateSize();
+  }
   void Wakeup() noexcept {
     if (wakeup_fd_ < 0) {
       return;
@@ -48,16 +57,39 @@ class ContextControl {
   Scheduler& GetScheduler() const noexcept { return *scheduler_; }
   TimerKeeper& GetTimerKeeper() const noexcept { return *timer_keeper_; }
 
+  using IoCommandHandler = void (*)(IoCommand&&);
+  inline static IoCommandHandler s_server_dispatcher {nullptr};
+  inline static IoCommandHandler s_channel_dispatcher {nullptr};
+
+  static void SetServerDispatcher(IoCommandHandler handler) noexcept { s_server_dispatcher = handler; }
+  static void SetChannelDispatcher(IoCommandHandler handler) noexcept { s_channel_dispatcher = handler; }
+
  protected:
   void DrainMailboxesOnIoThread() {
     uint64_t ignored;
     while (read(wakeup_fd_, &ignored, sizeof(ignored)) == sizeof(ignored)) {
     }
     notified_.store(false, std::memory_order_release);
+    DrainCommandsOnIoThread();
     mailboxes_.Drain([](std::shared_ptr<IoCommandMailbox>&& mailbox) { mailbox->DrainCommandsOnIoThread(); });
   }
 
+  void DrainCommandsOnIoThread() {
+    commands_.Drain([](IoCommand&& cmd) {
+      if (static_cast<uint8_t>(cmd.type) <= static_cast<uint8_t>(IoCommand::Type::kServerClose)) {
+        if (s_server_dispatcher) {
+          s_server_dispatcher(std::move(cmd));
+        }
+      } else {
+        if (s_channel_dispatcher) {
+          s_channel_dispatcher(std::move(cmd));
+        }
+      }
+    });
+  }
+
  private:
+  MpscQueue<IoCommand> commands_;
   MpscQueue<std::shared_ptr<IoCommandMailbox>> mailboxes_;
   std::atomic<bool> notified_ {false};
   Scheduler* scheduler_ {nullptr};

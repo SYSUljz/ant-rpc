@@ -27,23 +27,13 @@ namespace ant_rpc::rpc::detail {
 // IO-thread-only coordinator for one channel. Connect, receive, and write
 // operations live in their own headers below so each state machine can be
 // reviewed independently.
-class RpcChannelIoDriver : public IoCommandMailbox, public std::enable_shared_from_this<RpcChannelIoDriver> {
+class RpcChannelIoDriver : public std::enable_shared_from_this<RpcChannelIoDriver> {
   const uint64_t connection_id_ {ant_rpc::logging::NextConnectionId()};
 
  public:
   struct OutboundFrame {
     uint64_t correlation_id {0};
     butil::IOBuf buffer;
-  };
-
-  struct ChannelCommand {
-    enum class Type : uint8_t { kStart, kSendFrame, kClose };
-    Type type;
-    OutboundFrame frame {};
-
-    static ChannelCommand Start() { return {Type::kStart, {}}; }
-    static ChannelCommand SendFrame(OutboundFrame frame) { return {Type::kSendFrame, std::move(frame)}; }
-    static ChannelCommand Close() { return {Type::kClose, {}}; }
   };
 
   RpcChannelIoDriver(Context& context, std::shared_ptr<ChannelState> state, int fd, const sockaddr* address,
@@ -58,10 +48,11 @@ class RpcChannelIoDriver : public IoCommandMailbox, public std::enable_shared_fr
         max_outbound_bytes_(max_outbound_bytes),
         connect_address_len_(address_len) {
     std::memcpy(&connect_address_, address, address_len);
+    ContextControl::SetChannelDispatcher(&RpcChannelIoDriver::DispatchCommand);
   }
 
   int fd() const noexcept { return fd_.load(std::memory_order_acquire); }
-  void Start() { PostCommand(ChannelCommand::Start()); }
+  void Start() { context_.PostCommand(IoCommand::ChannelStart(this)); }
 
   // Reserve before publishing a command so the limit covers both the MPSC
   // mailbox and the IO-owned outbound queue.
@@ -84,13 +75,15 @@ class RpcChannelIoDriver : public IoCommandMailbox, public std::enable_shared_fr
     state_->metrics->outbound_bytes.Add(-static_cast<int64_t>(bytes));
   }
   // Requires a successful TryReserveOutboundBytes() for frame.buffer.size().
-  void EnqueueReserved(OutboundFrame frame) { PostCommand(ChannelCommand::SendFrame(std::move(frame))); }
+  void EnqueueReserved(OutboundFrame frame) {
+    context_.PostCommand(IoCommand::ChannelSendFrame(this, frame.correlation_id, std::move(frame.buffer)));
+  }
   void RequestClose();
   void WaitClosed();
-  void DrainCommandsOnIoThread() override;
+  void SendFrameOnIoThread(uint64_t correlation_id, butil::IOBuf buffer);
+  static void DispatchCommand(IoCommand&& cmd);
 
  private:
-  void PostCommand(ChannelCommand command);
   void StartOnIoThread();
   void BeginCloseOnIoThread();
   void StartNextWriteOnIoThread();
@@ -120,7 +113,6 @@ class RpcChannelIoDriver : public IoCommandMailbox, public std::enable_shared_fr
   std::atomic<std::size_t> outbound_bytes_ {0};
   sockaddr_storage connect_address_ {};
   socklen_t connect_address_len_ {0};
-  MpscQueue<ChannelCommand> commands_;
   std::deque<OutboundFrame> outbound_;
   bool receiver_started_ {false};
   bool receiver_exited_ {false};
@@ -132,7 +124,7 @@ class RpcChannelIoDriver : public IoCommandMailbox, public std::enable_shared_fr
 
 inline void RpcChannelIoDriver::RequestClose() {
   if (state_->running.exchange(false, std::memory_order_acq_rel)) {
-    PostCommand(ChannelCommand::Close());
+    context_.PostCommand(IoCommand::ChannelClose(this));
   }
 }
 
@@ -144,32 +136,40 @@ inline void RpcChannelIoDriver::WaitClosed() {
   state_->close_cv.wait(lock, [this] { return state_->closed; });
 }
 
-inline void RpcChannelIoDriver::PostCommand(ChannelCommand command) {
-  commands_.Push(std::move(command));
-  context_.Notify(shared_from_this());
+inline void RpcChannelIoDriver::SendFrameOnIoThread(uint64_t correlation_id, butil::IOBuf buffer) {
+  if (!state_->running.load(std::memory_order_acquire)) {
+    ReleaseReservedOutboundBytes(buffer.size());
+    state_->slots.FailSlot(correlation_id, RPC_ECONN_FAILED, "Connection closed");
+    return;
+  }
+  outbound_.push_back(OutboundFrame {correlation_id, std::move(buffer)});
+  StartNextWriteOnIoThread();
 }
 
-inline void RpcChannelIoDriver::DrainCommandsOnIoThread() {
-  commands_.Drain([this](ChannelCommand&& command) {
-    switch (command.type) {
-      case ChannelCommand::Type::kStart:
-        StartOnIoThread();
-        break;
-      case ChannelCommand::Type::kSendFrame:
-        if (!state_->running.load(std::memory_order_acquire)) {
-          ReleaseReservedOutboundBytes(command.frame.buffer.size());
-          state_->slots.FailSlot(command.frame.correlation_id, RPC_ECONN_FAILED, "Connection closed");
-          break;
-        }
-        outbound_.push_back(std::move(command.frame));
-        StartNextWriteOnIoThread();
-        break;
-      case ChannelCommand::Type::kClose:
-        BeginCloseOnIoThread();
-        break;
-    }
-  });
+inline void RpcChannelIoDriver::DispatchCommand(IoCommand&& cmd) {
+  auto* driver = static_cast<RpcChannelIoDriver*>(cmd.connection);
+  if (!driver) {
+    return;
+  }
+  switch (cmd.type) {
+    case IoCommand::Type::kChannelStart:
+      driver->StartOnIoThread();
+      break;
+    case IoCommand::Type::kChannelSendFrame:
+      driver->SendFrameOnIoThread(cmd.correlation_id, std::move(cmd.payload));
+      break;
+    case IoCommand::Type::kChannelClose:
+      driver->BeginCloseOnIoThread();
+      break;
+    default:
+      break;
+  }
 }
+
+inline static bool s_channel_dispatcher_init = [] {
+  ContextControl::SetChannelDispatcher(&RpcChannelIoDriver::DispatchCommand);
+  return true;
+}();
 
 inline void RpcChannelIoDriver::BeginCloseOnIoThread() {
   HandleTerminalFailureOnIoThread(RPC_ECONN_FAILED, "Connection closed", false);
