@@ -354,22 +354,22 @@ class RpcChannel : public google::protobuf::RpcChannel {
         *meta.mutable_headers() = controller->Headers();
       }
     }
-    auto frame = std::make_shared<butil::IOBuf>();
+    butil::IOBuf frame;
     const butil::IOBuf* attachment = controller ? &controller->RequestAttachment() : nullptr;
     bool packed = false;
     if (request) {
-      packed = PackRpcFrame(meta, request, attachment, *frame, options_.max_frame_bytes);
+      packed = PackRpcFrame(meta, request, attachment, frame, options_.max_frame_bytes);
     } else if (raw_request_body) {
-      packed = PackRpcFrame(meta, *raw_request_body, attachment, *frame, options_.max_frame_bytes);
+      packed = PackRpcFrame(meta, *raw_request_body, attachment, frame, options_.max_frame_bytes);
     } else {
       butil::IOBuf empty;
-      packed = PackRpcFrame(meta, empty, attachment, *frame, options_.max_frame_bytes);
+      packed = PackRpcFrame(meta, empty, attachment, frame, options_.max_frame_bytes);
     }
     if (!packed) {
       return ResolveArmingFailure(state, correlation_id, RPC_EINVALID_DATA,
                                   "RPC request frame exceeds max_frame_bytes");
     }
-    const std::size_t frame_bytes = frame->size();
+    const std::size_t frame_bytes = frame.size();
     if (!driver->TryReserveOutboundBytes(frame_bytes)) {
       return ResolveArmingFailure(state, correlation_id, RPC_EOVERLOAD, "RPC max_outbound_bytes limit reached");
     }

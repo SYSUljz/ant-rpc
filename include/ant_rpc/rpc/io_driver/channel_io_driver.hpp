@@ -32,8 +32,8 @@ class RpcChannelIoDriver : public IoCommandMailbox, public std::enable_shared_fr
 
  public:
   struct OutboundFrame {
-    uint64_t correlation_id;
-    std::shared_ptr<butil::IOBuf> buffer;
+    uint64_t correlation_id {0};
+    butil::IOBuf buffer;
   };
 
   struct ChannelCommand {
@@ -83,7 +83,7 @@ class RpcChannelIoDriver : public IoCommandMailbox, public std::enable_shared_fr
     outbound_bytes_.fetch_sub(bytes, std::memory_order_acq_rel);
     state_->metrics->outbound_bytes.Add(-static_cast<int64_t>(bytes));
   }
-  // Requires a successful TryReserveOutboundBytes() for frame.buffer->size().
+  // Requires a successful TryReserveOutboundBytes() for frame.buffer.size().
   void EnqueueReserved(OutboundFrame frame) { PostCommand(ChannelCommand::SendFrame(std::move(frame))); }
   void RequestClose();
   void WaitClosed();
@@ -157,9 +157,7 @@ inline void RpcChannelIoDriver::DrainCommandsOnIoThread() {
         break;
       case ChannelCommand::Type::kSendFrame:
         if (!state_->running.load(std::memory_order_acquire)) {
-          if (command.frame.buffer) {
-            ReleaseReservedOutboundBytes(command.frame.buffer->size());
-          }
+          ReleaseReservedOutboundBytes(command.frame.buffer.size());
           state_->slots.FailSlot(command.frame.correlation_id, RPC_ECONN_FAILED, "Connection closed");
           break;
         }
@@ -221,10 +219,8 @@ inline void RpcChannelIoDriver::FinishConnectOnIoThread(int result) {
 }
 
 inline void RpcChannelIoDriver::FailAndClearOutboundOnIoThread(int error_code, const char* error_message) {
-  for (const OutboundFrame& frame : outbound_) {
-    if (frame.buffer) {
-      ReleaseReservedOutboundBytes(frame.buffer->size());
-    }
+  for (OutboundFrame& frame : outbound_) {
+    ReleaseReservedOutboundBytes(frame.buffer.size());
     state_->slots.FailSlot(frame.correlation_id, error_code, error_message);
   }
   outbound_.clear();

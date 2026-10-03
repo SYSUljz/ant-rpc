@@ -1,7 +1,6 @@
 #ifndef ANT_RPC
 #define ANT_RPC
 
-#include <liburing.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -101,7 +100,7 @@ inline HttpTask handle_http_client(Context& ctx, int client_fd) {
         } else {
           std::cout << "[Server] Client fd " << client_fd << " disconnected." << std::endl;
         }
-        co_await CloseAwaiter {ctx, client_fd};
+        CloseSocket(ctx, SocketHandle::Native(client_fd));
         co_return;
       }
       continue;
@@ -130,11 +129,11 @@ inline HttpTask handle_http_client(Context& ctx, int client_fd) {
         req = HttpRequest {};
         continue;
       } else {
-        co_await CloseAwaiter {ctx, client_fd};
+        CloseSocket(ctx, SocketHandle::Native(client_fd));
         co_return;
       }
     } else {
-      co_await CloseAwaiter {ctx, client_fd};
+      CloseSocket(ctx, SocketHandle::Native(client_fd));
       co_return;
     }
   }
