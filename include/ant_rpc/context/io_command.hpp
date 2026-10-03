@@ -5,8 +5,10 @@
 #include <memory>
 #include <utility>
 
-// A generic MPSC transport, but never a type-erased task queue. Each consumer
-// selects its own concrete command type (for example ChannelCommand).
+#include "daking/MPSC_queue.hpp"
+
+// A generic MPSC transport backed by daking::MPSC_queue (zero-malloc, chunk-pooled).
+// Each consumer selects its own concrete command type (for example ChannelCommand).
 template <typename T>
 class MpscQueue {
  public:
@@ -18,40 +20,23 @@ class MpscQueue {
   }
 
   void Push(T value) {
-    auto* node = new Node {std::move(value), nullptr};
     size_.fetch_add(1, std::memory_order_relaxed);
-    Node* head = head_.load(std::memory_order_relaxed);
-    do {
-      node->next = head;
-    } while (!head_.compare_exchange_weak(head, node, std::memory_order_release, std::memory_order_relaxed));
+    queue_.enqueue(std::move(value));
   }
+
   [[nodiscard]] std::size_t ApproximateSize() const noexcept { return size_.load(std::memory_order_relaxed); }
 
   template <typename Consumer>
   void Drain(Consumer&& consumer) {
-    Node* list = head_.exchange(nullptr, std::memory_order_acquire);
-    Node* fifo = nullptr;
-    while (list) {
-      Node* next = list->next;
-      list->next = fifo;
-      fifo = list;
-      list = next;
-    }
-    while (fifo) {
-      Node* next = fifo->next;
-      consumer(std::move(fifo->value));
-      delete fifo;
+    T item;
+    while (queue_.try_dequeue(item)) {
       size_.fetch_sub(1, std::memory_order_relaxed);
-      fifo = next;
+      consumer(std::move(item));
     }
   }
 
  private:
-  struct Node {
-    T value;
-    Node* next;
-  };
-  std::atomic<Node*> head_ {nullptr};
+  daking::MPSC_queue<T> queue_;
   std::atomic<std::size_t> size_ {0};
 };
 

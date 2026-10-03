@@ -410,6 +410,14 @@ class ServerConnection final : public IoCommandMailbox, public std::enable_share
     writing_ = true;
     OutboundFrame frame = std::move(outbound_.front());
     outbound_.pop_front();
+
+    // Batch-merge subsequent queued frames to send them in a single write/writev
+    static constexpr std::size_t kMaxBatchBytes = 64 * 1024;
+    while (!outbound_.empty() && frame.buffer.size() < kMaxBatchBytes) {
+      frame.buffer.append(outbound_.front().buffer);
+      outbound_.pop_front();
+    }
+
     WriteFrame(shared_from_this(), std::move(frame));
   }
   bool TryReserveOutboundBytes(std::size_t bytes) noexcept {

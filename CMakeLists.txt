@@ -117,10 +117,11 @@ add_library(AntRPC::AntRPC ALIAS AntRPC)
 target_include_directories(AntRPC INTERFACE
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/3rd_party
+    ${CMAKE_SOURCE_DIR}/3rd_party/MPSC_queue/include
     ${PROTO_GEN_DIR}
 )
 target_link_libraries(AntRPC INTERFACE butil llhttp echo_proto protobuf::libprotobuf absl::flat_hash_map
-    absl::log absl::log_initialize absl::log_globals)
+    absl::log absl::log_initialize absl::log_globals atomic)
 target_compile_definitions(AntRPC INTERFACE ${ANT_RPC_IO_BACKEND_DEFINE})
 
 if(ANT_RPC_BUILD_TESTS)

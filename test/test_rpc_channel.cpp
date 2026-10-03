@@ -566,3 +566,41 @@ TEST_F(RpcChannelTest, SharedChannelAcceptsCallsFromMultipleExternalThreads) {
   EXPECT_EQ(successful_calls.load(std::memory_order_relaxed), kThreadCount * kCallsPerThread);
   channel.Close();
 }
+
+TEST_F(RpcChannelTest, BatchedOutboundFramesMergePreservesIntegrity) {
+  RpcChannel channel(client_ctx_);
+  ASSERT_EQ(channel.Init("127.0.0.1", port_), 0);
+
+  // Send a burst of requests rapidly on the same channel
+  constexpr int kBatchSize = 64;
+  std::vector<std::thread> threads;
+  threads.reserve(kBatchSize);
+  std::atomic<int> completed {0};
+  std::atomic<bool> failed {false};
+
+  for (int i = 0; i < kBatchSize; ++i) {
+    threads.emplace_back([&channel, i, &completed, &failed] {
+      EchoService_Stub stub(&channel);
+      RpcController controller;
+      EchoRequest request;
+      EchoResponse response;
+      const std::string payload = "batch_test_payload_" + std::to_string(i) + "_" + std::string(128, 'x');
+      request.set_message(payload);
+      stub.Echo(&controller, &request, &response, nullptr);
+      if (controller.Failed() || response.message() != "Echo: " + payload) {
+        failed.store(true, std::memory_order_release);
+        return;
+      }
+      completed.fetch_add(1, std::memory_order_relaxed);
+    });
+  }
+
+  for (auto& t : threads) {
+    t.join();
+  }
+
+  EXPECT_FALSE(failed.load(std::memory_order_acquire));
+  EXPECT_EQ(completed.load(std::memory_order_relaxed), kBatchSize);
+  channel.Close();
+}
+

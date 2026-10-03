@@ -30,7 +30,9 @@ class ContextControl {
 
   void Notify(std::shared_ptr<IoCommandMailbox> mailbox) {
     mailboxes_.Push(std::move(mailbox));
-    Wakeup();
+    if (!notified_.exchange(true, std::memory_order_release)) {
+      Wakeup();
+    }
   }
   [[nodiscard]] std::size_t PendingCommandCount() const noexcept { return mailboxes_.ApproximateSize(); }
   void Wakeup() noexcept {
@@ -51,11 +53,13 @@ class ContextControl {
     uint64_t ignored;
     while (read(wakeup_fd_, &ignored, sizeof(ignored)) == sizeof(ignored)) {
     }
+    notified_.store(false, std::memory_order_release);
     mailboxes_.Drain([](std::shared_ptr<IoCommandMailbox>&& mailbox) { mailbox->DrainCommandsOnIoThread(); });
   }
 
  private:
   MpscQueue<std::shared_ptr<IoCommandMailbox>> mailboxes_;
+  std::atomic<bool> notified_ {false};
   Scheduler* scheduler_ {nullptr};
   Executor* executor_ {nullptr};
   TimerKeeper* timer_keeper_ {nullptr};
