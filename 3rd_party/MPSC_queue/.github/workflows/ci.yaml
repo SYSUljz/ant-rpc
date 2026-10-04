@@ -1,0 +1,107 @@
+name: Multi-Arch CI Pipeline
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+jobs:
+  spell-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for Typos
+        uses: codespell-project/actions-codespell@v2
+        with:
+          ignore_words_list: "mpsc,daking,hdr"
+          skip: "./.git,./out,./build"
+
+  # Linux (x86_64 & ARM64)
+  build-linux:
+    needs: spell-check
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+        preset: [
+          "linux-clang-relwithstack-asan", 
+          "linux-clang-relwithstack-tsan", 
+          "linux-gcc-release", 
+          "linux-clang-release"
+        ]
+        exclude:
+          - arch: arm64
+            preset: "linux-clang-relwithstack-asan"
+          - arch: arm64
+            preset: "linux-clang-relwithstack-tsan"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        if: matrix.arch == 'arm64'
+        uses: docker/setup-qemu-action@v3
+
+      - name: "[x64] Install Tools & Build"
+        if: matrix.arch == 'x64'
+        run: |
+          sudo apt-get update && sudo apt-get install -y ninja-build clang g++
+          cmake --preset ${{ matrix.preset }}
+          cmake --build --preset ${{ matrix.preset }}
+          cd out/build/${{ matrix.preset }}
+          ./mpsc_tests
+          ./mpsc_log_system_example
+          ./mpsc_command_dispatcher_example
+
+      - name: "[arm64] Build and Test in Container"
+        if: matrix.arch == 'arm64'
+        run: |
+          docker run --rm --platform linux/arm64/v8 \
+            -v ${{ github.workspace }}:/src \
+            -w /src \
+            -e DEBIAN_FRONTEND=noninteractive \
+            -e ASAN_OPTIONS='halt_on_error=1' \
+            -e TSAN_OPTIONS='halt_on_error=1' \
+            arm64v8/ubuntu:24.04 /bin/bash -c "
+              apt-get update && \
+              apt-get install -y --no-install-recommends \
+                build-essential \
+                ninja-build \
+                clang \
+                cmake && \
+              
+              cmake --version && \
+              
+              cmake --preset ${{ matrix.preset }} && \
+              cmake --build --preset ${{ matrix.preset }} && \
+              
+              cd out/build/${{ matrix.preset }} && \
+              echo '>>> Running ARM64 Tests' && \
+              ./mpsc_tests && \
+              ./mpsc_log_system_example && \
+              ./mpsc_command_dispatcher_example
+            "
+
+  # MSVC (x86_64)
+  build-windows:
+    needs: spell-check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: Install Ninja
+        run: choco install ninja
+      - name: Configure and Build
+        run: |
+          cmake --preset msvc-x64-release
+          cmake --build --preset msvc-x64-release
+      - name: Run Tests
+        shell: pwsh
+        run: |
+          cd out/build/msvc-x64-release
+          ./mpsc_tests.exe
+          ./mpsc_log_system_example.exe
+          ./mpsc_command_dispatcher_example.exe
