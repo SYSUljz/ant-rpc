@@ -260,10 +260,8 @@ namespace daking {
             }
 
             ~MPSC_thread_hook() {
-                // If this is consumer hook, release the queue tail to help destructor thread.
-                std::atomic_thread_fence(std::memory_order_release);
+                std::lock_guard<std::mutex> guard(Queue::global_mutex_);
                 if (Queue::_is_global_manager_alive()) {
-                    std::lock_guard<std::mutex> guard(Queue::global_mutex_);
                     Queue::_get_global_manager().unregister_for(tid_);
                 }
             }
@@ -305,8 +303,7 @@ namespace daking {
 
             ~MPSC_manager() {
                 reset();
-                Queue::global_manager_instance_ = nullptr;
-                std::atomic_thread_fence(std::memory_order_release);
+                Queue::global_manager_instance_.store(nullptr, std::memory_order_release);
             }
 
             void reset() {
@@ -653,12 +650,11 @@ namespace daking {
 
     private:
         DAKING_ALWAYS_INLINE static manager_t& _get_global_manager() noexcept {
-            return *global_manager_instance_;
+            return *global_manager_instance_.load(std::memory_order_acquire);
         }
 
         DAKING_ALWAYS_INLINE static bool _is_global_manager_alive() noexcept {
-            std::atomic_thread_fence(std::memory_order_acquire);
-            return global_manager_instance_ != nullptr;
+            return global_manager_instance_.load(std::memory_order_acquire) != nullptr;
         }
 
         DAKING_ALWAYS_INLINE thread_hook_t& _get_thread_hook() {
@@ -677,7 +673,7 @@ namespace daking {
         DAKING_ALWAYS_INLINE void _initial(const Alloc& alloc) {
             {
                 std::lock_guard<std::mutex> guard(global_mutex_);
-                global_manager_instance_ = manager_t::create_global_manager(alloc); // single instance
+                global_manager_instance_.store(manager_t::create_global_manager(alloc), std::memory_order_release); // single instance
             }
 
             node_t* dummy = _allocate();
@@ -755,7 +751,7 @@ namespace daking {
 
         /* Global Mutex*/ 
         inline static std::mutex             global_mutex_{};
-        inline static manager_t*             global_manager_instance_ = nullptr;
+        inline static std::atomic<manager_t*> global_manager_instance_{nullptr};
 
         /* MPSC */
         alignas(align) std::atomic<node_t*>  head_;

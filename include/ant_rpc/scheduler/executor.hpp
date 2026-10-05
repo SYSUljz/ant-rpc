@@ -34,8 +34,10 @@ class WorkStealingExecutor : public Executor {
 
   struct WorkerState {
     int thread_id {0};
+    WorkStealingExecutor* executor {nullptr};
     alignas(kCacheLineSize) SPMCQueue<TaskNode*, 1024> local_queue_;
     alignas(kCacheLineSize) moodycamel::ConcurrentQueue<TaskNode*> inbound_queue_;
+    alignas(kCacheLineSize) std::atomic<int32_t> inbound_count_ {0};
     alignas(kCacheLineSize) uint64_t tick {0};
     alignas(kCacheLineSize) std::atomic<bool> is_parked {false};
 
@@ -51,37 +53,19 @@ class WorkStealingExecutor : public Executor {
           return;
         }
       }
+      inbound_count_.fetch_add(1, std::memory_order_release);
       inbound_queue_.enqueue(task);
     }
 
-    TaskNode* pop_local() {
-      if (auto* task = local_queue_.TryPop()) {
-        return task;
-      }
-      TaskNode* task = nullptr;
-      if (inbound_queue_.try_dequeue(task)) {
-        return task;
-      }
-      return nullptr;
-    }
-
-    TaskNode* steal_one() {
-      if (auto* task = local_queue_.Steal()) {
-        return task;
-      }
-      TaskNode* task = nullptr;
-      if (inbound_queue_.try_dequeue(task)) {
-        return task;
-      }
-      return nullptr;
-    }
+    TaskNode* pop_local();
 
     std::size_t approximate_load() const noexcept {
-      return static_cast<std::size_t>(local_queue_.Size()) + inbound_queue_.size_approx();
+      int32_t in = inbound_count_.load(std::memory_order_relaxed);
+      return static_cast<std::size_t>(local_queue_.Size()) + (in > 0 ? static_cast<std::size_t>(in) : 0);
     }
 
     bool has_ready_work() const noexcept {
-      return !local_queue_.Empty() || inbound_queue_.size_approx() > 0;
+      return !local_queue_.Empty() || inbound_count_.load(std::memory_order_relaxed) > 0;
     }
 
     void unpark() {
@@ -114,6 +98,7 @@ class WorkStealingExecutor : public Executor {
     for (std::size_t i = 0; i < nthreads_; ++i) {
       auto w = std::make_unique<WorkerState>();
       w->thread_id = static_cast<int>(i);
+      w->executor = this;
       workers_.push_back(std::move(w));
     }
   }
@@ -211,7 +196,7 @@ class WorkStealingExecutor : public Executor {
         task->run();
       } else {
         empty_spins++;
-        if (empty_spins < 16) {
+        if (empty_spins < 32) {
 #if defined(__x86_64__) || defined(_M_X64)
           _mm_pause();
 #elif defined(__aarch64__)
@@ -219,7 +204,7 @@ class WorkStealingExecutor : public Executor {
 #else
           std::this_thread::yield();
 #endif
-        } else if (empty_spins < 32) {
+        } else if (empty_spins < 64) {
           std::this_thread::yield();
         } else {
           w.park_and_wait(running_);
@@ -259,6 +244,7 @@ class WorkStealingExecutor : public Executor {
       return nullptr;
     }
 
+    // Step 1: Probe local_queue_ of other workers using random start
     std::size_t start = ant_rpc::fast_random() % nthreads_;
     for (std::size_t i = 0; i < nthreads_; ++i) {
       std::size_t victim_id = (start + i) % nthreads_;
@@ -267,11 +253,35 @@ class WorkStealingExecutor : public Executor {
       }
 
       auto& victim = *workers_[victim_id];
+      if (victim.local_queue_.Empty()) {
+        continue;  // Fast O(1) check skips empty victims with zero memory fence/CAS!
+      }
 
-      if (auto* task = victim.steal_one()) {
+      if (auto* task = victim.local_queue_.Steal()) {
         return task;
       }
     }
+
+    // Step 2: Fallback - if all local queues are empty, check if any worker has
+    // backlogged inbound tasks (e.g. stalled on blocking sleep/syscalls)
+    for (std::size_t i = 0; i < nthreads_; ++i) {
+      std::size_t victim_id = (start + i) % nthreads_;
+      if (static_cast<int>(victim_id) == thief_id) {
+        continue;
+      }
+
+      auto& victim = *workers_[victim_id];
+      if (victim.inbound_count_.load(std::memory_order_relaxed) <= 0) {
+        continue;
+      }
+
+      TaskNode* task = nullptr;
+      if (victim.inbound_queue_.try_dequeue(task)) {
+        victim.inbound_count_.fetch_sub(1, std::memory_order_release);
+        return task;
+      }
+    }
+
     return nullptr;
   }
 
@@ -291,3 +301,28 @@ class WorkStealingExecutor : public Executor {
   std::size_t nthreads_;
   Scheduler* scheduler_ {nullptr};
 };
+
+inline TaskNode* WorkStealingExecutor::WorkerState::pop_local() {
+  if (auto* task = local_queue_.TryPop()) {
+    return task;
+  }
+  if (inbound_count_.load(std::memory_order_relaxed) <= 0) {
+    return nullptr;
+  }
+  TaskNode* bulk[32];
+  std::size_t n = inbound_queue_.try_dequeue_bulk(bulk, 32);
+  if (n > 0) {
+    inbound_count_.fetch_sub(static_cast<int32_t>(n), std::memory_order_release);
+    for (std::size_t i = 1; i < n; ++i) {
+      if (!local_queue_.Push(bulk[i])) {
+        inbound_count_.fetch_add(1, std::memory_order_release);
+        inbound_queue_.enqueue(bulk[i]);
+      }
+    }
+    if (n > 1 && executor) {
+      executor->wake_any_worker();
+    }
+    return bulk[0];
+  }
+  return nullptr;
+}

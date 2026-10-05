@@ -9,6 +9,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(ANT_RPC_ENABLE_TSAN "Build every target with ThreadSanitizer" OFF)
 option(ANT_RPC_USE_SYSTEM_DEPS "Use installed Abseil and Protobuf packages" OFF)
 option(ANT_RPC_BUILD_TESTS "Build AntRPC tests and test utilities" ON)
+option(ANT_RPC_BUILD_BENCHMARKS "Build AntRPC benchmark adapters" OFF)
+
+
 set(ANT_RPC_IO_BACKEND "epoll" CACHE STRING "Socket runtime: epoll or io_uring")
 set_property(CACHE ANT_RPC_IO_BACKEND PROPERTY STRINGS epoll io_uring)
 if(ANT_RPC_ENABLE_TSAN)
@@ -112,6 +115,16 @@ target_include_directories(echo_proto PUBLIC ${PROTO_GEN_DIR})
 add_subdirectory(3rd_party/butil)
 add_subdirectory(3rd_party/llhttp)
 
+option(ANT_RPC_USE_MIMALLOC "Link benchmark and servers with mimalloc" ON)
+if(ANT_RPC_USE_MIMALLOC)
+    set(MI_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+    set(MI_BUILD_STATIC ON CACHE BOOL "" FORCE)
+    set(MI_BUILD_OBJECT ON CACHE BOOL "" FORCE)
+    set(MI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(MI_OVERRIDE ON CACHE BOOL "" FORCE)
+    add_subdirectory(3rd_party/mimalloc EXCLUDE_FROM_ALL)
+endif()
+
 add_library(AntRPC INTERFACE)
 add_library(AntRPC::AntRPC ALIAS AntRPC)
 target_include_directories(AntRPC INTERFACE
@@ -123,6 +136,9 @@ target_include_directories(AntRPC INTERFACE
 target_link_libraries(AntRPC INTERFACE butil llhttp echo_proto protobuf::libprotobuf absl::flat_hash_map
     absl::log absl::log_initialize absl::log_globals atomic)
 target_compile_definitions(AntRPC INTERFACE ${ANT_RPC_IO_BACKEND_DEFINE})
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    target_compile_options(AntRPC INTERFACE -mcx16)
+endif()
 
 if(ANT_RPC_BUILD_TESTS)
     # Executables for demo / server testing
@@ -171,8 +187,20 @@ if(ANT_RPC_BUILD_TESTS)
     )
     target_link_libraries(unit_tests PRIVATE AntRPC ${URING_LIBRARIES} absl::synchronization absl::base GTest::gtest_main)
 
+
     include(GoogleTest)
     gtest_discover_tests(unit_tests)
 endif()
 
+if(ANT_RPC_BUILD_BENCHMARKS OR ANT_RPC_BUILD_TESTS)
+    add_subdirectory(benchmark/ant_rpc)
+endif()
 
+if(ANT_RPC_BUILD_TESTS)
+    add_test(
+        NAME rpc_server_sigterm
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/test/e2e/test_server_sigterm.py
+            --server $<TARGET_FILE:ant_rpc_bench_server>
+    )
+    set_tests_properties(rpc_server_sigterm PROPERTIES TIMEOUT 75)
+endif()

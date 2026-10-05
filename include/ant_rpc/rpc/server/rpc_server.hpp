@@ -198,8 +198,8 @@ class RpcServer {
         return;
       }
       auto connection = std::make_shared<detail::ServerConnection>(context, fd, *registry, runtime);
-      runtime->TrackConnection(connection);
       connection->Start();
+      runtime->TrackConnection(connection);
     }
     Context& context;
     int fd;
@@ -223,8 +223,8 @@ class RpcServer {
         return;
       }
       auto connection = std::make_shared<detail::ServerConnection>(ctx_, fd, *registry_, runtime_);
-      runtime_->TrackConnection(connection);
       connection->Start();
+      runtime_->TrackConnection(connection);
       return;
     }
     target.Notify(std::make_shared<AcceptedConnectionMailbox>(target, fd, registry_, runtime_));

@@ -30,6 +30,10 @@ class ConnectAwaiter final : public ant_rpc::epoll_detail::BaseAwaiter {
   }
   int await_resume() const noexcept { return res_; }
   void on_complete() override {
+    if (res_ == -ECANCELED) {
+      Finish();
+      return;
+    }
     int error = 0;
     socklen_t error_size = sizeof(error);
     if (getsockopt(socket.value, SOL_SOCKET, SO_ERROR, &error, &error_size) != 0) {

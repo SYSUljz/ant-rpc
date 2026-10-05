@@ -83,6 +83,7 @@ struct HttpTask {
   std::coroutine_handle<promise_type> handle {nullptr};
 };
 struct alignas(kCacheLineSize) TaskNode {
+  virtual ~TaskNode() = default;
   TaskNode* next {nullptr};
   void (*execute)(TaskNode* self) noexcept;
 
@@ -155,7 +156,7 @@ struct TypeErasedTask : public TaskNode {
     };
   }
 
-  ~TypeErasedTask() {
+  ~TypeErasedTask() override {
     if (destroy_fn) {
       destroy_fn(this);
     }

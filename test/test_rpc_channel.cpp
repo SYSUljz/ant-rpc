@@ -1,4 +1,5 @@
 #include <unistd.h>
+#include <csignal>
 
 #include <array>
 #include <atomic>
@@ -285,6 +286,7 @@ class RpcChannelTest : public ::testing::Test {
   int server_socket_ {-1};
 
   void SetUp() override {
+    signal(SIGPIPE, SIG_IGN);
     registry_.RegisterService(&echo_service_);
     server_socket_ = socket(AF_INET, SOCK_STREAM, 0);
     ASSERT_GE(server_socket_, 0);

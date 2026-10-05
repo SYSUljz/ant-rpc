@@ -169,7 +169,7 @@ class ServerConnection final : public std::enable_shared_from_this<ServerConnect
         registry_(registry),
         runtime_(std::move(runtime)),
         idle_timeout_(runtime_->options().idle_timeout) {
-    ContextControl::SetServerDispatcher(&ServerConnection::DispatchCommand, &ServerConnection::FlushWrites);
+    ContextControl::SetServerDispatcher(&ServerConnection::DispatchCommand);
   }
   void Start() {
     runtime_->metrics().io_command_backlog.Add(1);
@@ -178,6 +178,7 @@ class ServerConnection final : public std::enable_shared_from_this<ServerConnect
   void RequestClose(ConnectionCloseReason reason = ConnectionCloseReason::kLocalRequest) {
     RecordCloseReason(reason);
     if (running_.exchange(false, std::memory_order_acq_rel)) {
+      close_command_posted_.store(true, std::memory_order_release);
       runtime_->metrics().io_command_backlog.Add(1);
       context_.PostCommand(IoCommand::ServerClose(this));
     }
@@ -187,8 +188,7 @@ class ServerConnection final : public std::enable_shared_from_this<ServerConnect
     return close_reason_.load(std::memory_order_acquire);
   }
 
-  static void DispatchCommand(IoCommand&& cmd, bool defer_write);
-  static void FlushWrites(void* conn);
+  static void DispatchCommand(IoCommand&& cmd);
 
  private:
   struct InboundDoneClosure;
@@ -282,8 +282,7 @@ class ServerConnection final : public std::enable_shared_from_this<ServerConnect
     context_.PostCommand(
         IoCommand::ServerCompleteInbound(this, call.get(), std::move(response), close_after_completion));
   }
-  void CompleteInboundOnIoThread(void* call_state, butil::IOBuf response, bool close_after_completion,
-                                 bool defer_start_write = false) {
+  void CompleteInboundOnIoThread(void* call_state, butil::IOBuf response, bool close_after_completion) {
     if (call_state) {
       auto* call = static_cast<InboundCallState*>(call_state);
       std::erase_if(inbound_calls_, [call](const auto& item) { return item.get() == call; });
@@ -300,9 +299,7 @@ class ServerConnection final : public std::enable_shared_from_this<ServerConnect
     if (running_.load(std::memory_order_acquire) && !frame.buffer.empty()) {
       outbound_.push_back(std::move(frame));
       runtime_->metrics().responses_enqueued.Add();
-      if (!defer_start_write) {
-        StartNextWriteOnIoThread();
-      }
+      StartNextWriteOnIoThread();
     } else {
       ReleaseFrameReservation(frame);
     }
@@ -346,6 +343,7 @@ class ServerConnection final : public std::enable_shared_from_this<ServerConnect
     EnqueueResponseOnIoThread(std::move(response));
   }
   void StartOnIoThread() {
+    start_command_handled_ = true;
     if (!running_.load(std::memory_order_acquire)) {
       receiver_exited_ = true;
       TryFinishCloseOnIoThread();
@@ -355,6 +353,7 @@ class ServerConnection final : public std::enable_shared_from_this<ServerConnect
     ReceiveLoop(shared_from_this());
   }
   void BeginCloseOnIoThread() {
+    close_command_handled_ = true;
     CancelIdleTimer();
     if (const int socket = fd(); socket >= 0) {
       ShutdownSocket(context_, SocketHandle::Native(socket), SHUT_RDWR);
@@ -366,7 +365,10 @@ class ServerConnection final : public std::enable_shared_from_this<ServerConnect
     TryFinishCloseOnIoThread();
   }
   void TryFinishCloseOnIoThread() {
-    if (running_.load(std::memory_order_acquire) || !receiver_exited_ || writing_) {
+    if (running_.load(std::memory_order_acquire) || !receiver_exited_ || writing_ || !start_command_handled_) {
+      return;
+    }
+    if (close_command_posted_.load(std::memory_order_acquire) && !close_command_handled_) {
       return;
     }
     CancelIdleTimer();
@@ -635,15 +637,18 @@ class ServerConnection final : public std::enable_shared_from_this<ServerConnect
   std::atomic<std::size_t> reserved_outbound_bytes_ {0};
   std::atomic<bool> running_ {true};
   std::atomic<bool> released_ {false};
+  std::atomic<bool> close_command_posted_ {false};
   std::atomic<uint64_t> idle_generation_ {0};
   std::atomic<uint64_t> idle_timer_id_ {0};
   std::atomic<ConnectionCloseReason> close_reason_ {ConnectionCloseReason::kNone};
   bool receiver_started_ {false};
   bool receiver_exited_ {false};
   bool writing_ {false};
+  bool start_command_handled_ {false};
+  bool close_command_handled_ {false};
 };
 
-inline void ServerConnection::DispatchCommand(IoCommand&& cmd, bool defer_write) {
+inline void ServerConnection::DispatchCommand(IoCommand&& cmd) {
   auto* conn = static_cast<ServerConnection*>(cmd.connection);
   if (!conn) {
     return;
@@ -654,7 +659,7 @@ inline void ServerConnection::DispatchCommand(IoCommand&& cmd, bool defer_write)
       conn->StartOnIoThread();
       break;
     case IoCommand::Type::kServerCompleteInbound:
-      conn->CompleteInboundOnIoThread(cmd.inbound_call_state, std::move(cmd.payload), cmd.close_after, defer_write);
+      conn->CompleteInboundOnIoThread(cmd.inbound_call_state, std::move(cmd.payload), cmd.close_after);
       break;
     case IoCommand::Type::kServerClose:
       conn->BeginCloseOnIoThread();
@@ -664,14 +669,8 @@ inline void ServerConnection::DispatchCommand(IoCommand&& cmd, bool defer_write)
   }
 }
 
-inline void ServerConnection::FlushWrites(void* conn) {
-  if (auto* c = static_cast<ServerConnection*>(conn)) {
-    c->StartNextWriteOnIoThread();
-  }
-}
-
 inline static bool s_server_dispatcher_init = [] {
-  ContextControl::SetServerDispatcher(&ServerConnection::DispatchCommand, &ServerConnection::FlushWrites);
+  ContextControl::SetServerDispatcher(&ServerConnection::DispatchCommand);
   return true;
 }();
 
@@ -759,8 +758,14 @@ inline void ServerConnection::FinalizeInboundCall(std::shared_ptr<InboundCallSta
 }
 
 inline void ServerRuntime::TrackConnection(const std::shared_ptr<ServerConnection>& connection) {
-  absl::MutexLock lock(&connections_mu_);
-  connections_.push_back(connection);
+  const bool stopping = !accepting_.load(std::memory_order_acquire);
+  {
+    absl::MutexLock lock(&connections_mu_);
+    connections_.push_back(connection);
+  }
+  if (stopping && options_.graceful_stop_timeout.count() == 0) {
+    connection->RequestClose(ConnectionCloseReason::kServerStop);
+  }
 }
 inline void ServerRuntime::ReleaseConnection(const std::shared_ptr<ServerConnection>& connection) {
   {
@@ -786,11 +791,11 @@ inline void ServerRuntime::ReleaseConnection(const std::shared_ptr<ServerConnect
 }
 inline void ServerRuntime::BeginGracefulStop() {
   accepting_.store(false, std::memory_order_release);
-  if (active_connections_.load(std::memory_order_acquire) == 0) {
-    return;
-  }
   if (options_.graceful_stop_timeout.count() == 0) {
     ForceCloseLiveConnections();
+    return;
+  }
+  if (active_connections_.load(std::memory_order_acquire) == 0) {
     return;
   }
   auto self = shared_from_this();

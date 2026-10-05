@@ -288,9 +288,9 @@ inline void CloseSocket(Context&, SocketHandle socket) {
   }
 }
 inline constexpr SocketHandle AcceptedSocket(int fd) { return SocketHandle::Native(fd); }
-inline void CancelSocketOperation(Context& context, IOHandler* handler) {
-  if (handler && context.CancelWait(handler)) {
-    handler->prepare_complete(-ECANCELED, 0);
-    handler->on_complete();
+inline void CancelSocketOperation(Context&, IOHandler* handler) {
+  if (handler) {
+    static_cast<ant_rpc::epoll_detail::BaseAwaiter*>(handler)->CancelOnIoThread();
   }
 }
+

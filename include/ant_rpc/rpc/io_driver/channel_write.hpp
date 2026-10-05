@@ -4,7 +4,10 @@ namespace ant_rpc::rpc::detail {
 
 inline DetachedTask RpcChannelIoDriver::WriteFrame(std::shared_ptr<RpcChannelIoDriver> self, OutboundFrame frame) {
   while (!frame.buffer.empty() && self->state_->running.load(std::memory_order_acquire)) {
-    const int written = co_await IOBufWriteAwaiter(self->context_, self->fd(), frame.buffer, false);
+    IOBufWriteAwaiter write_awaiter(self->context_, self->fd(), frame.buffer, false);
+    self->active_write_ = &write_awaiter;
+    const int written = co_await write_awaiter;
+    self->active_write_ = nullptr;
     // BeginCloseOnIoThread() releases the IO queue's remaining reservation.
     // Do not release the copied front frame a second time after a close.
     if (!self->state_->running.load(std::memory_order_acquire)) {

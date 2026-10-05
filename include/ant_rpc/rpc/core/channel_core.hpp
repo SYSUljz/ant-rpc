@@ -22,6 +22,7 @@
 #include <sys/socket.h>
 
 #include "absl/synchronization/notification.h"
+#include "absl/time/time.h"
 #include "ant_rpc/context/context.hpp"
 #include "ant_rpc/coroutine/task.hpp"
 #include "ant_rpc/rpc/controller.hpp"
@@ -181,7 +182,11 @@ class RpcChannel : public google::protobuf::RpcChannel {
     }
     driver->Start();
     std::unique_lock<std::mutex> lock(state->connect_mu);
-    state->connect_cv.wait(lock, [&state] { return state->connect_finished; });
+    const auto wait_dur = options_.connect_timeout + std::chrono::milliseconds(500);
+    if (!state->connect_cv.wait_for(lock, wait_dur, [&state] { return state->connect_finished; })) {
+      state->connect_result = -ETIMEDOUT;
+      state->connect_finished = true;
+    }
     if (state->connect_result == 0) {
       return 0;
     }
@@ -199,10 +204,10 @@ class RpcChannel : public google::protobuf::RpcChannel {
     if (driver) {
       driver->RequestClose();
       driver->WaitClosed();
-      std::lock_guard<std::mutex> lock(channel_mu_);
-      if (driver_ == driver) {
-        driver_.reset();
-      }
+    }
+    std::lock_guard<std::mutex> lock(channel_mu_);
+    if (driver_ == driver) {
+      driver_.reset();
     }
     ReleaseDefaultRuntimeBinding();
   }
@@ -283,6 +288,7 @@ class RpcChannel : public google::protobuf::RpcChannel {
   // Before Init() has bound a Context, StartUnaryCall fails before it allocates
   // a slot, so this empty target can never reach completion dispatch.
   ContinuationTarget CurrentCallContinuationTarget() const noexcept {
+    std::lock_guard<std::mutex> lock(channel_mu_);
     if (ctx_ && ctx_->GetExecutor()) {
       return CurrentContinuationTarget(*ctx_->GetExecutor());
     }

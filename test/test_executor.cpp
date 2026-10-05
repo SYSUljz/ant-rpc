@@ -224,3 +224,87 @@ TEST(SchedulerTest, SeparatedIOAndWorkerLifecycle) {
 
   scheduler.Stop();
 }
+
+TEST(SPMCQueueTest, StealConcurrentStealersExtractAllItemsExactlyOnce) {
+  SPMCQueue<TaskNode*, 1024> queue;
+  constexpr std::size_t kTotalTasks = 500;
+  std::vector<std::unique_ptr<LambdaTask<std::function<void()>>>> tasks;
+  tasks.reserve(kTotalTasks);
+  std::atomic<uint32_t> executions[kTotalTasks];
+
+  for (std::size_t i = 0; i < kTotalTasks; ++i) {
+    executions[i].store(0, std::memory_order_relaxed);
+    tasks.push_back(std::make_unique<LambdaTask<std::function<void()>>>(
+        [&executions, i]() { executions[i].fetch_add(1, std::memory_order_relaxed); }));
+    EXPECT_TRUE(queue.Push(tasks.back().get()));
+  }
+
+  std::atomic<bool> start_stealing {false};
+  std::atomic<std::size_t> total_stolen {0};
+  constexpr std::size_t kStealers = 4;
+  std::vector<std::thread> stealers;
+  stealers.reserve(kStealers);
+
+  for (std::size_t s = 0; s < kStealers; ++s) {
+    stealers.emplace_back([&]() {
+      while (!start_stealing.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      while (total_stolen.load(std::memory_order_relaxed) < kTotalTasks) {
+        if (queue.Empty()) {
+          break;
+        }
+        if (auto* task = queue.Steal()) {
+          total_stolen.fetch_add(1, std::memory_order_relaxed);
+          task->run();
+        } else {
+          std::this_thread::yield();
+        }
+      }
+    });
+  }
+
+  start_stealing.store(true, std::memory_order_release);
+  for (auto& t : stealers) {
+    t.join();
+  }
+
+  // Drain any remaining in queue
+  while (auto* task = queue.TryPop()) {
+    total_stolen.fetch_add(1, std::memory_order_relaxed);
+    task->run();
+  }
+
+  EXPECT_EQ(total_stolen.load(), kTotalTasks);
+  for (std::size_t i = 0; i < kTotalTasks; ++i) {
+    EXPECT_EQ(executions[i].load(std::memory_order_acquire), 1u) << "Task " << i << " mismatch";
+  }
+}
+
+TEST(ExecutorTest, ImbalancedLoadDispersesViaWorkStealingAcrossManyWorkers) {
+  constexpr std::size_t kNumWorkers = 8;
+  constexpr std::size_t kNumTasks = 8000;
+
+  WorkStealingExecutor executor(kNumWorkers);
+  executor.Start();
+
+  std::atomic<std::size_t> completed {0};
+  std::vector<std::unique_ptr<LambdaTask<std::function<void()>>>> tasks;
+  tasks.reserve(kNumTasks);
+
+  for (std::size_t i = 0; i < kNumTasks; ++i) {
+    tasks.push_back(std::make_unique<LambdaTask<std::function<void()>>>(
+        [&completed]() { completed.fetch_add(1, std::memory_order_relaxed); }));
+    // Intentionally target worker 0 for all tasks to force work-stealing by workers 1..7
+    executor.schedule(tasks.back().get(), /*thread_id=*/0);
+  }
+
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (completed.load(std::memory_order_relaxed) < kNumTasks &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+
+  EXPECT_EQ(completed.load(), kNumTasks);
+  executor.Stop();
+}
