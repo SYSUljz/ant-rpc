@@ -3,3 +3,4 @@ build/
 3rd_resource/
 build-tsan/
 results/
+build*/

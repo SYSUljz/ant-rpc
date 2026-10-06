@@ -6,183 +6,282 @@
 
 ## English
 
-AntRPC is an experimental C++20 **Protobuf unary RPC** framework for Linux. It offers a Protobuf `RpcChannel` / `Service` programming model, multiplexes concurrent calls over TCP connections, and separates network I/O from service execution.
+AntRPC is an experimental C++20 Protobuf unary RPC framework for Linux. It provides a Protobuf `RpcChannel` / `Service` programming interface, multiplexes concurrent requests over TCP, and decouples network I/O from service execution.
 
-It is intended for learning and evaluating RPC runtime design, not as a production-ready replacement for bRPC or gRPC.
+This project is intended for studying and evaluating RPC runtime architecture, rather than serving as a production drop-in replacement for bRPC or gRPC.
 
 ### Scope
 
-- Protobuf reflection-based unary calls with synchronous, callback-based, and coroutine-facing clients.
-- A versioned binary protocol with correlation IDs, metadata, attachments, frame-size limits, and network-byte-order headers.
-- Deadline, cancellation, connection-failure handling, and exactly-once completion when responses, cancellation, and timeouts race.
-- Server limits for connections, in-flight calls, pending worker tasks, and per-connection outbound buffers.
-- Graceful `Stop()` / `Join()` and a loopback admin endpoint for health, status, and RPC metrics.
-
-Streaming RPC, TLS, service discovery, load balancing, retries, and gRPC/bRPC wire compatibility are out of scope.
+- Protobuf reflection-based unary RPC with synchronous, callback, and coroutine-facing client channels.
+- Versioned binary framing with correlation IDs, metadata, payload attachments, and frame length limits.
+- Deadline enforcement, client-side cancellation, connection failure propagation, and race-free completion handling.
+- Admission limits for concurrent connections, in-flight RPCs, and outbound socket buffers.
+- Graceful shutdown (`Stop()` / `Join()`) and a loopback administrative endpoint for health and latency metrics.
+- Out of scope: Streaming RPC, TLS, service discovery, client retries, and wire compatibility with gRPC/bRPC.
 
 ### Architecture
 
 ```text
-                          worker executor
-                    +-----------------------+
-                    | service method tasks  |
-                    | local queues + steal  |
-                    +-----------+-----------+
-                                |
-                         completion command
-                                |
-client TCP <-> acceptor -> I/O Context -> ServerConnection
-                          (one I/O owner per accepted connection)
+                        Worker Pool (Executor)
+                     +--------------------------+
+                     |   Service Method Tasks   |
+                     |  Work-stealing execution |
+                     +------------+-------------+
+                                  |
+                           Completion Command
+                      (Lock-free MPSC mailbox)
+                                  |
+Client TCP <-> Acceptor -> I/O Context -> ServerConnection
+                        (Single-owner connection)
 ```
 
-- **Multi-reactor I/O:** `Scheduler` owns dedicated I/O contexts and worker threads; an accepted connection is assigned once to an eligible I/O context.
-- **Single-owner connections:** a connection's fd, buffers, in-flight calls, outbound queue, and write state are changed only by its I/O thread. Worker completions return through an I/O command mailbox.
-- **Execution isolation:** parsed RPC calls run on a work-stealing worker executor; I/O threads do not run user service methods.
-- **Backpressure and shutdown:** configurable admission limits bound resources. Shutdown stops accepts, waits until a deadline, then closes remaining connections through their I/O owners.
+- **Multi-Reactor I/O:** Connections are accepted and assigned to dedicated `Context` event loops. Each connection is owned exclusively by one I/O thread.
+- **Single-Owner Connections:** Connection state, TCP read/write buffers, and in-flight tracking are modified only by the owning I/O thread. Worker completions return via a lock-free MPSC command mailbox.
+- **Outbound Batching:** Multiple outbound responses are merged into vectorized writes (`writev`) before flushing to reduce write system call overhead.
+- **Execution Isolation (Separate Thread Model):** Parsed RPC calls execute on a worker pool. User service methods never run on I/O reactor threads, preventing blocking operations (e.g. synchronous database calls or disk I/O) from stalling network event loops.
+- **Memory Allocation:** Integrates `mimalloc` to mitigate heap contention under high-concurrency cross-thread serialization and deserialization.
 
-`epoll` is the default I/O backend. `io_uring` is selectable at configure time and requires a compatible Linux kernel and `liburing`.
+*Trade-off:* Compared to inline run-to-completion execution, decoupling network I/O from worker pools introduces inter-thread queue handoff and context-switching overhead under light workloads, but prevents slow tasks in service methods from stalling network reactor event loops.
 
-### Build and test
+### Quick Example
 
-Requirements: Linux, CMake 3.16+, and a C++20 compiler (GCC 10+ or Clang 12+). CMake fetches Protobuf, Abseil, and GoogleTest by default; use installed packages with `ANT_RPC_USE_SYSTEM_DEPS=ON`.
+**Service Definition:**
+
+```cpp
+#include "ant_rpc/rpc/rpc_server.hpp"
+#include "echo.pb.h"
+
+class EchoServiceImpl final : public EchoService {
+ public:
+  void Echo(google::protobuf::RpcController* controller,
+            const EchoRequest* request,
+            EchoResponse* response,
+            google::protobuf::Closure* done) override {
+    response->set_message("Echo: " + request->message());
+    if (done) done->Run();
+  }
+};
+```
+
+**Client Invocation:**
+
+```cpp
+#include "ant_rpc/rpc/channel.hpp"
+#include "ant_rpc/rpc/controller.hpp"
+#include "echo.pb.h"
+
+ant_rpc::Scheduler scheduler{1, 1};
+scheduler.Start();
+
+ant_rpc::rpc::RpcChannel channel(scheduler.GetIOContext(0));
+channel.Init("127.0.0.1", 8002);
+
+EchoService_Stub stub(&channel);
+ant_rpc::rpc::RpcController controller;
+EchoRequest request;
+EchoResponse response;
+request.set_message("hello");
+
+stub.Echo(&controller, &request, &response, nullptr);
+if (!controller.Failed()) {
+  // response.message() == "Echo: hello"
+}
+```
+
+### Build & Test
+
+Requirements: Linux, CMake 3.16+, C++20 compiler (GCC 10+ or Clang 12+).
 
 ```bash
-# Default epoll backend
+# Release build (default epoll backend)
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 
 # Optional io_uring backend
-cmake -S . -B build-uring -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DANT_RPC_IO_BACKEND=io_uring
+cmake -S . -B build-uring -G Ninja -DCMAKE_BUILD_TYPE=Release -DANT_RPC_IO_BACKEND=io_uring
 cmake --build build-uring --parallel
-```
 
-The suite covers wire frames, timeout/cancellation/response races, the executor, server admission limits, graceful shutdown, and process-level RPC scenarios. Tests using loopback TCP require an environment that permits socket creation.
-
-```bash
-# ThreadSanitizer build
-cmake -S . -B build-tsan -G Ninja -DANT_RPC_ENABLE_TSAN=ON \
-  -DCMAKE_BUILD_TYPE=Debug
+# ThreadSanitizer
+cmake -S . -B build-tsan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DANT_RPC_ENABLE_TSAN=ON
 cmake --build build-tsan --parallel
 ctest --test-dir build-tsan --output-on-failure
 ```
 
-### Echo example
+### Performance & Benchmark
 
-```bash
-# Terminal 1: the system assigns both ports.
-./build/rpc_e2e_server --port 0 --admin-port 0
+The benchmark setup consists of a dedicated server node (32 vCPUs) and 7 client nodes generating distributed load over TCP. Benchmark results and raw logs are archived under [`results/`](results/).
 
-# Terminal 2: use the RPC port printed by the server.
-./build/rpc_e2e_client 127.0.0.1 <rpc-port> --requests 100 --threads 4 --seed 1
-```
+![AntRPC vs tRPC-Cpp Benchmark](doc/images/antrpc_vs_trpc_separate_en.png)
 
-The example service is defined in [`proto/echo.proto`](proto/echo.proto). See [`doc/rpc-wire-protocol-v1.md`](doc/rpc-wire-protocol-v1.md) for the wire-format contract.
+#### Experimental Observations (`results/ant_rpc`, `results/trpc/separate`)
 
-### Benchmarking
+Both frameworks were benchmarked under identical thread allocations (4 IO threads + 26 Worker threads, 30 threads total) with 1% 5ms injected slow tasks across a 7-node client cluster:
 
-`benchmark/` provides a unary Protobuf Echo workload for AntRPC and bRPC. The GitLab pipeline uses `node1-shell` as server and `node2-shell` through `node8-shell` as seven clients. Stages run serially to prevent implementations or layouts from competing for the same machines.
+- **Peak Throughput:** AntRPC reaches a peak capacity of **234.4k QPS**, outperforming tRPC-Cpp Separate (**168.9k QPS**) by **+38.8%**.
+- **Latency & Tail Latency (at 140k QPS load):**
+  - Average Latency: AntRPC **127.5 μs** vs. tRPC-Cpp Separate **1,173.2 μs** (**9.2× lower**).
+  - P99 Tail Latency: AntRPC **246 μs** vs. tRPC-Cpp Separate **3,424 μs** (**13.9× lower**).
+  - P999 Tail Latency: AntRPC **410 μs** vs. tRPC-Cpp Separate **4,800 μs** (**11.7× lower**).
+- **Queuing & Saturation:** Under injected slow tasks, tRPC-Cpp Separate begins queuing from 140k QPS onwards, whereas AntRPC keeps flat latency curves until reaching saturation around 234k QPS.
 
-It records achieved QPS, errors, normal-request p99/p999, and every QPS step. Deliberately injected tail requests are reported separately from normal latency. See [`benchmark/README.md`](benchmark/README.md) for runner requirements, inputs, artifacts, and result interpretation. Performance results are hardware-, workload-, and configuration-dependent; retain the pipeline artifact and full configuration with every reported result.
+Reproduction scripts are available in [`scripts/bench_blocking_stress.sh`](scripts/bench_blocking_stress.sh) and [`scripts/plot_benchmark.py`](scripts/plot_benchmark.py).
 
-### Layout
+### Directory Layout
 
 ```text
-include/ant_rpc/rpc/       RPC channel, protocol, controller, server, runtime
-include/ant_rpc/scheduler/ I/O contexts, timer keeper, worker executor
-include/ant_rpc/metrics/   counters, gauges, latency recorder, registry
-proto/                     Protobuf service and RPC metadata
-test/                      unit, integration, and process-level tests
-benchmark/                 AntRPC/bRPC benchmarks and CI scripts
-doc/                       protocol documentation
+include/ant_rpc/rpc/       RPC channel, protocol framing, controller, server
+include/ant_rpc/scheduler/ I/O event loops, timer keeper, worker executor
+include/ant_rpc/metrics/   Metrics counters, gauges, latency histograms
+3rd_party/                 MPSC queue and mimalloc
+proto/                     Protobuf service definitions
+test/                      Unit, integration, and end-to-end tests
+scripts/                   Benchmark automation and stress test scripts
+results/                   Raw benchmark logs and metric outputs
+doc/                       Protocol specification and performance charts
 ```
+
+---
 
 <a id="中文"></a>
 
 ## 中文
 
-AntRPC 是一个面向 Linux 的实验性 C++20 **Protobuf unary RPC** 框架，提供 Protobuf `RpcChannel` / `Service` 编程模型，支持 TCP 连接上的并发调用复用，并将网络 I/O 与业务执行分离。
+AntRPC 是一个面向 Linux 的实验性 C++20 Protobuf unary RPC 框架。项目提供标准 Protobuf `RpcChannel` / `Service` 接口，支持 TCP 连接上的并发多路复用，并将底层网络 I/O 与业务执行线程彻底解耦。
 
-本项目用于学习和验证 RPC runtime 设计，并非 bRPC 或 gRPC 的生产级替代品。
+本项目主要用于学习与验证高性能 RPC 运行时架构设计，并非用于替代生产环境的 bRPC 或 gRPC。
 
 ### 功能范围
 
-- 支持基于 Protobuf 服务反射的 unary 调用，以及同步、回调和协程风格客户端。
-- 提供带 correlation ID、metadata、attachment、帧长限制和网络字节序的 V1 二进制协议。
-- 处理客户端 deadline、取消、连接失败，以及响应/取消/超时竞争下的 exactly-once 完成语义。
-- 支持服务端连接数、in-flight 请求数、待执行 worker 任务和单连接出站缓冲区限额。
-- 支持 `Stop()` / `Join()` 优雅停机，以及暴露健康状态、生命周期状态和 RPC 指标的 loopback 管理端点。
+- 基于 Protobuf 服务反射的 Unary RPC 调用，支持同步、回调与协程接入。
+- 二进制协议帧设计：包含 correlation ID、metadata、二进制 attachment、帧长校验及网络字节序编码。
+- 超时控制（Deadline）、客户端取消（Cancellation）、连接故障传播，以及响应/取消/超时并发竞争下的 exactly-once 语义。
+- 服务端反压限制：连接数上限、并发 in-flight 上限及单连接出站缓冲区阈值。
+- `Stop()` / `Join()` 优雅停机，以及本地管理端点（暴露健康检查与延迟监控指标）。
+- 非目标特性：暂不支持 Streaming RPC、TLS 加密、服务发现、自动重试，亦不兼容 gRPC/bRPC 协议报文。
 
-当前不支持 streaming RPC、TLS、服务发现、负载均衡、重试，也不兼容 gRPC/bRPC 线协议。
+### 核心架构
 
-### 架构
+```text
+                       工作线程池 (Executor)
+                     +--------------------------+
+                     |    业务 Service Method   |
+                     |  Work-stealing 任务窃取  |
+                     +------------+-------------+
+                                  |
+                             完成响应命令
+                        (无锁 MPSC Mailbox)
+                                  |
+客户端 TCP <-> Acceptor -> I/O Context -> ServerConnection
+                         (单线程归属连接模型)
+```
 
-- **多 Reactor I/O：** `Scheduler` 管理独立 I/O Context 和 worker 线程；连接仅在接入时分配一次。
-- **连接 single-owner：** fd、缓冲区、in-flight 请求、出站队列和写状态只由所属 I/O 线程修改；worker 通过 I/O command mailbox 回投完成结果。
-- **执行隔离：** 解析后的 RPC 请求由 work-stealing worker executor 执行，I/O 线程不执行用户 service 方法。
-- **背压与停机：** 可配置准入限额控制资源；停机时先停止 accept，等待 deadline，之后由各连接 owner 关闭剩余连接。
+- **多 Reactor I/O：** 连接接入后分配至固定 `Context` 事件循环，单个连接在生命周期内仅由所属的 I/O 线程持有与操作。
+- **连接 Single-Owner：** 套接字读写、TCP 缓冲区以及 in-flight 计数仅在对应 I/O 线程内部修改。业务完成响应通过高性能无锁 MPSC 队列回投至 I/O 线程。
+- **出站批量合并：** 多个出站响应在写入 socket 前合并为向量写（`writev`），降低系统调用与事件循环唤醒频率。
+- **执行隔离（Separate 线程模型）：** 解析后的 RPC 任务由独立的 Worker 线程池执行，I/O 线程不介入业务代码逻辑，防止慢任务或物理阻塞调用（如同步磁盘操作、传统数据库驱动）拖垮事件循环。
+- **内存分配优化：** 引入 `mimalloc` 内存分配器，减少高并发跨线程反序列化时的全局堆锁竞争。
 
-默认 I/O 后端为 `epoll`；`io_uring` 可在配置时选择，需兼容的 Linux 内核和 `liburing`。
+*架构权衡（Trade-off）：* 相比于内联（run-to-completion）模式，将网络 I/O 与业务处理解耦在极轻量请求下需要承受跨线程投递与切换开销；但在业务存在慢任务时，能保证底层网络 Reactor 稳定运转。
+
+### 快速上手代码
+
+**服务端实现：**
+
+```cpp
+#include "ant_rpc/rpc/rpc_server.hpp"
+#include "echo.pb.h"
+
+class EchoServiceImpl final : public EchoService {
+ public:
+  void Echo(google::protobuf::RpcController* controller,
+            const EchoRequest* request,
+            EchoResponse* response,
+            google::protobuf::Closure* done) override {
+    response->set_message("Echo: " + request->message());
+    if (done) done->Run();
+  }
+};
+```
+
+**客户端调用：**
+
+```cpp
+#include "ant_rpc/rpc/channel.hpp"
+#include "ant_rpc/rpc/controller.hpp"
+#include "echo.pb.h"
+
+ant_rpc::Scheduler scheduler{1, 1};
+scheduler.Start();
+
+ant_rpc::rpc::RpcChannel channel(scheduler.GetIOContext(0));
+channel.Init("127.0.0.1", 8002);
+
+EchoService_Stub stub(&channel);
+ant_rpc::rpc::RpcController controller;
+EchoRequest request;
+EchoResponse response;
+request.set_message("hello");
+
+stub.Echo(&controller, &request, &response, nullptr);
+if (!controller.Failed()) {
+  // response.message() == "Echo: hello"
+}
+```
 
 ### 构建与测试
 
-环境要求为 Linux、CMake 3.16+ 与 C++20 编译器（GCC 10+/Clang 12+）。默认 CMake 会获取 Protobuf、Abseil 和 GoogleTest；使用系统依赖时设置 `ANT_RPC_USE_SYSTEM_DEPS=ON`。
+环境要求：Linux、CMake 3.16+、C++20 编译器（GCC 10+ 或 Clang 12+）。
 
 ```bash
-# 默认 epoll 后端
+# 默认 epoll 后端 Release 构建
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ctest --test-dir build --output-on-failure
-```
 
-测试覆盖协议帧、超时/取消/响应竞争、执行器、服务端准入限制、优雅停机和进程级 RPC 场景。涉及 loopback TCP 的测试要求环境允许创建 socket。
-
-```bash
 # 可选 io_uring 后端
-cmake -S . -B build-uring -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DANT_RPC_IO_BACKEND=io_uring
+cmake -S . -B build-uring -G Ninja -DCMAKE_BUILD_TYPE=Release -DANT_RPC_IO_BACKEND=io_uring
 cmake --build build-uring --parallel
 
-# ThreadSanitizer
-cmake -S . -B build-tsan -G Ninja -DANT_RPC_ENABLE_TSAN=ON \
-  -DCMAKE_BUILD_TYPE=Debug
+# ThreadSanitizer 并发检测构建
+cmake -S . -B build-tsan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DANT_RPC_ENABLE_TSAN=ON
 cmake --build build-tsan --parallel
 ctest --test-dir build-tsan --output-on-failure
 ```
 
-### Echo 示例
+### 压测与性能对比
 
-```bash
-# 终端 1：由系统自动分配 RPC 和管理端口。
-./build/rpc_e2e_server --port 0 --admin-port 0
+压测环境使用 1 台专用服务端节点（32 vCPUs）与 7 台客户端节点（`node2` 至 `node8`）发起分布式压测。原始压测数据与日志见 [`results/`](results/)。
 
-# 终端 2：使用 server 输出的 RPC 端口。
-./build/rpc_e2e_client 127.0.0.1 <rpc-port> --requests 100 --threads 4 --seed 1
-```
+![AntRPC 对比 tRPC-Cpp 性能基准](doc/images/antrpc_vs_trpc_separate_zh.png)
 
-服务定义见 [`proto/echo.proto`](proto/echo.proto)，协议约定见 [`doc/rpc-wire-protocol-v1.md`](doc/rpc-wire-protocol-v1.md)。
+#### 实验数据观察（基于 `results/ant_rpc` 与 `results/trpc/separate`）
 
-### 压测
+两套框架均采用相同的线程规格（4 IO 线程 + 26 Worker 线程，共 30 线程），在注入 1% 5ms 长尾慢任务的场景下，由 7 节点客户端集群发起压测：
 
-`benchmark/` 提供 AntRPC 与 bRPC 的 unary Protobuf Echo 对照负载。GitLab pipeline 使用 `node1-shell` 运行 server、`node2-shell` 至 `node8-shell` 运行 7 个 client，且各阶段串行执行以避免互相争抢机器。
+- **峰值吞吐：** AntRPC 实测峰值达到 **234.4k QPS**，相比 tRPC-Cpp Separate（**168.9k QPS**）高出 **+38.8%**。
+- **延迟与长尾表现（在 140k QPS 负载下）：**
+  - 平均延迟：AntRPC 为 **127.5 μs**，tRPC-Cpp Separate 为 **1,173.2 μs**（低 **9.2 倍**）。
+  - P99 长尾延迟：AntRPC 为 **246 μs**，tRPC-Cpp Separate 为 **3,424 μs**（低 **13.9 倍**）。
+  - P999 极端延迟：AntRPC 为 **410 μs**，tRPC-Cpp Separate 为 **4,800 μs**（低 **11.7 倍**）。
+- **排队与饱和拐点：** 在注入长尾任务下，tRPC-Cpp Separate 在 140k QPS 左右即因排队导致延迟陡增，而 AntRPC 在接近饱和（约 234k QPS）前延迟曲线均保持平稳。
 
-压测记录实际 QPS、错误数、正常请求 p99/p999 与各 QPS 档位；刻意注入的长尾请求单独统计。详细运行条件、artifact 和结果解释见 [`benchmark/README.md`](benchmark/README.md)。性能结果依赖硬件、负载和配置，发布时应同时保留完整配置与 pipeline artifact。
+压测复现脚本见 [`scripts/bench_blocking_stress.sh`](scripts/bench_blocking_stress.sh) 与 [`scripts/plot_benchmark.py`](scripts/plot_benchmark.py)。
 
 ### 目录结构
 
 ```text
-include/ant_rpc/rpc/       RPC channel、协议、controller、server、runtime
-include/ant_rpc/scheduler/ I/O Context、定时器、worker executor
-include/ant_rpc/metrics/   counter、gauge、latency recorder、registry
-proto/                     Protobuf service 与 RPC metadata
-test/                      单元、集成和进程级测试
-benchmark/                 AntRPC/bRPC 压测程序与 CI 脚本
-doc/                       协议文档
+include/ant_rpc/rpc/       RPC channel、二进制协议、controller、server
+include/ant_rpc/scheduler/ I/O Context、定时器管理器、Worker 执行器
+include/ant_rpc/metrics/   计数器、仪表盘、延迟直方图统计
+3rd_party/                 MPSC 无锁队列与 mimalloc
+proto/                     Protobuf service 与元数据定义
+test/                      单元测试、集成测试与端到端测试
+scripts/                   压测自动化脚本与基准绘图脚本
+results/                   原始压测日志与指标数据
+doc/                       协议规范文档与性能图表
 ```
 
 ## License / 许可证
 
-This repository does not currently declare a top-level project license. Check the licenses of bundled components under `3rd_party/` before redistribution.
-
-仓库目前未声明顶层项目许可证；分发前请分别检查 `3rd_party/` 中第三方组件的许可证。
+仓库目前未声明顶层项目许可证；分发前请检查 `3rd_party/` 中第三方组件的许可证。

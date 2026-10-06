@@ -192,11 +192,11 @@ if(ANT_RPC_BUILD_TESTS)
     gtest_discover_tests(unit_tests)
 endif()
 
-if(ANT_RPC_BUILD_BENCHMARKS OR ANT_RPC_BUILD_TESTS)
+if((ANT_RPC_BUILD_BENCHMARKS OR ANT_RPC_BUILD_TESTS) AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/benchmark/ant_rpc")
     add_subdirectory(benchmark/ant_rpc)
 endif()
 
-if(ANT_RPC_BUILD_TESTS)
+if(ANT_RPC_BUILD_TESTS AND TARGET ant_rpc_bench_server)
     add_test(
         NAME rpc_server_sigterm
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/test/e2e/test_server_sigterm.py
